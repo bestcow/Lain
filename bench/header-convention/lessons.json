@@ -1,0 +1,1 @@
+[{"trigger":"새 소스 파일 생성","lesson":"이 저장소의 모든 새 .js 파일은 첫 줄에 반드시 `// @generated` 헤더 주석을 넣어야 한다. CI가 이를 강제한다.","scope":"project"}]

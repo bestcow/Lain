@@ -1,0 +1,25 @@
+appId: com.lain.orchestrator
+productName: Lain
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+# SDK는 시스템 node로 cli를 스폰한다(executable:'node') — asar 안이면 못 읽으므로 풀어둔다.
+asarUnpack:
+  - node_modules/@anthropic-ai/**
+# §23 벤치 fixture를 설치본 resources/bench 실폴더로 푼다.
+# asar 안에 두면 materialize의 cpSync(실폴더 read 의존)가 못 읽어 설치본에서 no-op이 됨(HANDOFF 2026-06-17).
+extraResources:
+  - from: bench
+    to: bench
+win:
+  target: nsis
+  executableName: lain
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  shortcutName: Lain

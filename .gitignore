@@ -1,0 +1,18 @@
+node_modules/
+out/
+dist/
+release/
+data/
+*.log
+
+# 환경변수 파일 — 시크릿 유출 방지(런타임은 safety.ts가 차단, 버전관리 단계에서도 차단)
+.env
+.env.*
+!.env.example
+
+# superpowers SDD 작업 산출물 — 레포 추적 제외
+.superpowers/
+
+# UI 목업·제안 작업 산출물 — 레포 추적 제외(배포 가드가 미추적 dirty로 잡지 않게)
+/ui-proposals.html
+/uimock/
