@@ -9,10 +9,34 @@ import type {
   PluginInfo,
   TelegramStatus,
   DiscordStatus,
+  UpdateStatus,
 } from '../../shared/types'
 import { MODEL_IDS } from '../../shared/models'
 
 const TIERS: ModelTier[] = ['haiku', 'sonnet', 'opus']
+
+// 업데이트 상태 → 사람이 읽을 한 줄 힌트(④ 설정 행).
+function updHint(u: UpdateStatus | null): string {
+  if (!u) return '확인 중…'
+  switch (u.state) {
+    case 'disabled':
+      return `현재 v${u.currentVersion} · 자동 업데이트는 설치본(패키징)에서만 동작`
+    case 'checking':
+      return '새 버전 확인 중…'
+    case 'available':
+      return `새 버전 v${u.version} 있음 — 다운로드 가능`
+    case 'downloading':
+      return `다운로드 중… ${u.percent ?? 0}%`
+    case 'downloaded':
+      return `v${u.version} 준비됨 — 재시작하면 적용`
+    case 'not-available':
+      return `현재 v${u.currentVersion} · 최신`
+    case 'error':
+      return `업데이트 오류: ${u.error ?? '알 수 없음'}`
+    default:
+      return `현재 v${u.currentVersion}`
+  }
+}
 
 // 텔레그램 시크릿 필드 — 입력 옆에 "알아내는 법" 안내 + 명시적 저장(Enter/버튼) + "저장됨" 피드백.
 function TelegramField({
@@ -426,19 +450,25 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
   const [settings, setSettings] = useState<LainSettings | null>(null)
   const [tg, setTg] = useState<TelegramStatus | null>(null)
   const [dc, setDc] = useState<DiscordStatus | null>(null)
+  const [upd, setUpd] = useState<UpdateStatus | null>(null)
 
   const refreshTg = () => window.lain.telegramStatus().then(setTg)
   const refreshDc = () => window.lain.discordStatus().then(setDc)
 
   useEffect(() => {
     window.lain.getSettings().then(setSettings)
+    window.lain.getUpdateStatus().then(setUpd)
+    const offUpd = window.lain.onUpdateStatus(setUpd)
     refreshTg()
     refreshDc()
     const t = setInterval(() => {
       refreshTg()
       refreshDc()
     }, 4000) // 연결 상태 폴링
-    return () => clearInterval(t)
+    return () => {
+      clearInterval(t)
+      offUpd()
+    }
   }, [])
 
   const patch = (p: Partial<LainSettings>) => {
@@ -542,6 +572,60 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                   onChange={(e) => patch({ autoStart: e.target.checked })}
                 />
                 <span className="dim settings-hint">로그인 시 트레이로 기동 (패키징 실행에서만 유효)</span>
+              </label>
+              {/* 자동 업데이트 — ④ 수동 확인/적용 + ② Lain 제안 + ③ 자동 다운로드 토글 */}
+              <div className="settings-row">
+                <span className="settings-key">업데이트</span>
+                <span className="upd-controls">
+                  <button
+                    type="button"
+                    className="upd-btn"
+                    onClick={() => void window.lain.checkForUpdate()}
+                    disabled={upd?.state === 'disabled' || upd?.state === 'checking'}
+                  >
+                    업데이트 확인
+                  </button>
+                  {upd?.state === 'downloaded' ? (
+                    <button
+                      type="button"
+                      className="upd-btn upd-apply"
+                      onClick={() => void window.lain.installUpdate()}
+                    >
+                      지금 재시작해 적용
+                    </button>
+                  ) : upd?.state === 'available' ? (
+                    <button
+                      type="button"
+                      className="upd-btn"
+                      onClick={() => void window.lain.downloadUpdate()}
+                    >
+                      다운로드
+                    </button>
+                  ) : null}
+                </span>
+                <span className="dim settings-hint">{updHint(upd)}</span>
+              </div>
+              <label className="settings-row">
+                <span className="settings-key">Lain 업데이트 제안</span>
+                <input
+                  type="checkbox"
+                  checked={settings.updateNotify}
+                  onChange={(e) => patch({ updateNotify: e.target.checked })}
+                />
+                <span className="dim settings-hint">
+                  새 버전이 나오면 작업이 한가할 때 Lain이 먼저 제안한다 (②)
+                </span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">자동 다운로드</span>
+                <input
+                  type="checkbox"
+                  checked={settings.updateAutoDownload}
+                  onChange={(e) => patch({ updateAutoDownload: e.target.checked })}
+                />
+                <span className="dim settings-hint">
+                  새 버전을 백그라운드로 미리 받아둠 — 설치(재시작)는 항상 수동 (③). 기본 꺼짐
+                </span>
               </label>
               <label className="settings-row">
                 <span className="settings-key">자동 우선순위</span>

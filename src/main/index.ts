@@ -42,6 +42,7 @@ import { startTelegram, stopTelegram } from './telegram'
 import { startDiscord, stopDiscord } from './discord'
 import { DATA_DIR } from './paths'
 import { appendCapped } from './logfile'
+import { initUpdater } from './updater'
 
 // 최후 안전망 — 메인은 텔레그램 폴러·스케줄러·Navi·watcher 등 fire-and-forget 비동기가 많다.
 // 그 중 하나라도 미처리 거부/예외로 새면 Node 기본 동작상 데몬 전체(트레이·작업·승인큐)가 죽는다.
@@ -254,6 +255,8 @@ app.whenReady().then(async () => {
   // Phase 3: 트레이 상주 + 주기 스캔 (§15, §12.5b) — 각각 격리
   bootStep('setupTray', () => setupTray(() => mainWin, createWindow))
   bootStep('rearmScheduler', () => rearmScheduler())
+  // 자동 업데이트 엔진 — 패키징본만 동작(dev no-op). 부팅 8초 후 1회 + 6시간 주기 체크.
+  bootStep('updater', () => initUpdater())
   // 클로드코드 연동(개선 #2) — 켜져 있으면 훅 설치 + inbox 감시 시작(꺼졌으면 잔여 훅 제거). 격리.
   bootStep('ccHooks', () => applyCcHooks())
   // 시작 시 레인 브리핑 1회 생성(프로덕션엔 startup 스캔이 없어 주기 스캔 전까지 브리핑이 비던 것 교정).

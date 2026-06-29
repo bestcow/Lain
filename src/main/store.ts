@@ -2298,6 +2298,8 @@ export function getSettings(): LainSettings {
     gptSovitsRefAudio: getSetting('gpt_sovits_ref_audio') ?? '',
     gptSovitsRefText: getSetting('gpt_sovits_ref_text') ?? '',
     gptSovitsRefLang: getSetting('gpt_sovits_ref_lang') ?? 'ko',
+    updateNotify: (getSetting('update_notify') ?? '1') === '1',
+    updateAutoDownload: (getSetting('update_auto_download') ?? '0') === '1',
   }
 }
 
@@ -2316,6 +2318,9 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
   if (patch.managerFastMode !== undefined)
     setSetting('manager_fast_mode', patch.managerFastMode ? '1' : '0')
   if (patch.defaultTaskMode !== undefined) setSetting('default_task_mode', patch.defaultTaskMode)
+  if (patch.updateNotify !== undefined) setSetting('update_notify', patch.updateNotify ? '1' : '0')
+  if (patch.updateAutoDownload !== undefined)
+    setSetting('update_auto_download', patch.updateAutoDownload ? '1' : '0')
   if (patch.overlayMonitoringEnabled !== undefined)
     setSetting('overlay_monitoring_enabled', patch.overlayMonitoringEnabled ? '1' : '0')
   if (patch.monitorSensitiveApps !== undefined)

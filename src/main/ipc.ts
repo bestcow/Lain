@@ -43,6 +43,14 @@ import {
   deleteMcpServer,
 } from './store'
 import { listPlugins, installPlugin, uninstallPlugin } from './plugins'
+import {
+  getUpdateStatus,
+  checkForUpdates,
+  downloadUpdate,
+  installUpdate,
+  setUpdateBroadcaster,
+  applyUpdaterSettings,
+} from './updater'
 import { sendToNavi, sendToAllNavis, stopNaviChat } from './navichat'
 import { diffBody } from './worktree'
 import { setInboxOpen } from './notify'
@@ -109,6 +117,8 @@ async function refresh(id: string | null): Promise<void> {
 }
 
 export function registerIpc(): void {
+  // 자동 업데이트 상태를 렌더러로 흘려보낼 broadcaster 주입(엔진은 index.ts initUpdater에서 시작)
+  setUpdateBroadcaster((s) => broadcast('update:status', s))
   // 창 제어 (frameless) — sender의 BrowserWindow에 위임
   ipcMain.handle('window:minimize', (e) => {
     BrowserWindow.fromWebContents(e.sender)?.minimize()
@@ -527,8 +537,16 @@ export function registerIpc(): void {
     if (patch.ccHooksEnabled !== undefined) applyCcHooks()
     // 어깨너머 토글 변경 시 오버레이/감시 즉시 재평가
     if (patch.overlayMonitoringEnabled !== undefined) syncOverlayMode()
+    // 자동 다운로드 토글 변경을 업데이트 엔진에 반영
+    if (patch.updateAutoDownload !== undefined) applyUpdaterSettings()
     return s
   })
+
+  // 자동 업데이트 — ④ UI 버튼/상태 (감지·다운로드·설치)
+  ipcMain.handle('update:status', () => getUpdateStatus())
+  ipcMain.handle('update:check', () => checkForUpdates())
+  ipcMain.handle('update:download', () => downloadUpdate())
+  ipcMain.handle('update:install', () => installUpdate())
 
   ipcMain.handle('telegram:status', () => telegramStatus())
 

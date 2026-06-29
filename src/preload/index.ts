@@ -12,6 +12,7 @@ import type {
   TaskEvent,
   NaviChatEvent,
   DiscordStateEvent,
+  UpdateStatus,
 } from '../shared/types'
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -65,6 +66,12 @@ const api: LainApi = {
   // 설정
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (patch) => ipcRenderer.invoke('settings:set', patch),
+  // 자동 업데이트
+  getUpdateStatus: () => ipcRenderer.invoke('update:status'),
+  checkForUpdate: () => ipcRenderer.invoke('update:check'),
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
+  installUpdate: () => ipcRenderer.invoke('update:install'),
+  onUpdateStatus: (cb) => subscribe<UpdateStatus>('update:status', cb),
   telegramStatus: () => ipcRenderer.invoke('telegram:status'),
   discordStatus: () => ipcRenderer.invoke('discord:status'),
   onDiscordState: (cb) => subscribe<DiscordStateEvent>('discord:state', cb),

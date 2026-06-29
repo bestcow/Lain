@@ -23,3 +23,9 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: always
   shortcutName: Lain
+# 사용자용 자동 업데이트 피드 — GitHub Releases (electron-updater).
+# 발행: electron-builder --publish always (+ GH_TOKEN). --dir(deploy)·--win(dist)은 발행 안 함.
+publish:
+  provider: github
+  owner: bestcow
+  repo: Lain

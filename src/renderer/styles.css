@@ -2513,6 +2513,94 @@ button:disabled {
   background: rgba(240, 180, 107, 0.2);
 }
 
+/* ── 자동 업데이트: ② Lain 제안 배너(고정 토스트) + ④ 설정 버튼 ── */
+.upd-banner {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 92vw;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--signal);
+  border-radius: 8px;
+  box-shadow:
+    0 8px 28px rgba(0, 0, 0, 0.55),
+    0 0 12px rgba(177, 140, 240, 0.25);
+  font-size: 12px;
+  -webkit-app-region: no-drag;
+}
+.upd-banner-prefix {
+  flex: none;
+  color: var(--signal);
+  font-weight: 600;
+}
+.upd-banner-msg {
+  color: var(--signal-bright);
+  letter-spacing: 0.2px;
+}
+.upd-banner-btn {
+  flex: none;
+  font-size: 11px;
+  padding: 3px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  font-family: var(--font);
+}
+.upd-banner-btn:hover {
+  color: var(--signal-bright);
+  border-color: var(--signal);
+}
+.upd-banner-btn.ok {
+  border-color: var(--signal);
+  color: var(--signal);
+}
+.upd-banner-btn.ok:hover {
+  background: rgba(177, 140, 240, 0.14);
+  color: var(--signal-bright);
+}
+/* ④ 환경설정 업데이트 행 */
+.upd-controls {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.upd-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--signal);
+  cursor: pointer;
+  font-family: var(--font);
+}
+.upd-btn:hover:not(:disabled) {
+  border-color: var(--signal);
+  color: var(--signal-bright);
+  background: rgba(177, 140, 240, 0.1);
+}
+.upd-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+  color: var(--text-3);
+  border-color: var(--border);
+}
+.upd-btn.upd-apply {
+  border-color: var(--phosphor);
+  color: var(--phosphor);
+}
+.upd-btn.upd-apply:hover:not(:disabled) {
+  background: rgba(102, 230, 176, 0.12);
+}
+
 /* 막힌 작업의 명세 질문 — Navi 채팅 상단. 입력이 답변으로 먹히던 혼란 차단 */
 .blocked-banner {
   flex: none;

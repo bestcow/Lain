@@ -19,6 +19,7 @@ import type {
   TaskEvent,
   DiscordCallState,
   LainSettings,
+  UpdateStatus,
 } from '../shared/types'
 import { NaviTile } from './components/NaviTile'
 import { naviStatus } from './components/StageView'
@@ -122,6 +123,13 @@ export default function App() {
   const [settings, setSettings] = useState<LainSettings | null>(null)
   useEffect(() => {
     void window.lain.getSettings().then(setSettings)
+  }, [])
+  // 자동 업데이트 — ② Lain 제안 배너(설정 화면 ④와 같은 onUpdateStatus 스트림 구독)
+  const [upd, setUpd] = useState<UpdateStatus | null>(null)
+  const [updDismissed, setUpdDismissed] = useState<string | null>(null) // '나중에' 한 버전(그 버전만 숨김)
+  useEffect(() => {
+    void window.lain.getUpdateStatus().then(setUpd)
+    return window.lain.onUpdateStatus(setUpd)
   }, [])
   // Ctrl+K/Ctrl+P 명령 팔레트
   const [paletteOpen, setPaletteOpen] = useState(false)
@@ -1165,6 +1173,34 @@ export default function App() {
 
   return (
     <div className={`app${crtFx ? ' crt' : ''}${theme !== 'wired' ? ` theme-${theme}` : ''}`}>
+      {/* ② 자동 업데이트 — Lain이 한가할 때 띄우는 제안 배너(고정 토스트). '나중에'는 그 버전만 숨김. */}
+      {upd?.suggested &&
+        upd.version &&
+        upd.version !== updDismissed &&
+        (upd.state === 'available' || upd.state === 'downloading' || upd.state === 'downloaded') && (
+          <div className="upd-banner">
+            <span className="upd-banner-prefix">Lain&gt;</span>
+            <span className="upd-banner-msg">
+              {upd.state === 'downloaded'
+                ? `새 버전 v${upd.version} 준비됐어. 재시작하면 적용돼.`
+                : upd.state === 'downloading'
+                  ? `새 버전 v${upd.version} 받는 중… ${upd.percent ?? 0}%`
+                  : `새 버전 v${upd.version} 나왔어. 지금 받을까?`}
+            </span>
+            {upd.state === 'downloaded' ? (
+              <button className="upd-banner-btn ok" onClick={() => void window.lain.installUpdate()}>
+                지금 적용
+              </button>
+            ) : upd.state === 'available' ? (
+              <button className="upd-banner-btn ok" onClick={() => void window.lain.downloadUpdate()}>
+                지금 업데이트
+              </button>
+            ) : null}
+            <button className="upd-banner-btn" onClick={() => setUpdDismissed(upd.version ?? null)}>
+              나중에
+            </button>
+          </div>
+        )}
       <header
         className="manager-bar panel"
         onDoubleClick={(e) => {

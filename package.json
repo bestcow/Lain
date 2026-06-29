@@ -4,9 +4,14 @@
   "description": "Multi-project Claude Code orchestrator",
   "author": "bestcow",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/bestcow/Lain.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bestcow/Lain.git"
+  },
   "homepage": "https://github.com/bestcow/Lain#readme",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
@@ -23,6 +28,7 @@
     "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.19.2",
     "discord.js": "^14.26.4",
+    "electron-updater": "^6.8.9",
     "libsodium-wrappers": "^0.7.16",
     "msedge-tts": "^2.0.6",
     "opusscript": "^0.0.8",

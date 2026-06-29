@@ -303,6 +303,19 @@ export interface LainSettings {
   gptSovitsRefAudio: string // 참조 음성 클립 경로(목소리 복제용 3~10초) — 서버가 접근할 로컬 경로
   gptSovitsRefText: string // 참조 클립의 전사(prompt_text)
   gptSovitsRefLang: string // 참조 클립의 언어(prompt_lang) — 'ko'|'ja'|'en'|'zh'. 일본 성우 음색=ja(교차언어)
+  // 자동 업데이트 (electron-updater + GitHub Releases)
+  updateNotify: boolean // ② 새 버전 감지 시 Lain이 자발 제안(작업 한가할 때만). 기본 on
+  updateAutoDownload: boolean // ③ 백그라운드 자동 '다운로드'만(설치는 항상 수동). 기본 off
+}
+
+// 자동 업데이트 상태 — main(updater) → 렌더러(배너·설정 화면) 단일 출처.
+export interface UpdateStatus {
+  state: 'disabled' | 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
+  currentVersion: string // 현재 설치 버전(app.getVersion). dev/미패키징은 state='disabled'
+  version?: string // 감지/다운로드된 새 버전
+  percent?: number // 다운로드 진행률(0~100)
+  error?: string
+  suggested?: boolean // ② Lain이 제안을 띄웠는지 — 렌더러 배너 트리거
 }
 
 // 작업 드로어를 대화 트랜스크립트로 렌더하기 위한 화자 귀속(옵션). 없으면 시스템 로그 줄(기존 표시).
@@ -409,6 +422,12 @@ export interface LainApi {
   // 설정
   getSettings(): Promise<LainSettings>
   setSettings(patch: Partial<LainSettings>): Promise<LainSettings>
+  // 자동 업데이트 — ④ UI 버튼/상태 + ② Lain 제안 배너
+  getUpdateStatus(): Promise<UpdateStatus>
+  checkForUpdate(): Promise<UpdateStatus>
+  downloadUpdate(): Promise<UpdateStatus>
+  installUpdate(): Promise<void>
+  onUpdateStatus(cb: (s: UpdateStatus) => void): () => void
   // §20.3 텔레그램 — 어댑터 연결 상태 (토큰 검증용)
   telegramStatus(): Promise<TelegramStatus>
   // §20.3 디스코드 — 음성 통화 어댑터 연결 상태
