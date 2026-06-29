@@ -71,3 +71,5 @@ Navi 자동 스캔 루트는 **환경변수**로 바꿀 수 있다(기본값은 
 ## 라이선스
 
 [MIT](LICENSE). 번들된 폰트·에셋 등 제3자 구성요소의 라이선스는 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 참조.
+
+자기개선·저널링 구조는 **Hermes** 에이전트(MIT)에서 영감받아 독립 재구현했다(코드 복사 없음).
