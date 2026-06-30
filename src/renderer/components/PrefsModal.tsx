@@ -15,6 +15,16 @@ import { MODEL_IDS } from '../../shared/models'
 
 const TIERS: ModelTier[] = ['haiku', 'sonnet', 'opus']
 
+// 환경설정 카테고리(좌측 nav) — 현재 설정들을 묶음. 순서·이름·분류는 자유 조정.
+const CATS: { id: string; label: string }[] = [
+  { id: 'general', label: '일반' },
+  { id: 'models', label: '모델' },
+  { id: 'automation', label: '자동화·고급' },
+  { id: 'telegram', label: '텔레그램' },
+  { id: 'voice', label: '음성·통화' },
+  { id: 'extensions', label: '확장' },
+]
+
 // 업데이트 상태 → 사람이 읽을 한 줄 힌트(④ 설정 행).
 function updHint(u: UpdateStatus | null): string {
   if (!u) return '확인 중…'
@@ -451,6 +461,7 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
   const [tg, setTg] = useState<TelegramStatus | null>(null)
   const [dc, setDc] = useState<DiscordStatus | null>(null)
   const [upd, setUpd] = useState<UpdateStatus | null>(null)
+  const [cat, setCat] = useState('general') // 환경설정 카테고리(좌측 nav)
   const [ttsTesting, setTtsTesting] = useState(false)
   const [ttsTestMsg, setTtsTestMsg] = useState('')
   const runTtsTest = async () => {
@@ -521,7 +532,21 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
           {!settings ? (
             <div className="dim">로딩...</div>
           ) : (
-            <div className="settings-body">
+            <div className="prefs-2col">
+              <nav className="prefs-nav">
+                {CATS.map((c) => (
+                  <button
+                    key={c.id}
+                    className={`prefs-nav-item${cat === c.id ? ' on' : ''}`}
+                    onClick={() => setCat(c.id)}
+                  >
+                    {c.label}
+                  </button>
+                ))}
+              </nav>
+              <div className="settings-body prefs-content">
+                {cat === 'models' && (
+                  <>
               <label className="settings-row">
                 <span className="settings-key">동시 작업 cap</span>
                 <input
@@ -551,6 +576,10 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 value={settings.judgeModel}
                 onChange={(v) => patch({ judgeModel: v })}
               />
+                  </>
+                )}
+                {cat === 'general' && (
+                  <>
               <label className="settings-row">
                 <span className="settings-key">주기 스캔(분)</span>
                 <input
@@ -656,6 +685,10 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                   새 버전을 백그라운드로 미리 받아둠 — 설치(재시작)는 항상 수동 (③). 기본 꺼짐
                 </span>
               </label>
+                  </>
+                )}
+                {cat === 'automation' && (
+                  <>
               <label className="settings-row">
                 <span className="settings-key">자동 우선순위</span>
                 <input
@@ -765,6 +798,10 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 </span>
               </label>
 
+                  </>
+                )}
+                {cat === 'telegram' && (
+                  <>
               {/* §20.3 텔레그램 채널 — 자리 비웠을 때 폰으로 와이어드 지휘·결재 */}
               <div className="dim" style={{ marginTop: 12, borderTop: '1px solid #1c3a2c', paddingTop: 8 }}>
                 ── 텔레그램 (§20.3 폰에서 지휘·결재)
@@ -838,6 +875,10 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 }
               />
 
+                  </>
+                )}
+                {cat === 'voice' && (
+                  <>
               {/* §20.3 디스코드 음성 통화 — 폰/데스크 음성채널로 레인과 실시간 통화 */}
               <div className="dim" style={{ marginTop: 12, borderTop: '1px solid #1c3a2c', paddingTop: 8 }}>
                 ── 디스코드 음성 통화 (§20.3 음성으로 지휘)
@@ -1038,13 +1079,19 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                   </div>
                 </>
               )}
-
+                  </>
+                )}
+                {cat === 'extensions' && (
+                  <>
               <McpServersSection />
 
               <PluginsSection
                 curated={settings.curatedPlugins ?? []}
                 onSetCurated={(names) => patch({ curatedPlugins: names })}
               />
+                  </>
+                )}
+              </div>
             </div>
           )}
         </div>

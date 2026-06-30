@@ -2601,6 +2601,52 @@ button:disabled {
   background: rgba(102, 230, 176, 0.12);
 }
 
+/* ── 환경설정 2단: 좌측 카테고리 nav + 우측 내용 ── */
+.prefs-2col {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+.prefs-nav {
+  flex: none;
+  width: 148px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 8px 2px 0;
+  border-right: 1px solid var(--border);
+}
+.prefs-nav-item {
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--font);
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition:
+    background 0.1s,
+    color 0.1s;
+}
+.prefs-nav-item:hover {
+  background: var(--surface-2);
+  color: var(--signal-bright);
+}
+.prefs-nav-item.on {
+  background: rgba(177, 140, 240, 0.14);
+  color: var(--signal-bright);
+  box-shadow: inset 2px 0 0 var(--signal);
+}
+.prefs-content {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  max-height: 64vh;
+  padding-left: 16px;
+}
+
 /* 막힌 작업의 명세 질문 — Navi 채팅 상단. 입력이 답변으로 먹히던 혼란 차단 */
 .blocked-banner {
   flex: none;
