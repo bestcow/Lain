@@ -307,6 +307,7 @@ export interface LainSettings {
   supertonicVoice: string // 보이스 스타일 F1~F5 / M1~M5 (기본 F5)
   supertonicSpeed: number // 말 속도 0.5~2.0 (기본 1.05)
   supertonicStep: number // 디노이즈 스텝 2~16 (높을수록 품질↑·느림, 기본 8)
+  voiceTone: 'deadpan' | 'subtle' | 'expressive' // 음성 답변 기본 톤(감정 태그 사용량). 기본 deadpan(무미건조·태그 0)
   // 자동 업데이트 (electron-updater + GitHub Releases)
   updateNotify: boolean // ② 새 버전 감지 시 Lain이 자발 제안(작업 한가할 때만). 기본 on
   updateAutoDownload: boolean // ③ 백그라운드 자동 '다운로드'만(설치는 항상 수동). 기본 off

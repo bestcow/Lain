@@ -978,6 +978,22 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                   Supertonic=인앱 한국어(파이썬 없음·빠름) · GPT-SoVITS=음성복제(서버 필요)
                 </span>
               </label>
+              <label className="settings-row">
+                <span className="settings-key">기본 톤</span>
+                <select
+                  value={settings.voiceTone || 'deadpan'}
+                  onChange={(e) =>
+                    patch({ voiceTone: e.target.value as 'deadpan' | 'subtle' | 'expressive' })
+                  }
+                >
+                  <option value="deadpan">무미건조 (감정 표현 없음 · 기본)</option>
+                  <option value="subtle">미세한 감정 (아주 드물게)</option>
+                  <option value="expressive">표현 풍부 (감정 태그 적극)</option>
+                </select>
+                <span className="dim settings-hint">
+                  음성 답변의 말투·감정 — 레인이 감정 태그(&lt;sigh&gt; 등)를 얼마나 쓸지. 태그는 Supertonic에서만 발음됨
+                </span>
+              </label>
               {settings.ttsBackend === 'gpt-sovits' && (
                 <>
                   <TelegramField
