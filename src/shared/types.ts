@@ -520,4 +520,5 @@ export interface LainApi {
   // 어깨너머 오버레이 — 클릭 시 메인창 복귀 / 내용 높이에 맞춰 창 리사이즈(fire-and-forget)
   openMainWindow(): Promise<void>
   overlayResize(height: number): void
+  overlaySetVisible(visible: boolean): void // 유저 감시 — proactive 반응 시 오버레이 표시/숨김
 }

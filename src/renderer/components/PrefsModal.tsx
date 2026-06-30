@@ -591,6 +591,17 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 />
                 <span className="dim settings-hint">로그인 시 트레이로 기동 (패키징 실행에서만 유효)</span>
               </label>
+              <label className="settings-row">
+                <span className="settings-key">유저 감시</span>
+                <input
+                  type="checkbox"
+                  checked={settings.overlayMonitoringEnabled}
+                  onChange={(e) => patch({ overlayMonitoringEnabled: e.target.checked })}
+                />
+                <span className="dim settings-hint">
+                  메인창을 안 볼 때 화면 작업을 관찰해, Lain이 먼저 도울 말이 있을 때만 우하단에 잠깐 떴다 사라짐
+                </span>
+              </label>
               {/* 자동 업데이트 — ④ 수동 확인/적용 + ② Lain 제안 + ③ 자동 다운로드 토글 */}
               <div className="settings-row">
                 <span className="settings-key">업데이트</span>

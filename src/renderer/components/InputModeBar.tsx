@@ -166,16 +166,6 @@ export function InputModeBar({
           header="동시 작업"
           align="right"
         />
-        <button
-          className={`imb-watch${settings.overlayMonitoringEnabled ? ' imb-on' : ''}`}
-          onClick={() => onPatch({ overlayMonitoringEnabled: !settings.overlayMonitoringEnabled })}
-          title="어깨너머 — 메인창을 안 볼 때 화면 작업을 관찰해 먼저 조언(우하단 오버레이). on/off"
-        >
-          <span>어깨너머</span>
-          <span
-            className={`imb-switch${settings.overlayMonitoringEnabled ? ' imb-switch-on' : ''}`}
-          />
-        </button>
         <span className="imb-orb" title="사용량 (곧)" />
       </div>
     </div>

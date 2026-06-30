@@ -126,18 +126,16 @@ export function openMainWindow(): void {
   main.focus()
 }
 
-// 단일 평가 — (어깨너머 ON) && (메인창 비활성)일 때만 오버레이+감시, 아니면 끈다.
+// 단일 평가 — (유저 감시 ON && 메인창 비활성)이면 '감시'만 돌린다(화면 관찰). 오버레이는 평소 숨김 —
+// Lain이 먼저 말을 걸 때(proactive 반응)만 setOverlayVisible로 잠깐 떴다 사라진다(상시 표시 안 함).
 export function syncOverlayMode(): void {
   try {
     const enabled = getSettings().overlayMonitoringEnabled
     const main = getMainWin()
     const mainActive = !!(main && !main.isDestroyed() && main.isVisible() && !main.isMinimized())
-    olog(
-      `sync enabled=${enabled} mainNull=${!main} mainActive=${mainActive} -> ${enabled && !mainActive ? 'SHOW' : 'hide'}`,
-    )
+    olog(`sync enabled=${enabled} mainActive=${mainActive} -> ${enabled && !mainActive ? 'WATCH' : 'off'}`)
     if (enabled && !mainActive) {
-      showOverlay()
-      startWatcher()
+      startWatcher() // 감시만 — 오버레이는 반응 시에만 표시
     } else {
       hideOverlay()
       stopWatcher()
@@ -147,5 +145,21 @@ export function syncOverlayMode(): void {
     olog(`sync ERROR: ${e instanceof Error ? e.stack || e.message : e}`)
     hideOverlay()
     stopWatcher()
+  }
+}
+
+// 렌더러(overlay.tsx)가 proactive 반응 시 표시를 요청 — (유저 감시 ON && 메인 비활성)일 때만 띄운다. 숨김은 항상 허용.
+export function setOverlayVisible(visible: boolean): void {
+  try {
+    if (!visible) {
+      hideOverlay()
+      return
+    }
+    const enabled = getSettings().overlayMonitoringEnabled
+    const main = getMainWin()
+    const mainActive = !!(main && !main.isDestroyed() && main.isVisible() && !main.isMinimized())
+    if (enabled && !mainActive) showOverlay()
+  } catch (e) {
+    olog(`setOverlayVisible ERROR: ${e instanceof Error ? e.stack || e.message : e}`)
   }
 }

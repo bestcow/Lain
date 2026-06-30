@@ -65,7 +65,7 @@ import {
   answerUserQuestion,
 } from './manager'
 import { applyCcHooks, refreshCcLinkIfEnabled } from './cchooks'
-import { syncOverlayMode, openMainWindow, resizeOverlay } from './overlay-window'
+import { syncOverlayMode, openMainWindow, resizeOverlay, setOverlayVisible } from './overlay-window'
 import { bindTitleRefresh } from './title'
 import {
   bindOrchestrator,
@@ -139,6 +139,8 @@ export function registerIpc(): void {
   // 어깨너머 오버레이 — 클릭 시 메인창 복귀, 내용 높이에 맞춘 리사이즈(fire-and-forget)
   ipcMain.handle('window:openMain', () => openMainWindow())
   ipcMain.on('overlay:resize', (_e, height: number) => resizeOverlay(Number(height) || 0))
+  // 유저 감시 — 렌더러가 proactive 반응 시 오버레이 표시/숨김 요청(게이트는 main에서)
+  ipcMain.on('overlay:setVisible', (_e, visible: boolean) => setOverlayVisible(!!visible))
 
   ipcMain.handle('projects:list', () => listProjects())
 

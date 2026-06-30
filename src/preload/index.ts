@@ -138,6 +138,7 @@ const api: LainApi = {
   // 어깨너머 오버레이
   openMainWindow: () => ipcRenderer.invoke('window:openMain'),
   overlayResize: (height) => ipcRenderer.send('overlay:resize', height),
+  overlaySetVisible: (visible) => ipcRenderer.send('overlay:setVisible', visible),
   // OS 알림 클릭 → 대기 항목(Inbox) 열기
   onOpenInbox: (cb) => {
     const h = () => cb()

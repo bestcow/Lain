@@ -46,7 +46,23 @@ body {
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 0 14px rgba(177, 140, 240, 0.12);
   backdrop-filter: blur(3px);
   cursor: pointer;
-  animation: ov-in 0.16s ease-out;
+  transition:
+    transform 0.28s ease,
+    opacity 0.28s ease;
+}
+/* 슬라이드 등장/퇴장 단계 — 렌더러가 phase 클래스 토글(proactive 반응 때만 등장, 시간 후 퇴장) */
+.ov-card.ov-hidden,
+.ov-card.ov-enter,
+.ov-card.ov-exit {
+  opacity: 0;
+  transform: translateY(28px);
+}
+.ov-card.ov-hidden {
+  pointer-events: none;
+}
+.ov-card.ov-shown {
+  opacity: 1;
+  transform: translateY(0);
 }
 /* 내용이 잘릴 때만 보이는 하단 페이드 — '더 있음(클릭)' 신호 */
 .ov-fade {
