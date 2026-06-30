@@ -62,20 +62,35 @@ export type SupertonicOpts = { voice?: string; speed?: number; step?: number }
 export async function synthesizeSupertonic(text: string, opts: SupertonicOpts = {}): Promise<Buffer> {
   const { ensureSupertonic } = await import('./supertonic-proc')
   const port = await ensureSupertonic()
-  const resp = await fetch(`http://127.0.0.1:${port}/tts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      text,
-      voice: opts.voice || 'F5',
-      lang: 'ko', // 출력은 항상 한국어
-      speed: opts.speed ?? 1.05,
-      step: opts.step ?? 8,
-    }),
+  const body = JSON.stringify({
+    text,
+    voice: opts.voice || 'F5',
+    lang: 'ko', // 출력은 항상 한국어
+    speed: opts.speed ?? 1.05,
+    step: opts.step ?? 8,
   })
-  if (!resp.ok) {
-    const err = await resp.text().catch(() => '')
-    throw new Error(`supertonic ${resp.status} ${err.slice(0, 160)}`)
+  // 사이드카 콜드스타트(spawn~listen 갭) + 모델 로드(준비 전 503)를 흡수 — 준비될 때까지 재시도.
+  // 모델이 캐시에 있으면 ~1초 내 준비. 미캐시면 다운로드 중 → 데드라인 후 throw(호출측 edge 폴백/안내).
+  const deadline = Date.now() + 20000
+  let lastErr = 'init'
+  while (Date.now() < deadline) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      })
+      if (resp.ok) return Buffer.from(await resp.arrayBuffer())
+      if (resp.status !== 503) {
+        const err = await resp.text().catch(() => '')
+        throw new Error(`supertonic ${resp.status} ${err.slice(0, 160)}`)
+      }
+      lastErr = '준비 중(503)' // 모델 로딩/다운로드 중 — 재시도
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith('supertonic ')) throw e // 실제 HTTP 에러는 즉시
+      lastErr = String((e as Error)?.message || e) // fetch failed(아직 미기동) — 재시도
+    }
+    await new Promise((r) => setTimeout(r, 450))
   }
-  return Buffer.from(await resp.arrayBuffer())
+  throw new Error(`supertonic 준비 시간 초과 — ${lastErr} (모델 다운로드 중이면 잠시 후 다시)`)
 }
