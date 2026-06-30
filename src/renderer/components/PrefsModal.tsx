@@ -1041,8 +1041,8 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                     <span className="settings-key">말 속도</span>
                     <input
                       type="range"
-                      min={0.7}
-                      max={1.5}
+                      min={0.5}
+                      max={2.0}
                       step={0.05}
                       value={settings.supertonicSpeed ?? 1.05}
                       onChange={(e) => patch({ supertonicSpeed: Number(e.target.value) })}
@@ -1055,8 +1055,8 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                     <span className="settings-key">품질 스텝</span>
                     <input
                       type="range"
-                      min={4}
-                      max={12}
+                      min={2}
+                      max={16}
                       step={1}
                       value={settings.supertonicStep ?? 8}
                       onChange={(e) => patch({ supertonicStep: Number(e.target.value) })}
@@ -1075,6 +1075,14 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                     <span className="dim settings-hint">
                       {ttsTestMsg ||
                         '현재 보이스·속도로 한 문장 합성해 들려줌 (첫 사용 시 모델 ~398MB 1회 다운로드)'}
+                    </span>
+                  </div>
+                  <div className="settings-row">
+                    <span className="settings-key">감정</span>
+                    <span className="dim settings-hint">
+                      Supertonic은 감정을 <b>수치가 아니라 텍스트 태그</b>로 표현 — 말할 문장에{' '}
+                      <code>&lt;laugh&gt; &lt;sigh&gt; &lt;breath&gt; &lt;scream&gt;</code> 를 넣는다.
+                      피치·톤 같은 별도 숫자 파라미터는 Supertonic에 없음(조절 수치는 위 보이스·속도·품질이 전부).
                     </span>
                   </div>
                 </>
