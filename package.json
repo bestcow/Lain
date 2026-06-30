@@ -20,7 +20,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "dist": "electron-vite build && electron-builder --win",
+    "dist": "electron-vite build && npm --prefix sidecar/supertonic install --omit=dev && electron-builder --win",
     "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1"
   },
   "dependencies": {

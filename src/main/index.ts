@@ -43,6 +43,7 @@ import { startDiscord, stopDiscord } from './discord'
 import { DATA_DIR } from './paths'
 import { appendCapped } from './logfile'
 import { initUpdater } from './updater'
+import { stopSupertonic } from './supertonic-proc'
 
 // 최후 안전망 — 메인은 텔레그램 폴러·스케줄러·Navi·watcher 등 fire-and-forget 비동기가 많다.
 // 그 중 하나라도 미처리 거부/예외로 새면 Node 기본 동작상 데몬 전체(트레이·작업·승인큐)가 죽는다.
@@ -583,6 +584,8 @@ app.on('before-quit', () => {
   // 어깨너머 상주 PowerShell·오버레이 정리 — 안 죽이면 종료/배포 반복마다 고아 PS가 쌓인다.
   stopWatcher()
   destroyOverlayWindow()
+  // Supertonic 사이드카(node 자식) 정리 — 안 죽이면 고아 node 프로세스가 쌓인다.
+  stopSupertonic()
   // WAL을 메인에 합치고 DB를 닫는다 — WAL이 비대한 채 방치되다 다음 강제종료에 손상되는 경로를 줄인다.
   closeStore()
 })

@@ -548,6 +548,22 @@ export function registerIpc(): void {
   ipcMain.handle('update:download', () => downloadUpdate())
   ipcMain.handle('update:install', () => installUpdate())
 
+  // Supertonic TTS — 설정 테스트 재생(현재 보이스·속도로 한 문장 합성 → base64 WAV) + 모델 준비/다운로드 상태
+  ipcMain.handle('tts:test', async (_e, text?: string) => {
+    const tts = await import('./tts')
+    const s = getSettings()
+    const buf = await tts.synthesizeSupertonic(text || '안녕, 나 레인이야. 지금 이 목소리로 말해.', {
+      voice: s.supertonicVoice,
+      speed: s.supertonicSpeed,
+      step: s.supertonicStep,
+    })
+    return buf.toString('base64')
+  })
+  ipcMain.handle('tts:supertonicStatus', async () => {
+    const { supertonicStatus } = await import('./supertonic-proc')
+    return supertonicStatus()
+  })
+
   ipcMain.handle('telegram:status', () => telegramStatus())
 
   ipcMain.handle('discord:status', () => discordStatus())

@@ -61,6 +61,9 @@ function setCallState(state: DiscordCallState, error?: string): void {
 let currentCallConv: string | null = null
 let speaking = false // 봇이 TTS 재생 중인지(barge-in 판정용)
 const speakQueue: string[] = [] // 매니저 assistant 텍스트 발화 큐(순차 재생)
+let sentenceQueue: Buffer[] = [] // A: 현재 발화를 문장 단위로 쪼갠 합성 결과 재생 큐(스트리밍)
+let synthInFlight = false // 현재 발화의 다음 문장 합성 중 — Idle이어도 발화 유지
+let speakGen = 0 // 발화 세대 — barge-in/새 발화 시 증가해 진행 중 파이프라인 취소
 let pendingAction: string | null = null // #5 파괴적 작업 — 확인("네") 대기 중인 원 발화
 let recvFlushTimer: ReturnType<typeof setTimeout> | null = null // 수신 프레임 끊김 감지 → 발화 마감(flush)
 
@@ -72,11 +75,19 @@ function isAffirmative(t: string): boolean {
 const player = createAudioPlayer()
 player.on(AudioPlayerStatus.Playing, () => dlog('player: playing(송출 시작)'))
 player.on(AudioPlayerStatus.Idle, () => {
+  if (sentenceQueue.length) {
+    playNextSentence() // 같은 발화의 다음 문장 — 발화 큐로 안 넘어감
+    return
+  }
+  if (synthInFlight) return // 다음 문장 합성 대기 — 발화 유지(짧은 무음 후 이어짐)
   speaking = false
   void drainSpeakQueue()
 })
 player.on('error', (e) => {
   speaking = false
+  sentenceQueue = []
+  synthInFlight = false
+  speakGen++
   dlog(`player error: ${e.message}`)
   void drainSpeakQueue()
 })
@@ -383,52 +394,127 @@ async function drainSpeakQueue(): Promise<void> {
   await speak(text)
 }
 
+// A: 텍스트를 문장 단위로 분할 — 첫 문장부터 합성·재생해 체감 지연(time-to-first-audio)을 줄인다.
+function splitSentences(text: string): string[] {
+  const raw = text.replace(/\s+/g, ' ').trim()
+  if (!raw) return []
+  const parts = raw.match(/[^.!?。！？\n]+[.!?。！？]*/g) || [raw]
+  const out: string[] = []
+  let buf = ''
+  for (const p of parts) {
+    const seg = p.trim()
+    if (!seg) continue
+    buf = buf ? `${buf} ${seg}` : seg
+    if (buf.length >= 12) {
+      out.push(buf) // 너무 짧은 조각은 합쳐서 자연스럽게
+      buf = ''
+    }
+  }
+  if (buf) out.push(buf)
+  return out
+}
+
+// 한 문장(또는 청크)을 현재 백엔드로 합성 → Buffer. supertonic/gpt-sovits 실패 시 Edge 폴백.
+async function synthOne(
+  cfg: ReturnType<typeof getSettings>,
+  tts: typeof import('./tts'),
+  text: string,
+): Promise<Buffer> {
+  const t0 = Date.now()
+  if (cfg.ttsBackend === 'supertonic') {
+    try {
+      const a = await tts.synthesizeSupertonic(text, {
+        voice: cfg.supertonicVoice,
+        speed: cfg.supertonicSpeed,
+        step: cfg.supertonicStep,
+      })
+      dlog(`synth supertonic ${a.length}B in ${Date.now() - t0}ms`)
+      return a
+    } catch (e) {
+      dlog(`supertonic fail → edge 폴백: ${(e as Error).message}`)
+      return tts.synthesize(text, cfg.discordTtsVoice || undefined)
+    }
+  }
+  if (cfg.ttsBackend === 'gpt-sovits' && cfg.gptSovitsRefAudio) {
+    try {
+      const a = await tts.synthesizeGptSovits(text, {
+        url: cfg.gptSovitsUrl,
+        refAudio: cfg.gptSovitsRefAudio,
+        refText: cfg.gptSovitsRefText,
+        refLang: cfg.gptSovitsRefLang,
+      })
+      dlog(`synth gpt-sovits ${a.length}B in ${Date.now() - t0}ms`)
+      return a
+    } catch (e) {
+      dlog(`gpt-sovits fail → edge 폴백: ${(e as Error).message}`)
+      return tts.synthesize(text, cfg.discordTtsVoice || undefined)
+    }
+  }
+  const a = await tts.synthesize(text, cfg.discordTtsVoice || undefined)
+  dlog(`synth edge ${a.length}B in ${Date.now() - t0}ms`)
+  return a
+}
+
+function playNextSentence(): void {
+  const audio = sentenceQueue.shift()
+  if (!audio) return
+  player.play(createAudioResource(Readable.from(audio)))
+}
+
 async function speak(text: string): Promise<void> {
-  const s = getSettings()
-  const conn = getVoiceConnection(s.discordGuildId)
+  const cfg = getSettings()
+  const conn = getVoiceConnection(cfg.discordGuildId)
   if (!conn) {
     dlog('speak: no voice connection (skip)')
     return
   }
-  try {
-    // 백엔드 분기 — gpt-sovits(로컬, 참조음성 설정 시) 우선, 실패하면 Edge로 폴백(음성 끊김 방지).
-    const cfg = getSettings()
-    const tts = await import('./tts')
-    let audio: Buffer
-    const t0 = Date.now()
-    if (cfg.ttsBackend === 'gpt-sovits' && cfg.gptSovitsRefAudio) {
-      try {
-        audio = await tts.synthesizeGptSovits(text, {
-          url: cfg.gptSovitsUrl,
-          refAudio: cfg.gptSovitsRefAudio,
-          refText: cfg.gptSovitsRefText,
-          refLang: cfg.gptSovitsRefLang,
-        })
-        dlog(`synth gpt-sovits ${audio.length}B in ${Date.now() - t0}ms`)
-      } catch (e) {
-        dlog(`gpt-sovits fail → edge 폴백: ${(e as Error).message}`)
-        audio = await tts.synthesize(text, cfg.discordTtsVoice || undefined)
-        dlog(`synth edge(폴백) ${audio.length}B`)
-      }
-    } else {
-      audio = await tts.synthesize(text, cfg.discordTtsVoice || undefined)
-      dlog(`synth edge ${audio.length}B in ${Date.now() - t0}ms`)
-    }
-    conn.subscribe(player)
-    const resource = createAudioResource(Readable.from(audio))
-    speaking = true
-    setCallState('speaking')
-    player.play(resource)
-    dlog(`play() 호출 (${audio.length}B)`)
-  } catch (e) {
-    dlog(`tts fail: ${(e as Error).message}`)
-    speaking = false
+  const parts = splitSentences(text)
+  if (!parts.length) {
     void drainSpeakQueue()
+    return
   }
+  const tts = await import('./tts')
+  const gen = ++speakGen
+  conn.subscribe(player)
+  sentenceQueue = []
+  synthInFlight = true
+  speaking = true
+  setCallState('speaking')
+  // 파이프라인 — 문장을 순차 합성(단일 모델이라 동시 호출 안 함)하며 큐에 넣고, 비어 있으면 즉시 재생.
+  // 다음 문장 합성이 현재 문장 재생과 겹쳐 첫 소리가 빨리 난다(time-to-first-audio↓).
+  void (async () => {
+    try {
+      for (const part of parts) {
+        if (gen !== speakGen) return // 새 발화/barge-in으로 무효화
+        let audio: Buffer | null = null
+        try {
+          audio = await synthOne(cfg, tts, part)
+        } catch (e) {
+          dlog(`synth fail(skip): ${(e as Error).message}`)
+        }
+        if (gen !== speakGen) return
+        if (audio) {
+          sentenceQueue.push(audio)
+          if (player.state.status === AudioPlayerStatus.Idle) playNextSentence()
+        }
+      }
+    } finally {
+      if (gen === speakGen) {
+        synthInFlight = false
+        if (player.state.status === AudioPlayerStatus.Idle && sentenceQueue.length === 0) {
+          speaking = false
+          void drainSpeakQueue() // 모두 끝났고 idle이면 다음 발화로
+        }
+      }
+    }
+  })()
 }
 
 function stopPlayback(): void {
-  if (speaking) {
+  if (speaking || synthInFlight || sentenceQueue.length) {
+    speakGen++ // 진행 중 합성 파이프라인 취소
+    sentenceQueue = []
+    synthInFlight = false
     player.stop(true)
     speaking = false
     dlog('barge-in stop')

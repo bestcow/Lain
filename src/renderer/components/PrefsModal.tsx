@@ -451,6 +451,24 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
   const [tg, setTg] = useState<TelegramStatus | null>(null)
   const [dc, setDc] = useState<DiscordStatus | null>(null)
   const [upd, setUpd] = useState<UpdateStatus | null>(null)
+  const [ttsTesting, setTtsTesting] = useState(false)
+  const [ttsTestMsg, setTtsTestMsg] = useState('')
+  const runTtsTest = async () => {
+    setTtsTesting(true)
+    setTtsTestMsg('합성 중…')
+    try {
+      const b64 = await window.lain.testTts()
+      const audio = new Audio('data:audio/wav;base64,' + b64)
+      audio.onended = () => setTtsTestMsg('재생 완료')
+      await audio.play()
+      setTtsTestMsg('재생 중…')
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e)
+      setTtsTestMsg('실패: ' + m + ' — 모델 다운로드 중이면 잠시 후 다시')
+    } finally {
+      setTtsTesting(false)
+    }
+  }
 
   const refreshTg = () => window.lain.telegramStatus().then(setTg)
   const refreshDc = () => window.lain.discordStatus().then(setDc)
@@ -896,12 +914,17 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 <span className="settings-key">음성 합성</span>
                 <select
                   value={settings.ttsBackend || 'edge'}
-                  onChange={(e) => patch({ ttsBackend: e.target.value as 'edge' | 'gpt-sovits' })}
+                  onChange={(e) =>
+                    patch({ ttsBackend: e.target.value as 'edge' | 'gpt-sovits' | 'supertonic' })
+                  }
                 >
                   <option value="edge">Edge TTS (클라우드, 기본)</option>
+                  <option value="supertonic">Supertonic (로컬·한국어, 권장)</option>
                   <option value="gpt-sovits">GPT-SoVITS (로컬·음성복제)</option>
                 </select>
-                <span className="dim settings-hint">로컬은 빠르고 목소리 복제 가능 — 서버 실행 필요</span>
+                <span className="dim settings-hint">
+                  Supertonic=인앱 한국어(파이썬 없음·빠름) · GPT-SoVITS=음성복제(서버 필요)
+                </span>
               </label>
               {settings.ttsBackend === 'gpt-sovits' && (
                 <>
@@ -933,12 +956,75 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                       onChange={(e) => patch({ gptSovitsRefLang: e.target.value })}
                     >
                       <option value="ko">한국어</option>
-                      <option value="ja">일본어 (일본 성우 음색)</option>
+                      <option value="ja">일본어</option>
                       <option value="en">영어</option>
                       <option value="zh">중국어</option>
                     </select>
                     <span className="dim settings-hint">참조 클립의 언어. 출력은 항상 한국어</span>
                   </label>
+                </>
+              )}
+              {settings.ttsBackend === 'supertonic' && (
+                <>
+                  <label className="settings-row">
+                    <span className="settings-key">Supertonic 보이스</span>
+                    <select
+                      value={settings.supertonicVoice || 'F5'}
+                      onChange={(e) => patch({ supertonicVoice: e.target.value })}
+                    >
+                      <option value="F1">F1 (여성)</option>
+                      <option value="F2">F2 (여성)</option>
+                      <option value="F3">F3 (여성)</option>
+                      <option value="F4">F4 (여성)</option>
+                      <option value="F5">F5 (여성·기본)</option>
+                      <option value="M1">M1 (남성)</option>
+                      <option value="M2">M2 (남성)</option>
+                      <option value="M3">M3 (남성)</option>
+                      <option value="M4">M4 (남성)</option>
+                      <option value="M5">M5 (남성)</option>
+                    </select>
+                    <span className="dim settings-hint">내장 한국어 보이스 (F=여성 / M=남성)</span>
+                  </label>
+                  <label className="settings-row">
+                    <span className="settings-key">말 속도</span>
+                    <input
+                      type="range"
+                      min={0.7}
+                      max={1.5}
+                      step={0.05}
+                      value={settings.supertonicSpeed ?? 1.05}
+                      onChange={(e) => patch({ supertonicSpeed: Number(e.target.value) })}
+                    />
+                    <span className="dim settings-hint">
+                      {(settings.supertonicSpeed ?? 1.05).toFixed(2)}x — 낮출수록 차분·무미건조
+                    </span>
+                  </label>
+                  <label className="settings-row">
+                    <span className="settings-key">품질 스텝</span>
+                    <input
+                      type="range"
+                      min={4}
+                      max={12}
+                      step={1}
+                      value={settings.supertonicStep ?? 8}
+                      onChange={(e) => patch({ supertonicStep: Number(e.target.value) })}
+                    />
+                    <span className="dim settings-hint">
+                      {settings.supertonicStep ?? 8} — 높을수록 품질↑·느림 (기본 8)
+                    </span>
+                  </label>
+                  <div className="settings-row">
+                    <span className="settings-key">테스트</span>
+                    <span className="upd-controls">
+                      <button type="button" className="upd-btn" disabled={ttsTesting} onClick={runTtsTest}>
+                        {ttsTesting ? '생성 중…' : '▶ 테스트 재생'}
+                      </button>
+                    </span>
+                    <span className="dim settings-hint">
+                      {ttsTestMsg ||
+                        '현재 보이스·속도로 한 문장 합성해 들려줌 (첫 사용 시 모델 ~398MB 1회 다운로드)'}
+                    </span>
+                  </div>
                 </>
               )}
 

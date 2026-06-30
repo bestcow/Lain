@@ -298,11 +298,15 @@ export interface LainSettings {
   discordTtsVoice: string // 음성 응답 TTS 보이스(ko-KR-*Neural). 빈값=기본(SunHi)
   discordVoiceMode: 'always' | 'wake' // #7 항상 청취 / '레인' 호출 시에만(웨이크워드)
   // 음성 합성 백엔드 — edge(Edge TTS·클라우드) / gpt-sovits(로컬 api_v2 서버). 로컬은 빠르고 음성 복제 가능.
-  ttsBackend: 'edge' | 'gpt-sovits'
+  ttsBackend: 'edge' | 'gpt-sovits' | 'supertonic'
   gptSovitsUrl: string // GPT-SoVITS api_v2 서버 주소 (기본 http://127.0.0.1:9880)
   gptSovitsRefAudio: string // 참조 음성 클립 경로(목소리 복제용 3~10초) — 서버가 접근할 로컬 경로
   gptSovitsRefText: string // 참조 클립의 전사(prompt_text)
-  gptSovitsRefLang: string // 참조 클립의 언어(prompt_lang) — 'ko'|'ja'|'en'|'zh'. 일본 성우 음색=ja(교차언어)
+  gptSovitsRefLang: string // 참조 클립의 언어(prompt_lang) — 'ko'|'ja'|'en'|'zh'(교차언어). 출력은 항상 한국어
+  // Supertonic(로컬 ONNX 사이드카) — 한국어 내장 보이스, 파이썬 없음(모델 첫 사용 시 1회 다운로드)
+  supertonicVoice: string // 보이스 스타일 F1~F5 / M1~M5 (기본 F5)
+  supertonicSpeed: number // 말 속도 0.5~2.0 (기본 1.05)
+  supertonicStep: number // 디노이즈 스텝 2~16 (높을수록 품질↑·느림, 기본 8)
   // 자동 업데이트 (electron-updater + GitHub Releases)
   updateNotify: boolean // ② 새 버전 감지 시 Lain이 자발 제안(작업 한가할 때만). 기본 on
   updateAutoDownload: boolean // ③ 백그라운드 자동 '다운로드'만(설치는 항상 수동). 기본 off
@@ -428,6 +432,9 @@ export interface LainApi {
   downloadUpdate(): Promise<UpdateStatus>
   installUpdate(): Promise<void>
   onUpdateStatus(cb: (s: UpdateStatus) => void): () => void
+  // Supertonic TTS — 설정 테스트 재생(base64 WAV) + 모델 준비/다운로드 상태
+  testTts(text?: string): Promise<string>
+  supertonicStatus(): Promise<{ ready: boolean; downloading?: boolean; progress?: number } | null>
   // §20.3 텔레그램 — 어댑터 연결 상태 (토큰 검증용)
   telegramStatus(): Promise<TelegramStatus>
   // §20.3 디스코드 — 음성 통화 어댑터 연결 상태

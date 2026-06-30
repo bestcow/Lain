@@ -14,6 +14,16 @@ asarUnpack:
 extraResources:
   - from: bench
     to: bench
+  # Supertonic TTS 사이드카(plain node + onnxruntime-node) — 설치본 resources/sidecar로 푼다.
+  # 모델 캐시(약 398MB)는 첫 음성 사용 때 %APPDATA%\lain\supertonic로 다운로드 → 패키지에서 제외.
+  - from: sidecar
+    to: sidecar
+    filter:
+      - '**/*'
+      - '!**/cache/**'
+      - '!**/*.log'
+      - '!**/*.part'
+      - '!**/*_out.wav'
 win:
   target: nsis
   executableName: lain

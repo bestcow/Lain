@@ -52,6 +52,10 @@ Write-Host '[deploy] 1/4 build (electron-vite)...' -ForegroundColor Cyan
 & npm run build
 if ($LASTEXITCODE -ne 0) { throw 'build 실패' }
 
+Write-Host '[deploy] 1.5/4 Supertonic 사이드카 의존성 설치(onnxruntime-node)...' -ForegroundColor Cyan
+& npm --prefix sidecar/supertonic install --omit=dev
+if ($LASTEXITCODE -ne 0) { throw 'sidecar npm install 실패' }
+
 Write-Host '[deploy] 2/4 package (electron-builder --dir, NSIS 생략)...' -ForegroundColor Cyan
 & npx electron-builder --win --dir
 if ($LASTEXITCODE -ne 0) { throw 'package 실패' }

@@ -29,7 +29,7 @@ export type GptSovitsOpts = {
   url: string
   refAudio: string
   refText: string
-  refLang?: string // 참조 클립 언어(prompt_lang). 일본 성우 음색은 'ja'(교차언어). 기본 'ko'.
+  refLang?: string // 참조 클립 언어(prompt_lang). 교차언어 가능(ja/en/zh 등). 기본 'ko'.
   speed?: number
 }
 export async function synthesizeGptSovits(text: string, opts: GptSovitsOpts): Promise<Buffer> {
@@ -52,6 +52,30 @@ export async function synthesizeGptSovits(text: string, opts: GptSovitsOpts): Pr
   if (!resp.ok) {
     const err = await resp.text().catch(() => '')
     throw new Error(`gpt-sovits ${resp.status} ${err.slice(0, 160)}`)
+  }
+  return Buffer.from(await resp.arrayBuffer())
+}
+
+// Supertonic(로컬 ONNX 사이드카) 합성 — 한국어 내장 보이스(파이썬 없음). 사이드카 미기동이면 띄우고 POST /tts → WAV.
+// 모델 다운로드/준비 전엔 사이드카가 503 → throw → 호출측이 Edge로 폴백(음성 끊김 방지).
+export type SupertonicOpts = { voice?: string; speed?: number; step?: number }
+export async function synthesizeSupertonic(text: string, opts: SupertonicOpts = {}): Promise<Buffer> {
+  const { ensureSupertonic } = await import('./supertonic-proc')
+  const port = await ensureSupertonic()
+  const resp = await fetch(`http://127.0.0.1:${port}/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      text,
+      voice: opts.voice || 'F5',
+      lang: 'ko', // 출력은 항상 한국어
+      speed: opts.speed ?? 1.05,
+      step: opts.step ?? 8,
+    }),
+  })
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => '')
+    throw new Error(`supertonic ${resp.status} ${err.slice(0, 160)}`)
   }
   return Buffer.from(await resp.arrayBuffer())
 }

@@ -2293,11 +2293,22 @@ export function getSettings(): LainSettings {
     discordUserId: getSetting('discord_user_id') ?? '',
     discordTtsVoice: getSetting('discord_tts_voice') ?? '',
     discordVoiceMode: getSetting('discord_voice_mode') === 'wake' ? 'wake' : 'always',
-    ttsBackend: getSetting('tts_backend') === 'gpt-sovits' ? 'gpt-sovits' : 'edge',
+    ttsBackend:
+      getSetting('tts_backend') === 'gpt-sovits'
+        ? 'gpt-sovits'
+        : getSetting('tts_backend') === 'supertonic'
+          ? 'supertonic'
+          : 'edge',
     gptSovitsUrl: getSetting('gpt_sovits_url') ?? 'http://127.0.0.1:9880',
     gptSovitsRefAudio: getSetting('gpt_sovits_ref_audio') ?? '',
     gptSovitsRefText: getSetting('gpt_sovits_ref_text') ?? '',
     gptSovitsRefLang: getSetting('gpt_sovits_ref_lang') ?? 'ko',
+    supertonicVoice: (() => {
+      const v = getSetting('supertonic_voice')
+      return v && /^[FM][1-9]$/.test(v) ? v : 'F5'
+    })(),
+    supertonicSpeed: Math.max(0.5, Math.min(2.0, Number(getSetting('supertonic_speed') ?? '1.05') || 1.05)),
+    supertonicStep: Math.max(2, Math.min(16, Number(getSetting('supertonic_step') ?? '8') || 8)),
     updateNotify: (getSetting('update_notify') ?? '1') === '1',
     updateAutoDownload: (getSetting('update_auto_download') ?? '0') === '1',
   }
@@ -2384,7 +2395,10 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
   if (patch.discordVoiceMode !== undefined)
     setSetting('discord_voice_mode', patch.discordVoiceMode === 'wake' ? 'wake' : 'always')
   if (patch.ttsBackend !== undefined)
-    setSetting('tts_backend', patch.ttsBackend === 'gpt-sovits' ? 'gpt-sovits' : 'edge')
+    setSetting(
+      'tts_backend',
+      patch.ttsBackend === 'gpt-sovits' || patch.ttsBackend === 'supertonic' ? patch.ttsBackend : 'edge',
+    )
   if (patch.gptSovitsUrl !== undefined) setSetting('gpt_sovits_url', patch.gptSovitsUrl.trim())
   if (patch.gptSovitsRefAudio !== undefined)
     setSetting('gpt_sovits_ref_audio', patch.gptSovitsRefAudio.trim())
@@ -2392,6 +2406,12 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     setSetting('gpt_sovits_ref_text', patch.gptSovitsRefText.trim())
   if (patch.gptSovitsRefLang !== undefined)
     setSetting('gpt_sovits_ref_lang', patch.gptSovitsRefLang.trim() || 'ko')
+  if (patch.supertonicVoice !== undefined)
+    setSetting('supertonic_voice', /^[FM][1-9]$/.test(patch.supertonicVoice) ? patch.supertonicVoice : 'F5')
+  if (patch.supertonicSpeed !== undefined)
+    setSetting('supertonic_speed', String(Math.max(0.5, Math.min(2.0, patch.supertonicSpeed || 1.05))))
+  if (patch.supertonicStep !== undefined)
+    setSetting('supertonic_step', String(Math.max(2, Math.min(16, Math.floor(patch.supertonicStep) || 8))))
   // 설정 영속성 보장 — WAL을 메인 DB에 즉시 병합한다.
   // deploy 시 Stop-Process -Force(강제종료) 후 recoverCorruptWal이 WAL을 폐기할 수 있어
   // 체크포인트 안 된 설정이 사라지는 문제를 차단한다. saveSettings는 호출 빈도가 낮아 FULL 모드 OK.

@@ -72,6 +72,9 @@ const api: LainApi = {
   downloadUpdate: () => ipcRenderer.invoke('update:download'),
   installUpdate: () => ipcRenderer.invoke('update:install'),
   onUpdateStatus: (cb) => subscribe<UpdateStatus>('update:status', cb),
+  // Supertonic TTS 테스트 재생 / 모델 상태
+  testTts: (text) => ipcRenderer.invoke('tts:test', text),
+  supertonicStatus: () => ipcRenderer.invoke('tts:supertonicStatus'),
   telegramStatus: () => ipcRenderer.invoke('telegram:status'),
   discordStatus: () => ipcRenderer.invoke('discord:status'),
   onDiscordState: (cb) => subscribe<DiscordStateEvent>('discord:state', cb),
