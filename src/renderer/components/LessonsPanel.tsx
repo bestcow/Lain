@@ -1,6 +1,8 @@
 // §22 자기개선 — 누적된 학습 목록. "점점 똑똑해지는 게 보인다"의 가시화.
 import { useEffect, useState } from 'react'
 import type { Lesson, Project } from '../../shared/types'
+import { isCleanupCandidate } from '../lib/lessonDerive'
+import { Icon } from './icons'
 
 export function LessonsPanel({ onClose }: { onClose: () => void }) {
   const [lessons, setLessons] = useState<Lesson[] | null>(null)
@@ -63,7 +65,7 @@ export function LessonsPanel({ onClose }: { onClose: () => void }) {
         >
           {activeOnly ? '사용만' : '전체'}
         </button>
-        <button onClick={onClose}>✕</button>
+        <button onClick={onClose}><Icon name="x-circle" size={18} /></button>
       </div>
       {!lessons ? (
         <div className="dim">로딩...</div>
@@ -91,8 +93,20 @@ export function LessonsPanel({ onClose }: { onClose: () => void }) {
                     <span className={`lesson-status lesson-status-${archived ? 'archived' : 'active'}`}>
                       {statusLabel(l)}
                     </span>
-                    {l.pinned && <span className="lesson-status">📌</span>}
-                    {l.trigger ? `${l.trigger} · ` : ''}재사용 {l.reuseCount}회
+                    {l.pinned && (
+                      <span className="lesson-status">
+                        <Icon name="pin" size={12} />
+                      </span>
+                    )}
+                    {isCleanupCandidate(l) && (
+                      <span
+                        className="lesson-status lesson-status-cleanup"
+                        title="주입은 되는데 한 번도 인용 안 됨 — 정리 후보"
+                      >
+                        정리 후보
+                      </span>
+                    )}
+                    {l.trigger ? `${l.trigger} · ` : ''}주입 {l.injectCount}회 · 인용 {l.reuseCount}회
                   </div>
                 </div>
               </div>
@@ -185,13 +199,20 @@ function LessonDetail({
 }) {
   const archived = l.status === 'archived'
   const isCurator = l.taskId === 'curator'
+  const cleanup = isCleanupCandidate(l)
+  // C7 — 병합 통합본(umbrella)이면 흡수된 원본 교훈 목록을 역참조로 로드(absorbed_into). 큐레이터 산물만.
+  const [absorbed, setAbsorbed] = useState<Lesson[]>([])
+  useEffect(() => {
+    if (isCurator) window.lain.lessonsAbsorbedInto(l.id).then(setAbsorbed)
+    else setAbsorbed([])
+  }, [l.id, isCurator])
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-window lesson-detail" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <span className="modal-title">학습 상세</span>
           <button className="modal-close" onClick={onClose}>
-            ✕
+            <Icon name="x-circle" size={18} />
           </button>
         </div>
         <div className="modal-body">
@@ -214,8 +235,18 @@ function LessonDetail({
               <dd>{l.trigger || '지정 안 됨'}</dd>
             </div>
             <div>
-              <dt>재사용</dt>
-              <dd>{l.reuseCount}회</dd>
+              <dt>주입 / 인용</dt>
+              <dd>
+                주입 {l.injectCount}회 · 인용 {l.reuseCount}회
+                {cleanup && (
+                  <span
+                    className="lesson-status lesson-status-cleanup lesson-detail-cleanup"
+                    title="주입은 되는데 한 번도 인용 안 됨 — 정리 후보"
+                  >
+                    정리 후보
+                  </span>
+                )}
+              </dd>
             </div>
             <div>
               <dt>생성</dt>
@@ -227,7 +258,15 @@ function LessonDetail({
             </div>
             <div>
               <dt>고정</dt>
-              <dd>{l.pinned ? '📌 고정됨' : '—'}</dd>
+              <dd>
+                {l.pinned ? (
+                  <>
+                    <Icon name="pin" size={12} /> 고정됨
+                  </>
+                ) : (
+                  '—'
+                )}
+              </dd>
             </div>
             {isCurator && (
               <div>
@@ -236,14 +275,32 @@ function LessonDetail({
               </div>
             )}
           </dl>
+          {/* C7 — 병합 계보: 이 통합본에 흡수된 원본 교훈 목록(absorbed_into 역참조). */}
+          {isCurator && absorbed.length > 0 && (
+            <div className="lesson-absorbed">
+              <div className="lesson-absorbed-head dim">흡수된 원본 {absorbed.length}건</div>
+              <ul className="lesson-absorbed-list">
+                {absorbed.map((a) => (
+                  <li key={a.id} className="lesson-absorbed-item" title={a.lesson}>
+                    <span className="dim lesson-absorbed-date">{fmtDate(a.createdAt)}</span>{' '}
+                    {a.lesson}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="lesson-detail-actions">
             <button onClick={() => window.lain.pinLesson(l.id, !l.pinned)}>
-              {l.pinned ? '📌 고정 해제' : '📌 고정'}
+              <Icon name="pin" size={14} /> {l.pinned ? '고정 해제' : '고정'}
             </button>
             {archived ? (
-              <button onClick={() => window.lain.unflagLesson(l.id)}>♻ 사용으로</button>
+              <button onClick={() => window.lain.unflagLesson(l.id)}>
+                <Icon name="restore" size={14} /> 사용으로
+              </button>
             ) : (
-              <button onClick={() => window.lain.archiveLesson(l.id)}>🗑 미사용으로</button>
+              <button onClick={() => window.lain.archiveLesson(l.id)}>
+                <Icon name="trash" size={14} /> 미사용으로
+              </button>
             )}
             {isCurator && l.consolidationBatch && (
               <button

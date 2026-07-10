@@ -24,10 +24,10 @@ import {
   insertLesson,
   listConversationDialogue,
   listAgentSkills,
-  listTasks,
   lessonsForProject,
 } from './store'
-import { tierQueryOptions } from './agentopts'
+import { hasActiveWork } from './orchestrator'
+import { judgeQueryOptions } from './agentopts'
 import { redactSecrets, scanLessonInjection } from './safety'
 import { buildSkillsIndex } from './agentskills'
 import type { ChatMessage } from '../shared/types'
@@ -142,7 +142,7 @@ export async function reviewManagerTurn(
 ): Promise<void> {
   try {
     if (!getSettings().turnReviewEnabled) return // off면 휴면 — 어떤 부수효과도 없음
-    if (listTasks().some((t) => t.state === 'working')) return // 작업 중엔 미룬다(consolidate 패턴)
+    if (hasActiveWork()) return // 작업 중엔 미룬다(consolidate 패턴) — C1: held만 있으면 활성 아님 → 턴리뷰 허용
     const convId = conversationId || ensureActiveConversation('manager')
     if (!convId) return
 
@@ -184,6 +184,8 @@ ${skillsIdx || '(없음)'}
 - 환경의존·일회성 실패에서 교훈을 만들지 마라(이 머신·이 순간에만 맞는 사실).
 - 도구가 무엇을 했다/못 했다는 부정확한 주장으로 교훈을 만들지 마라(과정-트레이스 금지).
 - 이 대화 한정 서사·맥락("아까 그 파일")을 일반 규칙으로 격상하지 마라.
+- **사실 진술과 행동 지시를 구분해라**: 사용자가 무언가를 알려준 것(정보)은 규칙이 아니다. 사용자가 명시적으로 지시·교정한 것만 규칙이 된다.
+- **사용자 정체 정보(이름·신원·직업·소속 등)는 교훈으로 만들지 마라** — 그건 프로필(user_profile) 영역이다. 특히 사용자가 이름을 밝혔다고 "그 이름으로 호칭하라"는 규칙으로 격상하지 마라 — 호칭은 "나를 OO라고 불러"라는 명시 지시가 있을 때만, 그것도 교훈이 아니라 set_user_title의 몫이다.
 - 진짜 사용자 선호/규칙이 아니면(단순 질문·지시·잡담) 빈 배열. 기존 교훈과 중복이어도 빈 배열.
 - 확신이 없으면 빈 배열. ${MAX_LESSONS_PER_REVIEW}건을 초과해 뽑지 마라.
 - skill_suggestion은 '여러 단계 절차'가 대화에 실제로 등장했고 재사용 가치가 분명할 때만. name은 ascii kebab.
@@ -204,7 +206,7 @@ JSON 한 블록만 출력:
           cwd: AGENT_CWD,
           allowedTools: [],
           maxTurns: 3,
-          ...tierQueryOptions(getSettings().judgeModel, getSettings()), // 짧은 판정류 — judge 티어(local 라우팅 포함)
+          ...judgeQueryOptions(), // 짧은 판정류 — judge 티어(local 라우팅 + D7 사용량 가드 강등)
           executable: 'node',
           pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로
           abortController: abort,
@@ -237,7 +239,7 @@ JSON 한 블록만 출력:
         lesson: l.lesson,
         origin: 'agent',
       })
-      savedLines.push(l.lesson.replace(/\s+/g, ' ').slice(0, 80))
+      savedLines.push(l.lesson.replace(/\s+/g, ' '))
     }
     if (savedLines.length > 0)
       emitChat?.(`💾 교훈 저장 — ${savedLines.join(' / ')}`)

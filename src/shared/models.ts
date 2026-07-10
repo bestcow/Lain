@@ -23,3 +23,13 @@ export const MODEL_IDS: Record<ModelTier, string> = {
 export function modelId(tier: string): string {
   return MODEL_IDS[tier as ModelTier] ?? MODEL_IDS.sonnet
 }
+
+/** 티어 → 사용자 표시 라벨(설정 UI 공용 단일출처). 입력창 바(InputModeBar)·작업 드로어(TaskDrawer)가 공유 —
+ *  '설정 표시=실제 일치' 원칙상 별칭이 아니라 세대 고정 표기(위 MODEL_IDS와 짝). */
+export const MODEL_NAME: Record<ModelTier, string> = {
+  haiku: 'Claude_Haiku_4.5',
+  sonnet: 'Claude_Sonnet_4.6',
+  opus: 'Claude_Opus_4.8',
+  fable: 'Claude_Fable_5',
+  local: 'Qwen_로컬(실험적)', // llama-server 필요(환경설정 모델 탭) — 서버 꺼져 있으면 응답 실패
+}

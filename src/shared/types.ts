@@ -48,6 +48,7 @@ export interface ChatMessage {
 // ── Phase 1: 작업 실행 (PLAN.md §6, §8) ──
 
 export type TaskState =
+  | 'queued' // D1 — cap 초과·프로젝트 중복으로 대기 중(슬롯 열리면 드레인이 자동 착수). 활성 아님
   | 'clarifying'
   | 'blocked' // 명확화 질문 답변 대기
   | 'ready'
@@ -73,12 +74,26 @@ export type ThinkingLevel = 'default' | 'off' | 'auto' | 'high'
 // 레인(manager) 작업량 — Claude Code effort 규격(낮음~최대) + Ultracode(xhigh + 워크플로 상시).
 export type ManagerEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode'
 
+// 작업 실행 엔진 — worker(작업 Navi)만 선택 가능. 매니저(Lain)·judge는 Claude 고정.
+// codex는 OpenAI Codex CLI(전역 설치+로그인) 필요. 승인 큐 대신 codex 샌드박스가 방어선.
+export type TaskEngine = 'claude' | 'codex'
+
+// A4 — TodoWrite 진행 체크리스트. Claude Code TodoWrite 도구의 todos 규격(shared/todoline.ts가
+// 파싱·진행률 순수 함수의 단일 출처). status별 아이콘은 todoline.ts TODO_STATUS_ICON.
+export type TodoStatus = 'pending' | 'in_progress' | 'completed'
+export interface TodoItem {
+  content: string
+  status: TodoStatus
+  activeForm: string
+}
+
 export interface Task {
   id: string
   projectId: string
   title: string
   state: TaskState
   mode: NaviMode // §21 — 기본 interactive
+  engine: TaskEngine // 실행 엔진(기본 claude)
   permissionMode: TaskPermissionMode // P2 — 기본 acceptEdits. bypass=승인 자동통과(시크릿·테스트보호는 유지)
   thinkingLevel: ThinkingLevel // P2 — 확장사고 수준(기본 default=미설정)
   disallowedTools: string[] // P2 — 이 작업 Navi에 금지할 도구 이름(빈 배열=제한 없음). canUseTool 가드와 별개 SDK 필터
@@ -93,12 +108,22 @@ export interface Task {
   diffStat: string | null
   verifyResult: string | null // pass | fail | skipped(이유)
   costUsd: number
-  tokens: number // 누적 토큰(input+output+cache) — 구독 모델용 표시
+  tokens: number // 이 세션 누적 토큰(input+output+cache) — 구독 모델용 표시(세션 교체 시 리셋됨)
+  tokensTotal: number // I4 — 라이프타임 누적 토큰(모든 세션 합) = sessionBaseTokens + 현재 세션 cumulative. 작업별 예산 판정 기준
+  sessionBaseTokens: number // I4 — 현재 세션 이전 세션들의 누계(baseline). 동일세션 재갱신=교체·새 세션=가산을 위한 내부 상태
   turns: number
   error: string | null
+  autoRetryCount: number // D3 — runNavi throw로 error 확정 전 자동 재시도한 횟수(영속·무한루프 방지). 상한 도달하면 에스컬레이션 후 error 확정
   skills: string[] | null // Lain이 이 작업 Navi에 할당한 스킬(null=기본 풀 전체)
   images: FileAttachment[] // B17 — 작업 입력 이미지(드로어 직접첨부). 새 세션 시작 시 Navi 프롬프트에 주입
   fastMode: boolean // B4 — Opus 빠른 출력 모드(작업별). SDK settings.fastMode로 전달. 기본 off
+  modelOverride: ModelTier | '' // D10 — 작업별 모델 고정('' = 전역 naviModel 따름). 다음 실행/재개부터 적용
+  todos: TodoItem[] | null // A4 — 최신 TodoWrite 스냅샷(누적 아님, 마지막 호출이 현재 상태). 없으면 null
+  priority: number // D1 — 대기 큐 드레인 순서. 낮을수록 먼저, 기본 0. queued 아닌 상태에선 무의미(보존만)
+  dependsOn: string[] // D2 — 선행 task id 배열([]=없음). 전부 done(병합·keep-branch 포함)이어야 queued에서 착수. 선행 실패는 자동취소 없이 통지 후 사람/레인 결정
+  groupId: string | null // D13 — 크로스레포 작업 그룹 소속(null=단독). 그룹 소속이면 개별 병합 봉쇄, resolve_group으로 all-or-nothing 결재
+  mergeBaseSha: string | null // D8 — ff 병합 시 포착한 병합 직전 main tip(되돌릴 범위 하한, exclusive). null=되돌릴 병합 없음(keep-branch/discard/미병합)
+  mergeHeadSha: string | null // D8 — 병합 후 main tip=Navi 브랜치 tip(되돌릴 범위 상한, inclusive). revert 범위 = base..head
   createdAt: string
   updatedAt: string
 }
@@ -106,7 +131,7 @@ export interface Task {
 export interface Approval {
   id: number
   taskId: string
-  kind: string // push | destructive | dep_change | network | outside_dev | question
+  kind: string // push | destructive | dep_change | network | outside_dev | question | system(OS 파괴 — taskId 'lain'이면 매니저發) | plan(D9 — Navi plan 모드 계획 승인)
   payload: string // 명령 원문 또는 질문
   state: 'pending' | 'approved' | 'rejected'
   createdAt: string
@@ -125,6 +150,34 @@ export interface Routine {
   lastRunAt: string | null // 마지막 실행 ISO
   createdAt: string
 }
+
+// ── 플래너 — 통합 일정 + 체크리스트 (2026-07-05 설계, docs/superpowers/specs) ──
+export interface PlanItem {
+  id: number
+  kind: 'event' | 'todo'
+  title: string
+  body: string // 메모·링크(md)
+  startAt: string | null // 로컬 ISO 'YYYY-MM-DDTHH:mm'. event 필수, todo는 선택(=마감일)
+  endAt: string | null
+  allDay: boolean
+  recur: string // none | daily | weekly:<0-6> | monthly:<1-31>
+  tagId: number | null
+  sectionId: number | null
+  done: boolean
+  doneAt: string | null
+  remindOffsetMin: number | null // NULL=설정 기본
+  remindSentAt: string | null // 마지막 발송의 발생(occurrence) ISO
+  snoozeUntil: string | null // [+10분] 스누즈 — 이 시각 전엔 리마인드 억제
+  pinned: boolean
+  sortOrder: number
+  origin: 'user' | 'lain' | 'telegram'
+  archived: boolean
+  createdAt: string
+  updatedAt: string
+}
+export interface PlanTag { id: number; name: string; color: string; sortOrder: number }
+export interface PlanSection { id: number; name: string; sortOrder: number; collapsed: boolean }
+export type PlanItemInput = Partial<PlanItem> & { title: string; kind: 'event' | 'todo' }
 
 // ── 외부 MCP 서버 (CC-FEATURES P1) — 백본 ③: 등록=사용자 UI, 사용=cascade(Lain·Navi) ──
 // SDK mcpServers 레코드에 머지된다. transport 3종: stdio(command/args/env) / sse·http(url/headers).
@@ -257,16 +310,20 @@ export interface DiscordStateEvent {
 
 export interface LainSettings {
   concurrencyCap: number // 동시 working 작업 수 (§9-7)
+  projectParallelCap: number // D14 — 프로젝트당 동시 활성 작업 상한(기본 1=현행). 2~4=같은 레포 병렬 opt-in — 충돌은 D8 rebase→verify가 사후 판사
+  taskTokenBudget: number // D7 — 작업 하나의 누적 토큰이 이 값을 넘으면 세션 경계에서 일시정지(blocked)+에스컬레이션. 0 = 무제한(off)
+  usageWindowTokenLimit: number // D7 — 최근 창(USAGE_WINDOW_MIN분) 전역 누적 토큰 한도. 근접 시 신규 스폰을 큐로 우회하고 judge 티어를 강등. 0 = off
   naviModel: ModelTier // Navi 본 작업 (§9b)
   managerModel: ModelTier // 관리자 채팅
   judgeModel: ModelTier // clarify 판정·ask_manager 즉답 등 짧은 판정류
   localBaseUrl: string // 'local' 티어의 llama-server 주소(Anthropic /v1/messages 네이티브). 기본 http://127.0.0.1:8080
+  anthropicApiKey: string // E5 — 구독 로그인 대신 API 키로 인증(비었으면 구독 OAuth 사용). 설정 시 non-local 티어 spawn env의 ANTHROPIC_API_KEY로 주입. 시크릿(로그 금지 §9-6)
   managerPermissionMode: TaskPermissionMode // 레인 채팅 권한 모드(입력창 바)
   managerEffort: ManagerEffort // 레인 작업량(effort) — 입력창 바
   managerEffortAuto: boolean // 작업량 자동 — 레인이 스스로(adaptive) 조절
   managerFastMode: boolean // 레인 빠른 모드(Opus 빠른 출력)
   managerFastChat: boolean // 빠른 대화 레인 — 작업 아닌 대화 턴은 도구 없는 경량 선응답으로 즉답, 행동이면 본체로 승격 (기본 on)
-  userTitle: string // 레인이 사용자를 부르는 호칭(기본 '마스터'). 채팅 라벨·레인 말투에 반영. set_user_title 도구/환경설정으로 변경
+  userTitle: string // 레인이 사용자를 부르는 호칭(기본 '유저'). 채팅 라벨·레인 말투에 반영. set_user_title 도구/환경설정으로 변경
   userAliases: string[] // 외부 앱(디스코드·카톡 등) 채팅에서 사용자 본인의 표시명/닉네임 — 감시(오버레이)가 화면 속 본인/타인을 구별하는 데 사용
   defaultTaskMode: 'auto' | 'autonomous' | 'interactive' // 작업 위임 기본(auto=현 자동판정)
   // 어깨너머 모드 (실시간 감시 + 우하단 오버레이) — 메인창 안 볼 때 화면 작업을 관찰해 먼저 조언
@@ -274,17 +331,42 @@ export interface LainSettings {
   monitorSensitiveApps: string[] // 민감 앱 블랙리스트 — 포그라운드면 감시/조언 스킵 (시크릿 보호 §9-6)
   monitorCooldownSec: number // 반응 최소 간격(초) — 연속 수다 억제 (기본 30)
   monitorPollMs: number // 포그라운드/유휴 폴링 간격(ms) — L0 결정론 (기본 1500)
+  chattiness: number // 말수 0~4 (0=묵언 · 2=기본 · 4=수다쟁이) — UI 상호작용 대사(quips)+감시 선제발화 빈도. 감시 on/off와 별개
+  // E6 — 워크스페이스 자동 스캔 대상. 빈값이면 기본(C:\workspace / apps·games·tools). 환경변수
+  // LAIN_WORKSPACE·LAIN_SCAN_DIRS가 있으면 그쪽이 우선(오버라이드).
+  workspaceRoot: string // 스캔 루트('' = 기본 C:\workspace)
+  scanDirs: string[] // 루트 하위 스캔 폴더([] = 기본 apps/games/tools)
   // Phase 3 자동화 (§15, §12.5b)
   scanIntervalMin: number // 주기 스캔 간격(분), 0 = 끔
   closeToTray: boolean // 창 닫기 → 트레이 상주
   autoStart: boolean // 로그인 시 자동 시작 (트레이로)
   autoPriority: boolean // 주기 스캔 변화 시 관리자 자동 우선순위 판단 (LLM 비용)
+  autoStartTaskMd: boolean // D5 — 새 TASK.md 발견 시 mode:autonomous 마커+verify_cmd 있으면 자동 착수 (기본 off, opt-in)
+  autoRebaseOnMerge: boolean // D8 — merge(결재)가 ff 불가일 때 worktree 브랜치를 main에 자동 rebase→verify 재실행→ff 재시도. 충돌·verify실패면 무해하게 브랜치만 남김(비파괴). 기본 on
   lessonCurator: boolean // §24 Phase3 — idle 시 judge가 중복 교훈을 semantic 병합 (LLM 비용, 기본 off)
   turnReviewEnabled: boolean // 학습루프 T3 — 레인 채팅 턴 종료 후 judge가 교훈/스킬 후보를 자동 추출 (기본 on, 구 signalReview 대체)
   verifyNudgeEnabled: boolean // 학습루프 T7 — 레인이 코드 수정 후 검증 없이 턴을 끝내면 다음 턴에 1회 넛지 (기본 on)
   idleMin: number // idle 판정 임계(분) — 마지막 채팅 활동 후 이 시간 경과해야 끼어듦 허용 (기본 3)
   routinesEnabled: boolean // 선언적 routines 스케줄 디스패치 on/off (기본 off — off면 등록만 되고 실행 안 됨)
   ccHooksEnabled: boolean // 클로드코드 연동 — 레인 밖에서 직접 실행한 CC 세션을 레인이 인지(훅 자동 설치). 기본 off
+  // 플래너 (스펙 §설정) — 표시=적용 일치 원칙: 전부 PrefsModal 노출
+  plannerShowEvents: boolean //  planner_show_events, 기본 1
+  plannerShowTodos: boolean //   planner_show_todos, 기본 1
+  plannerShowRoutines: boolean //planner_show_routines, 기본 1
+  plannerShowTasks: boolean //   planner_show_tasks, 기본 1
+  plannerDefaultView: 'month' | 'week' | 'day' // planner_default_view, 기본 month
+  plannerWeekStart: 0 | 1 //     planner_week_start, 기본 1(월)
+  plannerShowDone: boolean //    planner_show_done, 기본 1
+  plannerSidebarSide: 'left' | 'right' // planner_sidebar_side, 기본 right
+  plannerSidebarWidth: number // planner_sidebar_width, 기본 300 (px, 200~480 클램프)
+  plannerDensity: 'cozy' | 'compact' // planner_density, 기본 cozy
+  plannerRemindDefaultMin: number // planner_remind_default_min, 기본 10
+  plannerStaleDays: number //    planner_stale_days, 기본 7
+  plannerNudge: 'off' | 'daily' | 'weekly' // planner_nudge, 기본 weekly
+  plannerInBriefing: boolean //  planner_in_briefing, 기본 1
+  plannerOfferHelp: boolean //   planner_offer_help, 기본 1
+  plannerTelegramRemind: boolean // planner_telegram_remind, 기본 1
+  onboardingDone: boolean // 첫 실행 위저드 완료 플래그(기존 설치는 마이그레이션에서 자동 true)
   // §20.3 텔레그램 채널 — 자리 비웠을 때 폰으로 와이어드 지휘·결재
   telegramEnabled: boolean // 텔레그램 어댑터 on/off
   telegramBotToken: string // BotFather 토큰 (시크릿 — 로그/다이제스트 금지 §9-6)
@@ -293,6 +375,7 @@ export interface LainSettings {
   contextCompactThreshold: number // 무한세션 — 관리자 대화 컨텍스트 점유가 이 토큰 넘으면 월드모델 압축 후 새 세션. 0 = 끔
   naviHandoffThreshold: number // Navi 유한세션 핸드오프 — Navi 대화 점유가 이 토큰 넘으면 핸드오프 md 기록 후 새 세션(≠무한세션). 0 = 끔
   turnWatchdogMin: number // 무진전 자동종료 임계(분) — Lain 응답이 이 시간 동안 진전 없으면 자동 종료. 0 = 끔
+  approvalTimeoutMin: number // D4 — 작업 Navi 승인 대기가 이 시간 무응답이면 '재알림 1회'(PC·텔레그램). 거절 아님 — 이후 무한 대기(세션·worktree 보존). 0 = 재알림 끔(무한 대기). 기본 30
   // §디스코드 음성 통화 — 봇이 VC에 입장해 양방향 음성 지휘
   skillsEnabled: boolean // 클로드 스킬 노출 킬스위치(기본 OFF — plugins/skills 안 붙임)
   curatedPlugins: string[] // lain이 에이전트에 할당할 플러그인 이름 목록(CC-FEATURES P1). 기본=큐레이션 코딩셋
@@ -309,6 +392,7 @@ export interface LainSettings {
   gptSovitsRefAudio: string // 참조 음성 클립 경로(목소리 복제용 3~10초) — 서버가 접근할 로컬 경로
   gptSovitsRefText: string // 참조 클립의 전사(prompt_text)
   gptSovitsRefLang: string // 참조 클립의 언어(prompt_lang) — 'ko'|'ja'|'en'|'zh'(교차언어). 출력은 항상 한국어
+  gptSovitsSpeed: number // 말 속도(speed_factor) 0.5~2.0 (기본 1.15 — 기본 1.0보다 조금 빠르게)
   // Supertonic(로컬 ONNX 사이드카) — 한국어 내장 보이스, 파이썬 없음(모델 첫 사용 시 1회 다운로드)
   supertonicVoice: string // 보이스 스타일 F1~F5 / M1~M5 (기본 F5) / 'custom'(개인 보이스·로컬)
   supertonicCustomVoice: string // 개인 보이스(로컬) JSON 파일명 — %APPDATA%\lain\voices\ 안에 위치. 배포 미포함(사용자가 직접 가져옴)
@@ -347,13 +431,31 @@ export type TaskEvent =
   | { taskId: string; kind: 'error'; text: string; speaker?: TaskSpeaker }
   | { taskId: string; kind: 'subagent'; text: string; speaker?: TaskSpeaker } // B2 — 서브에이전트/백그라운드 task_* 가시화
   | { taskId: string; kind: 'exit'; text: string; speaker?: TaskSpeaker; exitReason: ExitReason }
+  // A4 — TodoWrite 진행 체크리스트. text는 JSON.stringify(TodoItem[])(그 시점의 todos 전체 — 최신 상태가 진실).
+  | { taskId: string; kind: 'todo'; text: string; speaker?: TaskSpeaker }
+  // D6 — 장기 작업 중간보고. text="진행중: N턴 · 커밋 M · +X/-Y"(결정론 계산, LLM 없음). speaker 없음(시스템 로그 줄).
+  | { taskId: string; kind: 'checkpoint'; text: string; speaker?: TaskSpeaker }
+  // D12 — codex 명령 실행 감사. codex는 승인 큐가 없어(샌드박스가 방어선) 사후 명령 로그가 유일한 관측창이라
+  // generic status와 구분해 감사 가시 이벤트로 노출한다. text="$ <cmd> → OK|exit N"(exit!=0는 렌더러가 경고색).
+  | { taskId: string; kind: 'exec'; text: string; speaker?: TaskSpeaker }
 
 type ChatEventKind =
   | { kind: 'user'; text: string; origin?: 'pc' | 'telegram' | 'discord' } // 사용자 입력 에코 — 텔레그램/디스코드發 메시지를 PC에 라이브 표시할 때(출처 운반)
   | { kind: 'assistant'; text: string; proactive?: boolean } // proactive=어깨너머 자발 발화(레인이 먼저)
   | { kind: 'assistant_delta'; text: string } // 스트리밍 텍스트 증분 — 렌더러가 라이브 버블에 이어붙임(영속X, 최종 assistant가 확정)
   | { kind: 'tool'; text: string } // 승인 대기 등 시스템 라인 (§5.6 Navi 직접 채팅)
-  | { kind: 'result'; costUsd: number | null; tokens: number | null; sessionId: string | null }
+  // failedTools: 이번 턴 도구 실패(is_error) 건수(A7) — 0이거나 없으면 배지 미표시.
+  // contextTokens/contextThreshold(A5): 무한세션 컨텍스트 게이지 배선 — 매 result에 실어 보낸다(조회 IPC 대신
+  // 기존 이벤트에 편승, 별도 왕복 없음). threshold<=0(압축 비활성)이면 게이트가 죽어 있으므로 둘 다 생략.
+  | {
+      kind: 'result'
+      costUsd: number | null
+      tokens: number | null
+      sessionId: string | null
+      failedTools?: number
+      contextTokens?: number
+      contextThreshold?: number
+    }
   | { kind: 'error'; message: string }
   // 인라인 선택형/체크형 질문(Lain→사용자) — ask_user 도구가 카드를 띄우고 답을 기다린다(라이브 전용).
   | { kind: 'question'; questionId: string; question: string; options: string[]; multi: boolean }
@@ -362,6 +464,16 @@ type ChatEventKind =
 // conversationId: 어느 대화의 이벤트인지. 텔레그램·PC가 같은 대화를 공유하므로
 // 렌더러가 '현재 연 대화면 본문에 추가, 아니면 목록 미리보기만 갱신'을 판별하는 데 쓴다.
 export type ChatEvent = ChatEventKind & { conversationId?: string }
+
+// B5 — 대기 중 인라인 질문(ask_user·편집/계획 승인). main 인메모리 보관 → 렌더러 리로드 시 question:pending으로 복원.
+export interface PendingQuestion {
+  questionId: string
+  question: string
+  options: string[]
+  multi: boolean
+  conversationId: string
+  createdAt: number // main epoch ms — 표시엔 안 쓰이나 정렬·진단용
+}
 
 // §5.6 Navi 직접 채팅 — 프로젝트 단위 이벤트
 export type NaviChatEvent = { projectId: string } & ChatEvent
@@ -386,6 +498,45 @@ export interface Conversation {
   lastMobileAt: string | null // 마지막 텔레그램(📱) 메시지 시각 — 5분 이내면 모바일 활성 표시 (Lain 기여)
 }
 
+// A15 — Ctrl+F '전체 기간' DB 전문검색(store.searchChatHistory) 히트 1건.
+export interface ChatHistoryHit {
+  id: number
+  conversationId: string | null
+  role: string
+  when: string
+  snippet: string
+}
+
+// C4 — 토큰 사용량 일별 집계용 원시 작업 행. main은 창(window) 내 원시 행만 넘기고, 로컬 날짜 버킷팅은
+// 렌더러 순수 함수(tokenUsage.summarizeUsage)가 한다(created_at은 UTC 저장이라 SQL date()면 하루 어긋남).
+export interface TaskUsageRow {
+  projectId: string
+  tokens: number
+  costUsd: number
+  createdAt: string // UTC 'YYYY-MM-DD HH:MM:SS'
+}
+
+// C6 — 전역 활동 피드 원시 행(main→렌더러). task_events(의미있는 kind)·cc_events를 하나로 실어 보낸다.
+// 병합/정렬/라벨링은 렌더러 순수 함수(activityFeed.mergeActivity)가 한다.
+export interface ActivityRaw {
+  source: 'task' | 'cc'
+  at: string // created_at (UTC 'YYYY-MM-DD HH:MM:SS')
+  detail: string // task: kind(status|error|exit…) / cc: event(SessionStart|SessionEnd)
+  text?: string | null // task_events.content (status/error 본문). cc는 없음
+  taskId?: string | null // task 출처
+  projectId?: string | null // cc 출처
+}
+
+// C6 — 병합·라벨링된 활동 요소(표시용). mergeActivity 산출물.
+export interface ActivityItem {
+  source: 'task' | 'cc'
+  at: string
+  projectId: string | null
+  taskId: string | null
+  label: string // 사람이 읽을 한 줄
+  kind: string // 원본 kind/event (렌더러 아이콘 분기용)
+}
+
 // 파일 첨부 (채팅 입력 - 이미지·텍스트)
 export interface FileAttachment {
   name: string
@@ -404,9 +555,13 @@ export interface LainApi {
   pushProject(id: string): Promise<{ ok: boolean; output: string }>
   refreshStatus(id?: string): Promise<void>
   runVerify(id: string): Promise<void>
+  // A12 — @파일 자동완성용 파일 목록(.gitignore 존중, 상한 적용). projectId 있으면 그 프로젝트 cwd만
+  // (Navi 드릴 범위, 상대경로), 없으면 등록된 모든 프로젝트(레인 채팅 범위, 'projectId/상대경로' 형태).
+  listFiles(projectId?: string): Promise<string[]>
   sendChat(text: string, attachments?: FileAttachment[], conversationId?: string): Promise<void>
   stopChat(): Promise<void>
   resetManager(): Promise<void> // Lain 무한세션 새로고침 — 진행 중 응답 멈추고 SDK 세션·월드스테이트 비움(로그는 보존)
+  compactNow(conversationId?: string): Promise<{ ok: boolean; message: string }> // A5 — /compact 수동 압축(자동 압축과 동일 로직 재사용)
   chatHistory(): Promise<ChatMessage[]>
   onProjectsUpdated(cb: (list: ProjectView[]) => void): () => void
   onChatEvent(cb: (ev: ChatEvent) => void): () => void
@@ -416,9 +571,12 @@ export interface LainApi {
   appStartedAt(): Promise<string>
   // Phase 1: tasks
   listTasks(): Promise<Task[]>
-  startTask(projectId: string): Promise<{ taskId?: string; error?: string }>
+  startTask(
+    projectId: string,
+  ): Promise<{ taskId?: string; mode?: NaviMode; error?: string; queued?: boolean; queuePos?: number }> // D1/D7 — queued=큐 적재됨, queuePos=대기 순위
   answerClarify(taskId: string, answers: string): Promise<void>
   resolveReview(taskId: string, action: 'merge' | 'keep-branch' | 'discard'): Promise<string>
+  revertMerge(taskId: string): Promise<string> // D8 — done+병합된 작업의 병합을 되돌린다(비파괴 범위 revert)
   cancelTask(taskId: string): Promise<void>
   resumeTask(taskId: string): Promise<void> // B3 — error 상태 작업을 worktree·세션 그대로 수동 재개
   setTaskPermissionMode(taskId: string, mode: TaskPermissionMode): Promise<void> // P2 권한모드 변경
@@ -426,19 +584,74 @@ export interface LainApi {
   setTaskDisallowedTools(taskId: string, tools: string[]): Promise<void> // P2 금지 도구 변경
   setTaskImages(taskId: string, images: FileAttachment[]): Promise<void> // B17 — 작업 입력 이미지 첨부(다음 실행/재개부터 Navi가 봄)
   setTaskFastMode(taskId: string, on: boolean): Promise<void> // B4 — Opus 빠른 출력 모드 토글(다음 실행/재개부터 적용)
+  setTaskModel(taskId: string, model: ModelTier | ''): Promise<void> // D10 — 작업별 모델 고정('' = 전역, 다음 실행/재개부터 적용)
+  rerunTask(taskId: string): Promise<{ taskId?: string; mode?: NaviMode; error?: string }> // D11 — done/cancelled 작업을 같은 content로 새 task 생성해 착수(원본 보존). mode=재판정된 실행 모드(orchestrator.rerunTask→startTask 반환)
   taskEvents(taskId: string): Promise<TaskEvent[]>
   taskDiff(taskId: string): Promise<string>
   listApprovals(): Promise<Approval[]>
   resolveApproval(id: number, approved: boolean, answer?: string): Promise<void>
   // 인라인 질문(ask_user) 답 제출 — 대기 중인 Lain 턴을 깨운다. answer는 선택된 보기 텍스트 배열.
   answerQuestion(questionId: string, answer: string[]): Promise<void>
+  // B5 — 대기 중 인라인 질문 조회. 렌더러 마운트/리로드 시 재요청해 카드를 복원(main 인메모리 → 리로드 유실 방어).
+  pendingQuestions(): Promise<PendingQuestion[]>
   onTasksUpdated(cb: (list: Task[]) => void): () => void
   onTaskEvent(cb: (ev: TaskEvent) => void): () => void
   onApprovalsUpdated(cb: (list: Approval[]) => void): () => void
   // 설정
   getSettings(): Promise<LainSettings>
   setSettings(patch: Partial<LainSettings>): Promise<LainSettings>
+  // 온보딩(첫 실행 위저드) — Claude 실행 파일·로그인 자격증명 결정론 검사
+  // claudeBinPath: 기대 경로(CLAUDE_BIN) — 진단용 표기. isPackaged: 패키징 실행 여부(dev면 npm install 안내 분기).
+  onboardingStatus(): Promise<{
+    claudeBin: boolean
+    loggedIn: boolean
+    claudeBinPath: string
+    isPackaged: boolean
+  }>
+  // E2 — 온보딩 '로그인 터미널 열기'. 번들 claude로 새 콘솔에 `auth login`(구독 OAuth)을 띄운다.
+  onboardingLogin(): Promise<{ ok: boolean; error?: string }>
+  // E6 — 유효 워크스페이스 루트/스캔폴더(env 오버라이드 반영). 빈상태 문구·SCAN 제목·폴더추가 기본경로 표시용.
+  workspaceInfo(): Promise<{
+    root: string
+    scanDirs: string[]
+    envRootOverride: boolean
+    envScanOverride: boolean
+  }>
+  // E8 — 데이터 폴더 열기(%APPDATA%\lain). 반환은 연 경로.
+  openDataFolder(): Promise<string>
+  // E8 — 백업 내보내기(WAL 병합 후 lain.sqlite를 사용자 선택 경로로 복사). busy=병합 미완(잠시 후 다시).
+  backupData(): Promise<{ ok?: boolean; bytes?: number; busy?: boolean; canceled?: boolean; error?: string }>
   onSettingsUpdated(cb: (s: LainSettings) => void): () => void // 설정 변경 라이브 반영(레인 도구·Prefs → 라벨 등)
+  onQuip(cb: (q: { text: string }) => void): () => void // 상호작용 대사(quip) 수신 — 캐릭터 옆 말풍선 표시(수신 전용 push)
+  // D15 되감기 — 레인 직접 편집 턴 체크포인트. 요약=확인창 파일 목록(existed=false면 복원 시 삭제),
+  // 복원=파일별 pre-turn 스냅샷 되쓰기(복원 직전 상태도 revertTurnId 그룹으로 남아 재되돌리기 가능).
+  editTurnCheckpoints(turnId: string): Promise<{ filePath: string; existed: boolean }[]>
+  // files·conversationId는 재리뷰 #4 — main(ipc)이 un-revert 카드를 emit하는 소스(렌더러는 ok/restored/error만 소비).
+  revertEditTurn(turnId: string): Promise<{
+    ok: boolean
+    restored: number
+    revertTurnId?: string
+    files: string[]
+    conversationId: string
+    error?: string
+  }>
+  // D13 크로스레포 그룹 — 결재 패널 정보 + all-or-nothing 일괄 결재
+  taskGroupInfo(groupId: string): Promise<{
+    id: string
+    title: string
+    children: { taskId: string; projectId: string; title: string; state: TaskState; verifyResult: string | null }[]
+  } | null>
+  resolveGroup(groupId: string, action: 'merge' | 'keep-branch' | 'discard'): Promise<string>
+  // 플래너
+  plannerList(): Promise<{ items: PlanItem[]; tags: PlanTag[]; sections: PlanSection[] }>
+  plannerUpsertItem(input: PlanItemInput): Promise<number>
+  plannerDeleteItem(id: number): Promise<void> // =archive
+  plannerSetDone(id: number, done: boolean): Promise<void>
+  plannerUpsertTag(input: { id?: number; name: string; color: string; sortOrder?: number }): Promise<number>
+  plannerDeleteTag(id: number): Promise<void>
+  plannerUpsertSection(input: { id?: number; name: string; sortOrder?: number; collapsed?: boolean }): Promise<number>
+  plannerDeleteSection(id: number): Promise<void>
+  onPlannerUpdated(cb: () => void): () => void
   // 자동 업데이트 — ④ UI 버튼/상태 + ② Lain 제안 배너
   getUpdateStatus(): Promise<UpdateStatus>
   checkForUpdate(): Promise<UpdateStatus>
@@ -451,7 +664,8 @@ export interface LainApi {
   importVoice(): Promise<{ file: string; kind: 'json' | 'audio'; error?: string } | null>
   openVoicesFolder(): Promise<string>
   sttVoice(bytes: Uint8Array): Promise<{ text?: string; error?: string }>
-  speakTts(text: string): Promise<string> // 합성 오디오 data URI(mime 포함, 빈 텍스트면 '')
+  // 합성 오디오 data URI(mime 포함, 빈 텍스트면 '') + 로컬 엔진 실패로 edge 대체됐는지(fallback, B7-2)
+  speakTts(text: string): Promise<{ uri: string; fallback?: boolean }>
   // §20.3 텔레그램 — 어댑터 연결 상태 (토큰 검증용)
   telegramStatus(): Promise<TelegramStatus>
   // §20.3 디스코드 — 음성 통화 어댑터 연결 상태
@@ -474,16 +688,35 @@ export interface LainApi {
   // 다중 세션 — 대상별 대화 목록 / 새 대화 / 대화 메시지 / 활성 대화
   listConversations(target: string): Promise<Conversation[]>
   createConversation(target: string): Promise<string> // 새 대화 id(활성으로 설정됨) 반환
-  conversationMessages(conversationId: string): Promise<ChatMessage[]>
+  // A15 — beforeId(옵션)로 위로 스크롤 페이징: 그 id보다 오래된 메시지 limit개(기본 200)를 더 로드.
+  conversationMessages(conversationId: string, limit?: number, beforeId?: number): Promise<ChatMessage[]>
   getActiveConversation(target: string): Promise<string>
   setActiveConversation(target: string, conversationId: string): Promise<void>
   deleteConversation(id: string): Promise<void>
+  // B9 — 삭제 확인창용 전건 메시지 수(워터마크·limit 무관, 실제 삭제량과 일치).
+  conversationMessageCount(id: string): Promise<number>
   renameConversation(id: string, title: string): Promise<void>
   // 채팅 우클릭 메뉴 — 메시지 클립보드 복사 / 챕터 고정·해제(title=null이면 해제)
   copyText(text: string): void
   setChapter(messageId: number, title: string | null): Promise<void>
+  // A16 — 대화 전체를 markdown(.md)으로 저장(showSaveDialog). 취소 시 { ok: false }.
+  exportConversationMarkdown(conversationId: string): Promise<{ ok: boolean; filePath?: string; error?: string }>
+  // 채팅 텍스트 링크화(A3) — URL은 브라우저로, 파일 경로는 탐색기에서 선택 상태로 열기(main 경유 필수)
+  openExternalUrl(url: string): Promise<{ ok: boolean; error?: string }>
+  revealPath(path: string): Promise<{ ok: boolean; error?: string }>
+  // A15 — Ctrl+F '전체 기간' 토글: 레인 대화(scope='manager') DB 전문검색(store.searchChatHistory 그대로).
+  searchChatHistory(query: string, limit?: number): Promise<ChatHistoryHit[]>
+  // A15 — 전체기간 검색 히트 클릭 시 그 메시지가 속한 대화의 주변 구간을 시간순으로 로드(점프용).
+  messagesAround(messageId: number, before?: number, after?: number): Promise<ChatMessage[]>
+  // C4 — 토큰 사용량 일별 집계: 최근 windowDays일(기본 15)에 생성된 작업의 원시 행. 로컬 날짜 버킷팅은
+  // 렌더러(summarizeUsage)가 한다. UTC/로컬 경계 slop 흡수용으로 창을 표시일수(14)보다 하루 넓게 잡는다.
+  dailyUsage(windowDays?: number): Promise<TaskUsageRow[]>
+  // C6 — 전역 활동 피드: task_events(의미있는 kind)+cc_events 원시 행(시간 역순 병합은 렌더러 mergeActivity).
+  recentActivity(limit?: number): Promise<ActivityRaw[]>
   // §22 자기개선 — 누적 교훈
   listLessons(): Promise<Lesson[]>
+  // C7 — 병합 통합본(umbrella)에 흡수된 원본 교훈 목록(absorbed_into 역참조, 읽기 전용 SELECT).
+  lessonsAbsorbedInto(umbrellaId: number): Promise<Lesson[]>
   // §24 교훈 수명주기 — 보관/복구/핀/직접추가
   flagLesson(id: number): Promise<boolean>
   unflagLesson(id: number): Promise<boolean>
@@ -527,6 +760,7 @@ export interface LainApi {
   // §23 평가 하네스
   runBench(conditions?: ('no-lessons' | 'with-lessons')[]): Promise<BenchSummary>
   onBenchProgress(cb: (msg: string) => void): () => void
+  listBenchRuns(): Promise<BenchSummary[]> // C10 — 영속된 벤치 이력, 시간순(오래된 런 먼저)
   // 창 제어 (frameless — OS 타이틀바를 헤더에 통합)
   windowMinimize(): Promise<void>
   windowMaximizeToggle(): Promise<boolean>

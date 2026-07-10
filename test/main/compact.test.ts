@@ -3,6 +3,7 @@ import {
   contextOccupancyTokens,
   shouldCompact,
   occupancyForMaxTurns,
+  contextPercent,
 } from '../../src/main/compactgate'
 
 describe('contextOccupancyTokens — 컨텍스트 점유량(프롬프트 크기), output 제외', () => {
@@ -68,5 +69,28 @@ describe('occupancyForMaxTurns — max-turns throw 경로의 점유 보정', () 
 
   it('비활성에선 게이트가 계속 false', () => {
     expect(shouldCompact(occupancyForMaxTurns(0, 0), 0)).toBe(false)
+  })
+})
+
+// A5 — 컨텍스트 게이지(UI) % 계산. threshold<=0(압축 비활성)이면 게이지 자체를 숨겨야 하므로 null.
+describe('contextPercent — 컨텍스트 게이지 % (threshold<=0이면 null=숨김)', () => {
+  it('threshold 0 또는 음수면 null', () => {
+    expect(contextPercent(100_000, 0)).toBeNull()
+    expect(contextPercent(0, 0)).toBeNull()
+    expect(contextPercent(100, -1)).toBeNull()
+  })
+
+  it('정상 비율 계산', () => {
+    expect(contextPercent(75_000, 150_000)).toBe(50)
+    expect(contextPercent(150_000, 150_000)).toBe(100)
+    expect(contextPercent(0, 150_000)).toBe(0)
+  })
+
+  it('임계 초과도 그대로(100 초과) — 클램프는 표시 쪽 책임', () => {
+    expect(contextPercent(300_000, 150_000)).toBe(200)
+  })
+
+  it('음수 토큰은 0으로 보정', () => {
+    expect(contextPercent(-50, 150_000)).toBe(0)
   })
 })

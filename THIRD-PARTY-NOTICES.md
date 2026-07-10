@@ -13,6 +13,40 @@ upon the third-party works listed below, each under its own license.
 - Hack — https://github.com/source-foundry/Hack
 - MonoplexKR — https://github.com/y-kim/monoplex
 
+## Bundled icons (`src/renderer/components/icons.tsx`)
+
+The `Icon` component inlines 40 icons (caret-left/right, calendar, x-circle, gear,
+bell, pin, trash, plus, check, send, eye, eye-off, refresh, book-open, clock, tag,
+chevron-down/up/left/right, menu, magnifier, play, pause, stop, paperclip, image,
+folder, bookmark, globe, key, restore, microphone, mic-off, volume, volume-off,
+chart, branch, window) sourced from **Reicon** — MIT License, Copyright (c) 2025
+Dev Chauhan (<https://github.com/dqev/reicon>). The SVG path data is embedded as-is;
+no source code from the reicon package itself is used.
+
+```
+MIT License
+
+Copyright (c) 2025 Dev Chauhan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## npm dependencies
 
 Runtime and build dependencies are fetched from the npm registry at install

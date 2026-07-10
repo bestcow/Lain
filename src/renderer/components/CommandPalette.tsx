@@ -7,6 +7,8 @@ export interface PaletteItem {
   label: string
   hint?: string
   group?: string
+  // B10 — 이 항목을 실행하는 키보드 단축키 표기(예: '?'). 있는 항목만 우측에 뱃지로 표시.
+  hotkey?: string
   run: () => void
 }
 
@@ -90,7 +92,10 @@ export function CommandPalette({ items, onClose }: { items: PaletteItem[]; onClo
                     onClick={() => run(it)}
                   >
                     <span>{it.label}</span>
-                    {it.hint && <span className="cmdk-hint">{it.hint}</span>}
+                    <span className="cmdk-meta">
+                      {it.hint && <span className="cmdk-hint">{it.hint}</span>}
+                      {it.hotkey && <kbd className="cmdk-hotkey">{it.hotkey}</kbd>}
+                    </span>
                   </button>
                 </div>
               )

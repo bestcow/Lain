@@ -23,9 +23,19 @@ export function extractSpeech(text: string): { clean: string; say: string } {
   return { clean, say: says.join(' ').trim() }
 }
 
-/** TTS로 읽을 텍스트 — say 태그가 있으면 그것만. 없으면: 짧은 응답은 그대로, 긴 본문은 빈 문자열(전문 낭독 방지). */
+// 첫 문장 추출 — 마침표/물음표/느낌표/줄바꿈 중 가장 먼저 나오는 지점까지, 없으면 100자 컷.
+// say 태그를 빼먹은 장문 응답이 완전 무음으로 스킵되는 것을 막기 위한 폴백(B7-1).
+function firstSentence(text: string): string {
+  const m = text.match(/^[\s\S]*?[.!?。！？\n]/) // 첫 종결부호(마침표류) 또는 줄바꿈까지
+  const cut = (m ? m[0] : text.slice(0, 100)).trim()
+  return cut.length <= 100 ? cut : cut.slice(0, 100).trim()
+}
+
+/** TTS로 읽을 텍스트 — say 태그가 있으면 그것만. 없으면: 짧은 응답은 그대로, 긴 본문은
+ * 첫 문장(~100자)만 읽는다(B7-1: say 태그 누락 시 완전 무음 방지). */
 export function spokenText(text: string): string {
   const { clean, say } = extractSpeech(text)
   if (say) return say
-  return clean.length <= 100 ? clean : ''
+  if (clean.length <= 100) return clean
+  return firstSentence(clean)
 }

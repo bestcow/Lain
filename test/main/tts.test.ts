@@ -40,3 +40,47 @@ describe('synthesize — Edge TTS', () => {
     expect(capturedFormat).toBe('audio-24khz-48kbitrate-mono-mp3')
   })
 })
+
+describe('synthesizeBackend — 로컬 엔진 실패 시 edge 폴백 (B7-2)', () => {
+  const baseCfg = {
+    ttsBackend: 'gpt-sovits' as const,
+    gptSovitsUrl: 'http://127.0.0.1:9880',
+    gptSovitsRefAudio: 'ref.wav',
+    gptSovitsRefText: '참조 문장',
+    gptSovitsRefLang: 'ko',
+  }
+
+  it('설정 엔진이 정상이면 fallback 플래그 없이 해당 엔진 결과를 반환한다', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      arrayBuffer: async () => Buffer.from('wav-bytes').buffer,
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { synthesizeBackend } = await import('../../src/main/tts')
+    const r = await synthesizeBackend('안녕', baseCfg)
+    expect(r.mime).toBe('audio/wav')
+    expect(r.fallback).toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
+  it('gpt-sovits 실패 시 edge로 폴백하고 fallback:true를 반환한다', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      text: async () => 'server error',
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { synthesizeBackend } = await import('../../src/main/tts')
+    const r = await synthesizeBackend('안녕', baseCfg)
+    expect(r.mime).toBe('audio/mpeg') // edge 컨테이너
+    expect(r.fallback).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('설정 자체가 edge면 폴백이 아니다(정상 경로)', async () => {
+    const { synthesizeBackend } = await import('../../src/main/tts')
+    const r = await synthesizeBackend('안녕', { ...baseCfg, ttsBackend: 'edge' as const })
+    expect(r.mime).toBe('audio/mpeg')
+    expect(r.fallback).toBeUndefined()
+  })
+})

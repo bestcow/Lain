@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react'
 import type { LainSettings, TaskPermissionMode, ManagerEffort } from '../../shared/types'
-import { MODEL_TIERS } from '../../shared/models'
+import { MODEL_TIERS, MODEL_NAME } from '../../shared/models'
+import { Icon } from './icons'
 
 type Opt = { value: string; label: string }
 
@@ -58,7 +59,11 @@ function ModeDropdown({
               }}
             >
               <span>{o.label}</span>
-              {o.value === value && <span className="imb-item-check">✓</span>}
+              {o.value === value && (
+                <span className="imb-item-check">
+                  <Icon name="check" size={14} />
+                </span>
+              )}
             </button>
           ))}
           {footer && <div className="imb-menu-foot">{footer}</div>}
@@ -89,13 +94,6 @@ const TASKMODE_OPTS: Opt[] = [
   { value: 'autonomous', label: '자동' },
   { value: 'interactive', label: '대화형' },
 ]
-const MODEL_NAME: Record<string, string> = {
-  haiku: 'Claude_Haiku_4.5',
-  sonnet: 'Claude_Sonnet_4.6',
-  opus: 'Claude_Opus_4.8',
-  fable: 'Claude_Fable_5',
-  local: 'Qwen_로컬(실험적)', // llama-server 필요(환경설정 모델 탭) — 서버 꺼져 있으면 응답 실패
-}
 const MODEL_OPTS: Opt[] = MODEL_TIERS.map((t) => ({ value: t, label: MODEL_NAME[t] }))
 const CONC_OPTS: Opt[] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => ({
   value: String(n),
@@ -106,11 +104,16 @@ export function InputModeBar({
   settings,
   onPatch,
   onPlus,
+  contextPercent,
 }: {
   settings: LainSettings
   onPatch: (p: Partial<LainSettings>) => void
   onPlus: (anchor: { x: number; y: number }) => void
+  contextPercent?: number | null // A5 — 무한세션 컨텍스트 게이지(%). null/undefined = 압축 비활성·데이터 없음(빈 orb)
 }) {
+  // A5 — 게이지 % 클램프(0~100, 표시용) + 임계 접근(80%+) 경고색 판정. null=압축 비활성·데이터 없음(빈 orb).
+  const gaugePct = contextPercent == null ? null : Math.min(100, Math.max(0, contextPercent))
+  const gaugeWarn = gaugePct != null && gaugePct >= 80
   return (
     <div className="input-modebar">
       <div className="imb-left">
@@ -181,7 +184,19 @@ export function InputModeBar({
           header="동시 작업"
           align="right"
         />
-        <span className="imb-orb" title="사용량 (곧)" />
+        <span
+          className={`imb-orb${gaugeWarn ? ' imb-orb-warn' : ''}`}
+          title={
+            gaugePct == null
+              ? '컨텍스트 사용량 — 압축 비활성(설정에서 켤 수 있음)'
+              : `컨텍스트 사용량 ${Math.round(gaugePct)}%`
+          }
+          style={
+            gaugePct == null
+              ? undefined
+              : { background: `conic-gradient(var(--imb-orb-fill, var(--signal)) ${gaugePct * 3.6}deg, transparent 0deg)` }
+          }
+        />
       </div>
     </div>
   )

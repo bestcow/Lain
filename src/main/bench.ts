@@ -166,7 +166,7 @@ function mkResult(
   return { benchTask, condition, success, verifyFirstPass, turns, costUsd, tokens }
 }
 
-function aggregate(runId: string, results: BenchTaskResult[], startedAt: string): BenchSummary {
+export function aggregate(runId: string, results: BenchTaskResult[], startedAt: string): BenchSummary {
   const byCondition: BenchSummary['byCondition'] = {}
   for (const cond of ['no-lessons', 'with-lessons']) {
     const rs = results.filter((r) => r.condition === cond)

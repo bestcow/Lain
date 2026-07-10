@@ -99,6 +99,17 @@ export function SessionList({
               className={`session-row${openConv === c.id ? ' session-row-selected' : ''}`}
               onClick={() => editingId !== c.id && onPick(c.id)}
               role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (
+                  editingId !== c.id &&
+                  (e.key === 'Enter' || e.key === ' ') &&
+                  !e.nativeEvent.isComposing
+                ) {
+                  e.preventDefault()
+                  onPick(c.id)
+                }
+              }}
               title={c.title || '새 대화'}
             >
               {editingId === c.id ? (

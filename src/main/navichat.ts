@@ -32,9 +32,11 @@ import {
 } from './store'
 import { tierQueryOptions } from './agentopts'
 import { summarizeConversationTitle } from './title'
-import { DEV_ROOT, RISKY, sumUsageTokens, waitApproval } from './worker'
+import { RISKY, sumUsageTokens, waitApproval } from './worker'
+import { workspaceRoot } from './registry'
 import { answerClarify, interruptTask } from './orchestrator'
 import { notifyUser } from './notify'
+import { classifySystemDestructive } from './sysrisk'
 import { blocksSecretFile, toolFilePath, SECRET_DENY_MESSAGE } from './safety'
 import { shouldCompact, contextOccupancyTokens } from './compactgate'
 import { summarizeNaviHandoff, handoffBlock } from './handoff'
@@ -42,6 +44,7 @@ import { skillOptions } from './skills'
 import { frameMessage, NAVI_SENDER_LEGEND, type NaviSender } from './navisender'
 import { conventionsBlock } from './conventions'
 import type { NaviChatEvent, FileAttachment } from '../shared/types'
+import { encodeToolLine } from '../shared/toolline'
 
 const busyProjects = new Set<string>()
 const chatAborts = new Map<string, AbortController>()
@@ -62,24 +65,29 @@ export function stopNaviChat(projectId: string): void {
 }
 
 // assistant content의 tool_use 블록 → 짧은 회색 활동 라인.
-function toolActivityLine(b: any): string {
+// A17 — display(축약)와 별개로 raw(잘리기 전 원문 — 전체 경로·전체 명령)도 반환. 호출부가
+// encodeToolLine으로 합쳐 저장(스키마 변경 없이 content 하나에 원문 보존, manager.ts formatToolUse와 동일 패턴).
+function toolActivityLine(b: any): { display: string; raw: string } {
   const name = String(b?.name ?? '')
   const input = (b?.input ?? {}) as Record<string, unknown>
+  const fp = String(input.file_path ?? '')
   const base = (p: unknown) => path.basename(String(p ?? '')) || String(p ?? '')
   switch (name) {
     case 'Read':
-      return `· Read ${base(input.file_path)}`
+      return { display: `· Read ${base(input.file_path)}`, raw: fp }
     case 'Edit':
     case 'Write':
-      return `· ${name} ${base(input.file_path)}`
+      return { display: `· ${name} ${base(input.file_path)}`, raw: fp }
     case 'Bash':
-    case 'PowerShell':
-      return `· $ ${String(input.command ?? '').slice(0, 60)}`
+    case 'PowerShell': {
+      const cmd = String(input.command ?? '')
+      return { display: `· $ ${cmd.slice(0, 60)}`, raw: cmd }
+    }
     case 'Glob':
     case 'Grep':
-      return `· Grep ${String(input.pattern ?? '')}`
+      return { display: `· Grep ${String(input.pattern ?? '')}`, raw: '' }
     default:
-      return `· ${name}`
+      return { display: `· ${name}`, raw: '' }
   }
 }
 
@@ -124,6 +132,8 @@ export async function sendToNavi(
   conversationId = conversationId || ensureActiveConversation(projectId)
   const msgOrigin = from === 'lain' ? 'lain' : undefined // addNaviMessage origin 인자(사용자 메시지 귀속용)
 
+  // D14 주의 — projectParallelCap>1로 같은 프로젝트 활성 작업이 여럿이면 최신 것 하나로 라우팅된다(v1).
+  // 아래 tool 라인에 대상 작업 제목이 표기되므로 어디로 갔는지는 보인다. 작업 지정 라우팅은 v2(task_id 파라미터).
   const active = activeTaskForProject(projectId)
   if (active && active.state === 'working') {
     // §5.7 작업 중 인터럽트 — 안전 중단 후 메시지를 최우선 주입, 같은 세션 이어감
@@ -275,6 +285,9 @@ export async function sendToNavi(
         resume,
         permissionMode: 'acceptEdits',
         maxTurns: 30,
+        // A9 — 토큰 스트리밍(manager.ts와 동일 선례): 텍스트 증분(stream_event)을 렌더러에 흘려
+        // 완성될 때까지 통짜로 나타나는 대신 라이브 버블로 이어붙게 한다. 확정·영속은 assistant 블록.
+        includePartialMessages: true,
         ...tierQueryOptions(getSettings().naviModel, getSettings()), // §9b — Navi와 같은 티어(local 라우팅 포함)
         ...skillOptions(null, getSettings().skillsEnabled, getSettings().curatedPlugins),
         executable: 'node',
@@ -297,8 +310,29 @@ export async function sendToNavi(
             return { behavior: 'deny', message: SECRET_DENY_MESSAGE }
           }
           if (toolName === 'Bash' || toolName === 'PowerShell') {
+            // 시스템/PC 파괴(sysrisk.ts) — 항상 사람 승인(예외 없음).
+            const sys = classifySystemDestructive(cmd)
+            if (sys) {
+              const approvalId = insertApproval(chatTaskId(projectId), 'system', cmd)
+              const waitNote = `승인 대기 [system:${sys}]: ${cmd.slice(0, 160)}`
+              addNaviMessage(projectId, 'tool', waitNote)
+              emit({ projectId, kind: 'tool', text: waitNote })
+              notifyUser('lain — 시스템 명령 승인 필요', `[${sys}] ${cmd.slice(0, 120)}`)
+              const sysRes = await waitApproval(approvalId)
+              const sysNote = sysRes.approved ? '승인됨' : '거절됨'
+              addNaviMessage(projectId, 'tool', `${sysNote}: ${cmd.slice(0, 80)}`)
+              emit({ projectId, kind: 'tool', text: `${sysNote}: ${cmd.slice(0, 80)}` })
+              if (!sysRes.approved) {
+                return {
+                  behavior: 'deny',
+                  message: '사용자가 이 시스템 명령을 거절했다. 다른 방법으로 진행해라.',
+                }
+              }
+              return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
+            }
+            const root = workspaceRoot() // E6 — 유효 워크스페이스 루트(UI/env) 반영
             const outside =
-              /[A-Za-z]:\\/.test(cmd) && !cmd.toUpperCase().includes(DEV_ROOT.toUpperCase())
+              /[A-Za-z]:\\/.test(cmd) && !cmd.toUpperCase().includes(root.toUpperCase())
             const risky = RISKY.find((r) => r.re.test(cmd))
             if (risky || outside) {
               const kind = risky?.kind ?? 'outside_dev'
@@ -327,6 +361,15 @@ export async function sendToNavi(
       if (abandoned) break // 정지로 강제 종료됨 — 늦게 도착한 스트림은 더 처리하지 않는다
       if (msg.type === 'system' && msg.subtype === 'init') {
         setConversationSdkSession(conversationId, msg.session_id)
+      } else if (msg.type === 'stream_event') {
+        // A9 — 최상위 텍스트 증분만 라이브로 흘린다(서브에이전트 parent_tool_use_id≠null 제외).
+        // manager.ts와 동일 패턴: thinking_delta 등은 무시하고 text_delta만.
+        if (msg.parent_tool_use_id == null) {
+          const sev = msg.event as { type?: string; delta?: { type?: string; text?: string } }
+          if (sev?.type === 'content_block_delta' && sev.delta?.type === 'text_delta' && sev.delta.text) {
+            emit({ projectId, kind: 'assistant_delta', text: sev.delta.text })
+          }
+        }
       } else if (msg.type === 'assistant') {
         const content = msg.message?.content ?? []
         const out = content
@@ -341,7 +384,9 @@ export async function sendToNavi(
         // 도구 활동 라인 — 같은 content 배열의 tool_use 블록도 짧은 회색 라인으로 영속+emit.
         for (const b of content as any[]) {
           if (b?.type !== 'tool_use') continue
-          const line = toolActivityLine(b)
+          const { display, raw } = toolActivityLine(b)
+          // A17 — 원문(전체 경로·전체 명령)을 축약 뒤에 인코딩해 함께 영속(스키마 변경 없음).
+          const line = encodeToolLine(display, raw)
           addNaviMessage(projectId, 'tool', line, conversationId)
           emit({ projectId, kind: 'tool', text: line })
         }

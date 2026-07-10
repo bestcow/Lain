@@ -7,7 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { AGENT_CWD, CLAUDE_BIN, DATA_DIR } from './paths'
 import { getSettings } from './store'
-import { tierQueryOptions } from './agentopts'
+import { judgeQueryOptions } from './agentopts'
 import type { ChatMessage } from '../shared/types'
 
 const FIELDS = `## 방침\n## 진행 스레드\n## 열린 결정\n## 최근 완료`
@@ -51,7 +51,7 @@ export async function summarizeWorldState(
         cwd: AGENT_CWD,
         allowedTools: [],
         maxTurns: 6, // 1은 모델의 추가 턴(도구 시도→거부 등)에 error_max_turns로 throw돼 산출물을 버린다(실측). 여유 확보.
-        ...tierQueryOptions(getSettings().judgeModel, getSettings()), // §9b — 판정/요약류(local 라우팅 포함)
+        ...judgeQueryOptions(), // §9b — 판정/요약류(local 라우팅 + D7 사용량 가드 강등)
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리
       },

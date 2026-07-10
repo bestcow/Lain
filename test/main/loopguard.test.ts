@@ -75,9 +75,22 @@ describe('extractToolResults — user(tool_result) 스트림 파싱(순수)', ()
       },
     }
     expect(extractToolResults(msg)).toEqual([
-      { toolUseId: 'tu_1', result: 'hello' },
-      { toolUseId: 'tu_2', result: 'line Aline B' },
+      { toolUseId: 'tu_1', result: 'hello', isError: false },
+      { toolUseId: 'tu_2', result: 'line Aline B', isError: false },
     ])
+  })
+
+  // A7 — 관리자 스트림 도구 실패 표시(is_error)가 이 필드에 의존한다.
+  it('is_error:true 블록은 isError:true로 표시', () => {
+    const msg = {
+      type: 'user',
+      message: {
+        content: [
+          { type: 'tool_result', tool_use_id: 'tu_err', content: 'boom', is_error: true },
+        ],
+      },
+    }
+    expect(extractToolResults(msg)).toEqual([{ toolUseId: 'tu_err', result: 'boom', isError: true }])
   })
 
   it('같은 입력 → 같은 result 문자열(해시 안정성 전제)', () => {
@@ -114,7 +127,7 @@ describe('extractToolResults — user(tool_result) 스트림 파싱(순수)', ()
       },
     }
     expect(extractToolResults(msg)).toEqual([
-      { toolUseId: 'tu', result: JSON.stringify({ type: 'image', source: { x: 1 } }) },
+      { toolUseId: 'tu', result: JSON.stringify({ type: 'image', source: { x: 1 } }), isError: false },
     ])
   })
 })

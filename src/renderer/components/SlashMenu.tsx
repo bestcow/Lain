@@ -9,7 +9,8 @@ export interface SlashCmd {
   arg?: string // 인자 힌트(있으면 명령에 공백+커서, 없으면 즉시 실행 가능)
 }
 
-// 텔레그램 슬래시 명령 원본(telegram.ts handleCommand)과 대응하는 8개.
+// 대부분 텔레그램 슬래시 명령 원본(telegram.ts handleCommand)과 대응. /compact(A5)는 PC 전용(무한세션
+// 컨텍스트 수동 압축 — 텔레그램엔 아직 미이식).
 export const SLASH_COMMANDS: SlashCmd[] = [
   { cmd: '/scan', label: '프로젝트 재스캔' },
   { cmd: '/refresh', label: '현황 새로고침' },
@@ -20,6 +21,8 @@ export const SLASH_COMMANDS: SlashCmd[] = [
   { cmd: '/verify', label: '검증 실행', arg: '<프로젝트id>' },
   { cmd: '/cancel', label: '작업 취소', arg: '<taskId>' },
   { cmd: '/learn', label: '절차를 스킬로 학습·저장', arg: '<주제·URL·경로·"방금 한 작업">' },
+  { cmd: '/plan', label: '플래너 열기' },
+  { cmd: '/compact', label: '컨텍스트 수동 압축(임계 도달 전에도)' }, // A5
 ]
 
 interface Props {

@@ -3,8 +3,8 @@
 // needsAutoTitle(0/NULL 가드) → setAutoTitle(원자적 title_auto=0 가드)로 한 대화 1회만 실제 반영.
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { AGENT_CWD, CLAUDE_BIN } from './paths'
-import { getSettings, needsAutoTitle, setAutoTitle } from './store'
-import { tierQueryOptions } from './agentopts'
+import { needsAutoTitle, setAutoTitle } from './store'
+import { judgeQueryOptions } from './agentopts'
 
 // 제목 갱신 알림 콜백 — ipc.ts가 startup에 바인딩(conversations:updated broadcast). manager·workerchat 공용.
 let titleRefresh: ((target: string) => void) | null = null
@@ -30,7 +30,7 @@ export async function summarizeConversationTitle(
         cwd: AGENT_CWD,
         allowedTools: [],
         maxTurns: 1,
-        ...tierQueryOptions(getSettings().judgeModel, getSettings()), // §9b — 짧은 판정류(local 라우팅 포함)
+        ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
       },

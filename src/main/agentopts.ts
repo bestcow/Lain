@@ -2,6 +2,8 @@
 import type { ThinkingConfig, PermissionMode, EffortLevel } from '@anthropic-ai/claude-agent-sdk'
 import type { ThinkingLevel, LainSettings } from '../shared/types'
 import { modelId } from '../shared/models'
+import { getSettings } from './store'
+import { effectiveJudgeTier, recentUsageTokens, usageGuardTripped } from './usage'
 
 /**
  * 티어 → query() 모델/라우팅 옵션 (로컬 모델 지원, 2026-07 조사 [[lain-local-model-plan]]).
@@ -22,10 +24,18 @@ import { modelId } from '../shared/models'
  */
 export function tierQueryOptions(
   tier: string,
-  s: Pick<LainSettings, 'localBaseUrl'>,
+  s: Pick<LainSettings, 'localBaseUrl' | 'anthropicApiKey'>,
   baseEnv: NodeJS.ProcessEnv = process.env,
 ): { model: string; env?: Record<string, string | undefined> } {
-  if (tier !== 'local') return { model: modelId(tier) }
+  if (tier !== 'local') {
+    // E5 — 앱에 API 키가 설정돼 있으면 spawn env에 ANTHROPIC_API_KEY로 주입(구독 로그인 대안).
+    // SDK env는 서브프로세스 환경을 통째 교체하므로 baseEnv 스프레드 필수(PATH 등). 비었으면 env
+    // 미설정 = 기존 동작(구독 OAuth 자격증명 사용).
+    const key = s.anthropicApiKey?.trim()
+    return key
+      ? { model: modelId(tier), env: { ...baseEnv, ANTHROPIC_API_KEY: key } }
+      : { model: modelId(tier) }
+  }
   const local = modelId('local')
   return {
     model: local,
@@ -39,6 +49,16 @@ export function tierQueryOptions(
       CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
     },
   }
+}
+
+// D7 (§9b) — judge류 짧은 판정 query의 티어/라우팅 옵션. 전역 사용량 가드가 발동(최근 창 누적이
+// usageWindowTokenLimit 이상)이면 judge 티어를 한 단계 강등(opus→sonnet→haiku, local 예외)해 크레딧을
+// 아낀다. 미발동·off(limit=0)면 설정 judgeModel 그대로 → 기존 동작 불변. elicit·ask_manager·reflect·
+// verify tier-up·autoPriority·consolidateLessons 6개 호출부의 단일 출처(중복 제거·정책 일관).
+export function judgeQueryOptions(): { model: string; env?: Record<string, string | undefined> } {
+  const s = getSettings()
+  const tripped = usageGuardTripped(recentUsageTokens(), s.usageWindowTokenLimit)
+  return tierQueryOptions(effectiveJudgeTier(s.judgeModel, tripped), s)
 }
 
 // 추론 강도(thinkingLevel)를 SDK thinking 옵션으로. default는 {}(옵션 미설정=현행 유지).

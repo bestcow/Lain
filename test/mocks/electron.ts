@@ -28,6 +28,6 @@ export const Tray = class {}
 export const nativeImage = { createFromPath: () => ({}), createFromDataURL: () => ({}) }
 export const clipboard = { readText: () => '', writeText: () => {} }
 export const dialog = { showOpenDialog: () => Promise.resolve({ canceled: true, filePaths: [] }) }
-export const shell = { openExternal: () => Promise.resolve() }
+export const shell = { openExternal: () => Promise.resolve(), showItemInFolder: () => {} }
 
 export default { app, BrowserWindow, Notification, ipcMain, Menu, Tray, nativeImage, clipboard, dialog, shell }

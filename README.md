@@ -4,6 +4,11 @@
 
 <h1 align="center"><img src="assets/lain-face.png" width="34" alt="" align="top"> Lain</h1>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Windows only">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
+</p>
+
 **내 PC에 상주하며 나에게 길들여지는 개인 AI 매니저**입니다 — 대화하고, 여러 프로젝트의 코딩 작업을 지휘하고, 화면을 어깨너머로 지켜보다 필요할 때만 조언하며, 쓸수록 사용자를 학습합니다. Windows 데스크톱 앱(Electron + Claude Agent SDK)입니다.
 
 > A local orchestrator where a manager agent ("Lain") directs Claude Code workers
@@ -11,13 +16,14 @@
 > and Lain plans, dispatches, reviews, and merges their work from one screen.
 > Lain also learns its user over time: lessons, a user profile, and a customizable persona.
 
-**🇰🇷 한국어 전용** — Lain의 대화·UI·문서는 한국어 기준으로 만들어졌습니다. (Korean-only for now.)
+**🇰🇷 한국어 전용** — Lain의 대화·UI·문서는 한국어 기준으로 만들어졌습니다. (Korean-only for now. [Read this in English](README.en.md))
 
 ## Lain이 하는 일
 
 - **대화** — 토큰 스트리밍과 빠른 대화 레인으로 사람과 말하듯 응답합니다. 앱을 껐다 켜도 종료 전 맥락을 기억하고 브리핑합니다
 - **코딩 작업 지휘** — 채팅으로 지시하면 프로젝트별 워커(Navi, Claude Code)가 격리된 git worktree에서 작업 → 검증 → 결재(merge/폐기)까지 진행합니다. 여러 프로젝트를 동시에 운용할 수 있습니다
 - **학습(길들이기)** — 대화·작업에서 교훈을 자동 추출해 다음 판단에 반영하고, 사용자에 대한 사실(선호·습관·수준)을 프로필로 축적합니다. 쓸수록 내 방식에 맞춰집니다
+- **플래너** — 일정과 할 일을 한 캘린더에서 관리합니다. "내일 3시 미팅 잡아줘"라고 말하면 등록되고, 시간이 되면 PC·텔레그램으로 알려드립니다
 - **유저 감시** — (opt-in) 화면을 지켜보다 진짜 도움이 될 때만 우하단에 잠깐 떠서 조언합니다. 대부분은 침묵합니다
 - **음성** — TTS 3종(Edge/Supertonic/GPT-SoVITS)과 디스코드 음성통화를 지원합니다
 - **모바일** — 텔레그램으로 어디서든 대화·작업 지시·승인·현황 확인이 가능합니다
@@ -28,17 +34,21 @@
 **전제조건**
 
 1. **Windows** (현재 Windows 전용 — macOS/Linux 미지원)
-2. **Node.js 20+**, **Git 2.x+**
-3. **[Claude Code](https://docs.claude.com/claude-code) 로그인** — Lain의 두뇌는 Claude입니다. 터미널에서 `claude`를 실행해 로그인되어 있어야 합니다(Claude 구독 또는 API 키). 로그인이 안 되어 있으면 Lain이 응답 대신 🔑 인증 안내를 띄웁니다.
+2. **[Claude Code](https://docs.claude.com/claude-code) 로그인** — Lain의 두뇌는 Claude입니다. 터미널에서 `claude`를 실행해 로그인되어 있어야 합니다(Claude 구독 또는 API 키). 로그인이 안 되어 있으면 Lain이 응답 대신 🔑 인증 안내를 띄웁니다.
 
-**설치·실행**
+**설치 (권장)**
+
+1. [Releases](https://github.com/bestcow/Lain/releases/latest)에서 최신 `Lain Setup x.y.z.exe`를 받아 실행하세요.
+2. 한 번 설치하면 이후로는 앱이 자동 업데이트를 확인·설치합니다 — 다시 받으러 올 필요 없습니다.
+
+**소스 빌드 (개발자용)** — Node.js 20+, Git 2.x+ 필요
 
 ```sh
 git clone https://github.com/bestcow/Lain.git
 cd Lain
 npm install
 npm run dev        # 개발 실행
-npm run dist       # 설치본 생성 (dist\Lain Setup *.exe) — 상주용 권장
+npm run dist       # 설치본 생성 (dist\Lain Setup *.exe)
 ```
 
 **첫 5분**
@@ -63,7 +73,7 @@ Lain은 쓰는 사람에 맞춰 자라는 것을 전제로 설계되었습니다
 
 ## 설정
 
-폴더를 하나씩 추가하는 대신, **본인 작업 폴더**를 환경변수로 지정하면 그 아래 프로젝트들을 자동 스캔해 등록합니다(선택 사항 — UI 수동 추가만으로도 충분합니다). 지정하지 않으면 기본값 경로를 살펴보고, 해당 폴더가 없으면 조용히 무시합니다.
+폴더를 하나씩 추가하는 대신, **본인 작업 폴더**를 자동 스캔 루트로 지정하면 그 아래 프로젝트들을 자동 등록합니다(선택 사항 — UI 수동 추가만으로도 충분합니다). 스캔 루트·하위 폴더는 **환경설정 → 일반**에서 지정하거나, 아래 환경변수로 덮어쓸 수 있습니다(환경변수가 우선). 지정하지 않으면 기본값 경로를 살펴보고, 해당 폴더가 없으면 조용히 무시합니다.
 
 | 환경변수 | 기본값 | 의미 |
 |---|---|---|
@@ -73,6 +83,18 @@ Lain은 쓰는 사람에 맞춰 자라는 것을 전제로 설계되었습니다
 | `LAIN_SELF_DIR` | (자동 탐지) | Lain 자기 소스 클론 경로 — 지정하면 Lain이 스스로 자기 코드를 수정·배포(`deploy_lain`)할 수 있습니다. 미지정·미탐지면 자기-업데이트는 안전하게 비활성화됩니다 |
 
 텔레그램·디스코드·TTS·모델 티어 등 나머지는 전부 앱 내 환경설정(⚙)에서 지정합니다. 데이터(설정·대화·학습)는 `%APPDATA%\lain`에 저장되며 재설치해도 보존됩니다.
+
+### 백업 · PC 이사
+
+Lain에 쌓인 개인화 데이터(설정·대화·교훈·플래너)는 전부 `%APPDATA%\lain\lain.sqlite` 한 파일에 담깁니다. **환경설정 → 일반 → 데이터**에서 `백업 내보내기`를 누르면 이 파일을 원하는 위치로 저장합니다(WAL을 합친 완전한 스냅샷).
+
+복원하거나 다른 PC로 옮기려면 **Lain을 완전히 종료한 뒤**:
+
+1. 대상 PC의 `%APPDATA%\lain` 폴더에서 `lain.sqlite`, **`lain.sqlite-wal`, `lain.sqlite-shm`** 파일을 (있으면) 모두 삭제합니다. ⚠️ `-wal`/`-shm`을 지우지 않고 덮어쓰면 이전 설치가 남긴 저널이 새 데이터에 잘못 병합돼 조용히 손상될 수 있습니다.
+2. 내보낸 백업 파일을 그 자리에 `lain.sqlite`로 복사합니다.
+3. Lain을 다시 실행합니다.
+
+`데이터 폴더 열기` 버튼으로 이 폴더를 바로 열 수 있습니다.
 
 ## 로컬 모델 (실험적)
 

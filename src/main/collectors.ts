@@ -68,24 +68,30 @@ export async function collectStatus(p: Project): Promise<void> {
 
 const TAIL_CHARS = 2000
 
-/** verify_cmd 실행 → pass/fail + 출력 꼬리 저장. 수동 트리거 전용(Phase 0). */
-export async function runVerify(p: Project): Promise<void> {
-  if (!p.verifyCmd) return
-  saveStatus({ projectId: p.id, testState: 'running' })
+/** 임의 디렉터리에서 verify 명령 실행 → pass/fail + 출력 꼬리. DB에 저장하지 않음(순수 실행).
+ * D8 rebase 폴백이 worktree(project status와 별개)에서 검증을 다시 돌리는 데 재사용한다. */
+export async function verifyInDir(
+  cmd: string,
+  cwd: string,
+): Promise<{ pass: boolean; tail: string }> {
   try {
-    const { stdout, stderr } = await execP(p.verifyCmd, {
-      cwd: p.path,
+    const { stdout, stderr } = await execP(cmd, {
+      cwd,
       windowsHide: true,
       timeout: 5 * 60_000,
       maxBuffer: 10 * 1024 * 1024,
     })
-    saveStatus({
-      projectId: p.id,
-      testState: 'pass',
-      testOutputTail: (stdout + stderr).slice(-TAIL_CHARS),
-    })
+    return { pass: true, tail: (stdout + stderr).slice(-TAIL_CHARS) }
   } catch (e: any) {
     const tail = (String(e?.stdout ?? '') + String(e?.stderr ?? '') || String(e)).slice(-TAIL_CHARS)
-    saveStatus({ projectId: p.id, testState: 'fail', testOutputTail: tail })
+    return { pass: false, tail }
   }
+}
+
+/** verify_cmd 실행 → pass/fail + 출력 꼬리 저장. 수동 트리거 전용(Phase 0). */
+export async function runVerify(p: Project): Promise<void> {
+  if (!p.verifyCmd) return
+  saveStatus({ projectId: p.id, testState: 'running' })
+  const { pass, tail } = await verifyInDir(p.verifyCmd, p.path)
+  saveStatus({ projectId: p.id, testState: pass ? 'pass' : 'fail', testOutputTail: tail })
 }

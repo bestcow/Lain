@@ -13,7 +13,7 @@ import {
   listConversationDialogue,
   getConversationWorldState,
 } from './store'
-import { tierQueryOptions } from './agentopts'
+import { judgeQueryOptions } from './agentopts'
 import { AGENT_CWD, CLAUDE_BIN, DATA_DIR } from './paths'
 
 // 진단 — 브리핑이 왜 비는지 침묵 실패를 파일에 남긴다(DATA_DIR/briefing-debug.log). 원인 확정 후 제거.
@@ -99,7 +99,7 @@ ${status.join('\n')}
         cwd: AGENT_CWD,
         allowedTools: [],
         maxTurns: 2,
-        ...tierQueryOptions(getSettings().judgeModel, getSettings()),
+        ...judgeQueryOptions(), // §9b 판정/요약류(local 라우팅 + D7 사용량 가드 강등)
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
       },

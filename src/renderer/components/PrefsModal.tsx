@@ -1,5 +1,5 @@
 // 환경설정 — 가운데 모달. 햄버거 메뉴에서 연다. (기존 CFG 드로어를 여기로 통합)
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type {
   LainSettings,
   McpServer,
@@ -12,6 +12,13 @@ import type {
   UpdateStatus,
 } from '../../shared/types'
 import { MODEL_IDS } from '../../shared/models'
+import { Icon } from './icons'
+import {
+  normalizeQuery,
+  matchingItems,
+  targetCategory,
+  type PrefsSearchItem,
+} from '../lib/prefsSearch'
 
 const TIERS: ModelTier[] = ['haiku', 'sonnet', 'opus', 'fable', 'local']
 
@@ -19,10 +26,91 @@ const TIERS: ModelTier[] = ['haiku', 'sonnet', 'opus', 'fable', 'local']
 const CATS: { id: string; label: string }[] = [
   { id: 'general', label: '일반' },
   { id: 'models', label: '모델' },
+  { id: 'planner', label: '플래너' },
   { id: 'automation', label: '자동화·고급' },
   { id: 'telegram', label: '텔레그램' },
   { id: 'voice', label: '음성·통화' },
   { id: 'extensions', label: '확장' },
+]
+
+// B11 — 검색 인덱스. key=설정명(=화면 .settings-key 텍스트와 정확히 일치해야 DOM 하이라이트가 걸린다),
+// label=검색 대상 설정명, hint=힌트/부가 검색어, cat=소속 카테고리. 검색 시 첫 매치 카테고리로 자동 전환하고
+// (targetCategory) 매치된 라벨 행을 하이라이트한다. 새 설정을 추가하면 여기에 한 줄 등록한다.
+const SEARCH_INDEX: PrefsSearchItem[] = [
+  // 일반
+  { key: '내 호칭', label: '내 호칭', hint: '레인이 너를 부르는 호칭 userTitle', cat: 'general' },
+  { key: '외부 표시명', label: '외부 표시명', hint: '디스코드 카톡 닉네임 별칭 userAliases', cat: 'general' },
+  { key: '워크스페이스 루트', label: '워크스페이스 루트', hint: '스캔 최상위 폴더 workspaceRoot C:\\workspace', cat: 'general' },
+  { key: '스캔 하위 폴더', label: '스캔 하위 폴더', hint: 'apps games tools scanDirs 스캔 대상', cat: 'general' },
+  { key: '주기 스캔(분)', label: '주기 스캔(분)', hint: '현황 자동 재수집 간격 scanInterval', cat: 'general' },
+  { key: '루틴 실행', label: '루틴 실행', hint: '등록한 루틴 디스패치 routinesEnabled', cat: 'general' },
+  { key: '트레이 상주', label: '트레이 상주', hint: '창 닫아도 트레이 closeToTray', cat: 'general' },
+  { key: '자동 시작', label: '자동 시작', hint: '로그인 시 기동 autoStart', cat: 'general' },
+  { key: '말수', label: '말수', hint: '상호작용 대사 감시 선제 발화 빈도 chattiness 묵언 수다쟁이 quips 말풍선', cat: 'general' },
+  { key: '업데이트', label: '업데이트', hint: '확인 다운로드 재시작 update', cat: 'general' },
+  { key: 'Lain 업데이트 제안', label: 'Lain 업데이트 제안', hint: 'updateNotify 새 버전 제안', cat: 'general' },
+  { key: '자동 다운로드', label: '자동 다운로드', hint: 'updateAutoDownload 백그라운드', cat: 'general' },
+  { key: '백업·이식', label: '백업·이식', hint: '데이터 폴더 열기 백업 내보내기 backup export PC 이사', cat: 'general' },
+  // 모델
+  { key: 'Navi 모델', label: 'Navi 모델', hint: 'TASK.md 본 작업 naviModel', cat: 'models' },
+  { key: 'Lain 모델', label: 'Lain 모델', hint: 'Lain 채팅 managerModel', cat: 'models' },
+  { key: '판정 모델', label: '판정 모델', hint: 'elicit ask_manager judgeModel', cat: 'models' },
+  { key: '로컬 모델 서버', label: '로컬 모델 서버', hint: 'llama-server localBaseUrl Qwen', cat: 'models' },
+  { key: 'Anthropic API 키', label: 'Anthropic API 키', hint: '구독 대신 키 인증 anthropicApiKey 과금 console', cat: 'models' },
+  // 자동화·고급
+  { key: '동시 작업 cap', label: '동시 작업 cap', hint: '동시에 working 작업 수 concurrency', cat: 'automation' },
+  { key: '프로젝트 병렬 cap', label: '프로젝트 병렬 cap', hint: '같은 프로젝트 동시 작업 병렬 projectParallelCap D14', cat: 'automation' },
+  { key: '작업 토큰 예산', label: '작업 토큰 예산', hint: '초과 시 일시정지 taskTokenBudget D7', cat: 'automation' },
+  { key: '전역 사용량 한도(토큰/1시간)', label: '전역 사용량 한도(토큰/1시간)', hint: '스폰 억제 티어 강등 usageWindowTokenLimit D7', cat: 'automation' },
+  { key: '자동 우선순위', label: '자동 우선순위', hint: '스캔 변화 우선순위 autoPriority', cat: 'automation' },
+  { key: 'TASK.md 자동 착수', label: 'TASK.md 자동 착수', hint: 'autonomous 자동 시작 autoStartTaskMd', cat: 'automation' },
+  { key: '병합 자동 rebase', label: '병합 자동 rebase', hint: 'merge ff 불가 시 rebase 폴백 autoRebaseOnMerge', cat: 'automation' },
+  { key: '학습 정비', label: '학습 정비', hint: 'curator 중복 학습 병합 lessonCurator', cat: 'automation' },
+  { key: '스킬 사용', label: '스킬 사용', hint: '클로드 스킬 노출 skillsEnabled', cat: 'automation' },
+  { key: '턴 자기개선 리뷰', label: '턴 자기개선 리뷰', hint: '학습 스킬 후보 추출 turnReview', cat: 'automation' },
+  { key: '검증 넛지', label: '검증 넛지', hint: '코드 수정 후 검증 상기 verifyNudge', cat: 'automation' },
+  { key: '빠른 대화', label: '빠른 대화', hint: '도구 없는 경량 응답 managerFastChat', cat: 'automation' },
+  { key: '클로드코드 연동', label: '클로드코드 연동', hint: 'CC 훅 양방향 ccHooks', cat: 'automation' },
+  { key: 'idle 임계(분)', label: 'idle 임계(분)', hint: '자동 끼어듦 게이트 idleMin', cat: 'automation' },
+  { key: '컨텍스트 압축(토큰)', label: '컨텍스트 압축(토큰)', hint: '무한세션 요약 compact', cat: 'automation' },
+  { key: 'Navi 핸드오프(토큰)', label: 'Navi 핸드오프(토큰)', hint: '유한세션 교체 handoff', cat: 'automation' },
+  { key: '무진전 자동종료(분)', label: '무진전 자동종료(분)', hint: 'watchdog 진전 없음 종료', cat: 'automation' },
+  { key: '승인 재알림(분)', label: '승인 재알림(분)', hint: '무응답 재알림 approvalTimeout', cat: 'automation' },
+  // 플래너
+  { key: '캘린더에 일정 표시', label: '캘린더에 일정 표시', hint: 'plannerShowEvents', cat: 'planner' },
+  { key: '체크리스트 표시', label: '체크리스트 표시', hint: 'plannerShowTodos 할일', cat: 'planner' },
+  { key: '루틴 표시', label: '루틴 표시', hint: 'plannerShowRoutines', cat: 'planner' },
+  { key: '작업 표시', label: '작업 표시', hint: 'plannerShowTasks Navi 마감', cat: 'planner' },
+  { key: '완료 항목 표시', label: '완료 항목 표시', hint: 'plannerShowDone', cat: 'planner' },
+  { key: '기본 뷰', label: '기본 뷰', hint: '월간 주간 일간 plannerDefaultView', cat: 'planner' },
+  { key: '주 시작', label: '주 시작', hint: '일요일 월요일 weekStart', cat: 'planner' },
+  { key: '사이드바 위치', label: '사이드바 위치', hint: '좌측 우측 sidebarSide', cat: 'planner' },
+  { key: '사이드바 폭', label: '사이드바 폭', hint: '픽셀 sidebarWidth', cat: 'planner' },
+  { key: '밀도', label: '밀도', hint: '넉넉 촘촘 density', cat: 'planner' },
+  { key: '리마인드 기본(분)', label: '리마인드 기본(분)', hint: '알림 시간 remind', cat: 'planner' },
+  { key: '방치 기준(일)', label: '방치 기준(일)', hint: '미완료 방치 staleDays', cat: 'planner' },
+  { key: '방치 넛지', label: '방치 넛지', hint: '자동 리마인드 nudge', cat: 'planner' },
+  { key: '브리핑에 포함', label: '브리핑에 포함', hint: '아침 브리핑 plannerInBriefing', cat: 'planner' },
+  { key: '체크리스트 대신 처리 제안', label: '체크리스트 대신 처리 제안', hint: 'offerHelp', cat: 'planner' },
+  { key: '텔레그램 리마인드', label: '텔레그램 리마인드', hint: '폰 알림 telegramRemind', cat: 'planner' },
+  // 텔레그램
+  { key: '텔레그램 사용', label: '텔레그램 사용', hint: 'telegramEnabled 폰', cat: 'telegram' },
+  { key: '봇 토큰', label: '봇 토큰', hint: 'BotFather telegramBotToken', cat: 'telegram' },
+  { key: '허용 채팅ID', label: '허용 채팅ID', hint: 'chatId 화이트리스트', cat: 'telegram' },
+  // Groq 키는 텔레그램·음성 두 카테고리에 같은 설정이 렌더된다(값은 한 곳 저장). 검색이 현재 카테고리를
+  // 존중하도록(안 튀도록) 양쪽 모두 인덱스에 등록한다.
+  { key: 'Groq API 키', label: 'Groq API 키', hint: 'Whisper STT 음성 인식 텔레그램 groqApiKey', cat: 'telegram' },
+  { key: 'Groq API 키', label: 'Groq API 키', hint: 'Whisper STT 음성 인식 마이크 PTT groqApiKey', cat: 'voice' },
+  // 음성·통화
+  { key: '디스코드 사용', label: '디스코드 사용', hint: 'discordEnabled 통화', cat: 'voice' },
+  { key: '청취 모드', label: '청취 모드', hint: '항상 웨이크워드 discordVoiceMode', cat: 'voice' },
+  { key: '엔진', label: '엔진', hint: 'TTS edge supertonic gpt-sovits 음성 출력', cat: 'voice' },
+  { key: '기본 톤', label: '기본 톤', hint: '무미건조 감정 voiceTone', cat: 'voice' },
+  { key: '말 속도', label: '말 속도', hint: 'supertonicSpeed', cat: 'voice' },
+  { key: '한국어 발음', label: '한국어 발음', hint: '음차 koreanizeTts', cat: 'voice' },
+  // 확장
+  { key: '외부 MCP 서버', label: '외부 MCP 서버', hint: 'chrome-devtools mcp 브라우저', cat: 'extensions' },
+  { key: '클로드 플러그인', label: '클로드 플러그인', hint: '스킬셋 마켓 plugin', cat: 'extensions' },
 ]
 
 // 업데이트 상태 → 사람이 읽을 한 줄 힌트(④ 설정 행).
@@ -201,10 +289,7 @@ function McpServersSection() {
 
   return (
     <>
-      <div
-        className="dim"
-        style={{ marginTop: 12, borderTop: '1px solid #1c3a2c', paddingTop: 8 }}
-      >
+      <div className="dim settings-section-divider">
         ── 외부 MCP 서버 (등록=나 · 사용=Lain·Navi)
       </div>
       {servers.length === 0 ? (
@@ -259,7 +344,7 @@ function McpServersSection() {
             if (r.error) setError(r.error)
           }}
         >
-          🌐 레인 브라우저 조작 (원클릭 등록)
+          <Icon name="globe" size={14} /> 레인 브라우저 조작 (원클릭 등록)
         </button>
         <button
           type="button"
@@ -275,7 +360,7 @@ function McpServersSection() {
             setError(null)
           }}
         >
-          🌐 Chrome DevTools (Navi 브라우저 검증)
+          <Icon name="globe" size={14} /> Chrome DevTools (Navi 브라우저 검증)
         </button>
       </div>
       <div className="settings-row" style={{ flexWrap: 'wrap', gap: 6 }}>
@@ -348,11 +433,7 @@ function McpServersSection() {
         <button className="tg-save" onClick={add} disabled={!name.trim()}>
           + MCP 서버 추가
         </button>
-        {error && (
-          <span className="dim" style={{ color: '#f88' }}>
-            {error}
-          </span>
-        )}
+        {error && <span className="err">{error}</span>}
         <span className="dim settings-hint">
           stdio(npx 류) 또는 http/sse url. 켠 서버만 해당 계층에 주입 · 🔑=시크릿 로컬 보관
         </span>
@@ -413,7 +494,7 @@ function PluginsSection({
 
   return (
     <>
-      <div className="dim" style={{ marginTop: 12, borderTop: '1px solid #1c3a2c', paddingTop: 8 }}>
+      <div className="dim settings-section-divider">
         ── 클로드 플러그인 (할당=lain이 쓸 스킬셋 · 설치/제거=마켓)
       </div>
       {installed.length === 0 ? (
@@ -470,11 +551,7 @@ function PluginsSection({
         <span className="dim settings-hint">
           할당은 '스킬 사용'이 켜져 있을 때만 적용 · 설치/제거는 클로드 CLI(전역 ~/.claude) · 다음 세션부터 반영
         </span>
-        {msg && (
-          <span className="dim" style={{ color: msg.includes('실패') ? '#f88' : '#8f8' }}>
-            {msg}
-          </span>
-        )}
+        {msg && <span className={msg.includes('실패') ? 'err' : 'ok'}>{msg}</span>}
       </div>
     </>
   )
@@ -485,7 +562,12 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
   const [tg, setTg] = useState<TelegramStatus | null>(null)
   const [dc, setDc] = useState<DiscordStatus | null>(null)
   const [upd, setUpd] = useState<UpdateStatus | null>(null)
+  // E6 — 유효 워크스페이스(env 오버라이드 여부 표시용). 설정 표시=실제 일치.
+  const [wsInfo, setWsInfo] = useState<{ root: string; envRootOverride: boolean; envScanOverride: boolean } | null>(null)
   const [cat, setCat] = useState('general') // 환경설정 카테고리(좌측 nav)
+  // B11 — 설정 검색어. 매치 시 첫 매치 카테고리로 자동 전환하고(targetCategory) 매치 라벨 행을 하이라이트.
+  const [query, setQuery] = useState('')
+  const bodyRef = useRef<HTMLDivElement>(null)
   const [ttsTesting, setTtsTesting] = useState(false)
   const [ttsTestMsg, setTtsTestMsg] = useState('')
   const runTtsTest = async () => {
@@ -537,11 +619,37 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
     }
   }
 
+  // E8 — 데이터 백업 내보내기
+  const [backupMsg, setBackupMsg] = useState('')
+  const runBackup = async () => {
+    setBackupMsg('백업 중…')
+    try {
+      const r = await window.lain.backupData()
+      if (r.canceled) {
+        setBackupMsg('')
+        return
+      }
+      if (!r.ok) {
+        setBackupMsg('실패: ' + (r.error || '알 수 없는 오류'))
+        return
+      }
+      const kb = Math.round((r.bytes || 0) / 1024)
+      setBackupMsg(
+        r.busy
+          ? `저장됨(${kb}KB) — 단, 다른 작업 중이라 일부 최신 변경이 빠졌을 수 있어. 잠시 후 다시 권장.`
+          : `백업 완료 — ${kb}KB`,
+      )
+    } catch (e) {
+      setBackupMsg('실패: ' + (e instanceof Error ? e.message : String(e)))
+    }
+  }
+
   const refreshTg = () => window.lain.telegramStatus().then(setTg)
   const refreshDc = () => window.lain.discordStatus().then(setDc)
 
   useEffect(() => {
     window.lain.getSettings().then(setSettings)
+    window.lain.workspaceInfo().then(setWsInfo)
     window.lain.getUpdateStatus().then(setUpd)
     const offUpd = window.lain.onUpdateStatus(setUpd)
     refreshTg()
@@ -575,13 +683,46 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
       setTimeout(refreshDc, 800)
   }
 
+  // B11 — 검색: 매치 라벨 집합 + 첫 매치 카테고리. matchingItems/targetCategory는 순수(vitest 검증).
+  const matchedLabels = useMemo(
+    () => new Set(matchingItems(SEARCH_INDEX, query).map((it) => it.label)),
+    [query],
+  )
+  // 검색어가 바뀌면 매치가 있는 카테고리로 자동 전환(현재 카테고리에 매치 있으면 유지 — 안 튐).
+  useEffect(() => {
+    if (!normalizeQuery(query)) return
+    const target = targetCategory(SEARCH_INDEX, query, cat)
+    if (target && target !== cat) setCat(target)
+    // cat을 deps에서 뺀다 — 넣으면 전환 직후 재실행돼 다른 카테고리로 연쇄 이동할 수 있다(첫 매치로 한 번만).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query])
+  // 렌더된 카테고리의 설정 행 중 매치되는 라벨에 하이라이트 클래스를 토글(라벨 텍스트로 DOM 매칭 — 개별 배선 불필요).
+  useEffect(() => {
+    const root = bodyRef.current
+    if (!root) return
+    const rows = root.querySelectorAll<HTMLElement>('.settings-row')
+    rows.forEach((row) => {
+      const keyText = row.querySelector('.settings-key')?.textContent?.trim() ?? ''
+      const hit = matchedLabels.size > 0 && matchedLabels.has(keyText)
+      row.classList.toggle('prefs-hit', hit)
+    })
+  }, [matchedLabels, cat, settings])
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-window" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <span className="modal-title">환경설정</span>
+          {/* B11 — 설정 검색 — 설정명·힌트 부분일치, 매치 카테고리로 자동 전환 + 매치 행 하이라이트 */}
+          <input
+            className="prefs-search"
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="설정 검색 — 예: groq · 압축 · 동시 작업"
+          />
           <button className="modal-close" onClick={onClose} aria-label="닫기">
-            ✕
+            <Icon name="x-circle" size={18} />
           </button>
         </div>
         <div className="modal-body">
@@ -600,20 +741,9 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                   </button>
                 ))}
               </nav>
-              <div className="settings-body prefs-content">
+              <div className="settings-body prefs-content" ref={bodyRef}>
                 {cat === 'models' && (
                   <>
-              <label className="settings-row">
-                <span className="settings-key">동시 작업 cap</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={settings.concurrencyCap}
-                  onChange={(e) => patch({ concurrencyCap: Number(e.target.value) || 1 })}
-                />
-                <span className="dim settings-hint">동시에 working 상태일 수 있는 작업 수 (§9-7)</span>
-              </label>
               <ModelSelect
                 label="Navi 모델"
                 hint="TASK.md 본 작업 (§9b)"
@@ -646,6 +776,21 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 }
                 onSave={(v) => patch({ localBaseUrl: v })}
               />
+              {/* E5 — 구독 로그인 대신 API 키로 인증(비었으면 구독 OAuth). non-local 티어 spawn env에 주입. 시크릿. */}
+              <TelegramField
+                label="Anthropic API 키"
+                secret
+                value={settings.anthropicApiKey}
+                placeholder="sk-ant-… (구독 로그인이 있으면 비워두세요)"
+                howto={
+                  <>
+                    Claude 구독 로그인 대신 API 키로 인증할 때만 입력. console.anthropic.com에서 발급.
+                    입력하면 Navi·Lain·판정 모두 이 키로 과금된다(local 티어 제외). 비우면 구독 로그인
+                    사용. 시크릿이라 로그·다이제스트에 남기지 않는다.
+                  </>
+                }
+                onSave={(v) => patch({ anthropicApiKey: v })}
+              />
                   </>
                 )}
                 {cat === 'general' && (
@@ -674,6 +819,48 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 onSave={(v) =>
                   patch({
                     userAliases: v
+                      .split(',')
+                      .map((t) => t.trim())
+                      .filter(Boolean),
+                  })
+                }
+              />
+              {/* E6 — 워크스페이스 자동 스캔 대상(env LAIN_WORKSPACE·LAIN_SCAN_DIRS가 있으면 그쪽 우선). */}
+              <TelegramField
+                label="워크스페이스 루트"
+                value={settings.workspaceRoot}
+                placeholder="C:\workspace (기본)"
+                howto={
+                  <>
+                    SCAN이 프로젝트를 찾는 최상위 폴더. 비우면 기본 <code>C:\workspace</code>.
+                    {wsInfo?.envRootOverride && (
+                      <>
+                        {' '}
+                        <b>환경변수 LAIN_WORKSPACE 적용 중</b>(설정보다 우선): <code>{wsInfo.root}</code>
+                      </>
+                    )}
+                  </>
+                }
+                onSave={(v) => patch({ workspaceRoot: v })}
+              />
+              <TelegramField
+                label="스캔 하위 폴더"
+                value={settings.scanDirs.join(', ')}
+                placeholder="apps, games, tools (기본)"
+                howto={
+                  <>
+                    루트 아래에서 스캔할 하위 폴더(쉼표 구분). 비우면 기본 apps·games·tools.
+                    {wsInfo?.envScanOverride && (
+                      <>
+                        {' '}
+                        <b>환경변수 LAIN_SCAN_DIRS 적용 중</b>(설정보다 우선).
+                      </>
+                    )}
+                  </>
+                }
+                onSave={(v) =>
+                  patch({
+                    scanDirs: v
                       .split(',')
                       .map((t) => t.trim())
                       .filter(Boolean),
@@ -719,6 +906,26 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                   onChange={(e) => patch({ autoStart: e.target.checked })}
                 />
                 <span className="dim settings-hint">로그인 시 트레이로 기동 (패키징 실행에서만 유효)</span>
+              </label>
+              {/* 말수 — 상호작용 대사(말풍선)+유저 감시 선제 발화 빈도. 감시 on/off(마스터)와 별개로 빈도만 조절. */}
+              <label className="settings-row">
+                <span className="settings-key">말수</span>
+                <span className="chattiness-ctl">
+                  <span className="dim">묵언</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={4}
+                    step={1}
+                    value={settings.chattiness ?? 2}
+                    onChange={(e) => patch({ chattiness: Number(e.target.value) })}
+                  />
+                  <span className="dim">수다쟁이</span>
+                </span>
+                <span className="dim settings-hint">
+                  UI 반응 대사·감시 중 먼저 말 걸기 빈도 — 묵언(왼끝)이면 말 걸었을 때만 대답. 감시
+                  끄기와 별개
+                </span>
               </label>
               {/* 유저 감시 토글은 메인 화면(레인 캐릭터 아래)으로 이동함 — 여기선 제거. */}
               {/* 자동 업데이트 — ④ 수동 확인/적용 + ② Lain 제안 + ③ 자동 다운로드 토글 */}
@@ -775,10 +982,253 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                   새 버전을 백그라운드로 미리 받아둠 — 설치(재시작)는 항상 수동 (③). 기본 꺼짐
                 </span>
               </label>
+              {/* E8 — 데이터 백업·이식. 설정·대화·교훈·플래너가 %APPDATA%\lain의 SQLite에 쌓인다. */}
+              <div className="settings-section-label">데이터</div>
+              <div className="settings-row">
+                <span className="settings-key">백업·이식</span>
+                <span className="upd-controls">
+                  <button type="button" className="upd-btn" onClick={() => void window.lain.openDataFolder()}>
+                    데이터 폴더 열기
+                  </button>
+                  <button type="button" className="upd-btn" onClick={() => void runBackup()}>
+                    백업 내보내기
+                  </button>
+                </span>
+                <span className="dim settings-hint">
+                  {backupMsg || '설정·대화·교훈·플래너를 하나의 파일로 내보낸다. PC 이사 시 이 파일을 데이터 폴더에 lain.sqlite로 되돌린다.'}
+                </span>
+              </div>
+                  </>
+                )}
+                {cat === 'planner' && (
+                  <>
+              {/* B11 — 좌측 nav에 이미 '플래너' 라벨이 있어 중복이던 '── 플래너' 구분 헤더 제거. */}
+              <div className="settings-section-label">표시</div>
+              <label className="settings-row">
+                <span className="settings-key">캘린더에 일정 표시</span>
+                <input
+                  type="checkbox"
+                  checked={settings.plannerShowEvents}
+                  onChange={(e) => patch({ plannerShowEvents: e.target.checked })}
+                />
+                <span className="dim settings-hint">일정(event) 항목을 캘린더에 표시</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">체크리스트 표시</span>
+                <input
+                  type="checkbox"
+                  checked={settings.plannerShowTodos}
+                  onChange={(e) => patch({ plannerShowTodos: e.target.checked })}
+                />
+                <span className="dim settings-hint">할일(todo) 항목을 캘린더에 표시</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">루틴 표시</span>
+                <input
+                  type="checkbox"
+                  checked={settings.plannerShowRoutines}
+                  onChange={(e) => patch({ plannerShowRoutines: e.target.checked })}
+                />
+                <span className="dim settings-hint">등록한 루틴을 캘린더에 표시</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">작업 표시</span>
+                <input
+                  type="checkbox"
+                  checked={settings.plannerShowTasks}
+                  onChange={(e) => patch({ plannerShowTasks: e.target.checked })}
+                />
+                <span className="dim settings-hint">Navi 작업 마감을 캘린더에 표시</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">완료 항목 표시</span>
+                <input
+                  type="checkbox"
+                  checked={settings.plannerShowDone}
+                  onChange={(e) => patch({ plannerShowDone: e.target.checked })}
+                />
+                <span className="dim settings-hint">완료된 일정/할일을 흐리게 표시</span>
+              </label>
+              <div className="settings-section-label">기본값·레이아웃</div>
+              <label className="settings-row">
+                <span className="settings-key">기본 뷰</span>
+                <select
+                  value={settings.plannerDefaultView}
+                  onChange={(e) => patch({ plannerDefaultView: e.target.value as 'month' | 'week' | 'day' })}
+                >
+                  <option value="month">월간</option>
+                  <option value="week">주간</option>
+                  <option value="day">일간</option>
+                </select>
+                <span className="dim settings-hint">플래너를 열면 처음 보이는 뷰</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">주 시작</span>
+                <select
+                  value={settings.plannerWeekStart}
+                  onChange={(e) => patch({ plannerWeekStart: Number(e.target.value) as 0 | 1 })}
+                >
+                  <option value="0">일요일</option>
+                  <option value="1">월요일</option>
+                </select>
+                <span className="dim settings-hint">캘린더 주간 뷰에서 첫 요일</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">사이드바 위치</span>
+                <select
+                  value={settings.plannerSidebarSide}
+                  onChange={(e) => patch({ plannerSidebarSide: e.target.value as 'left' | 'right' })}
+                >
+                  <option value="left">좌측</option>
+                  <option value="right">우측</option>
+                </select>
+                <span className="dim settings-hint">아이템 목록 사이드바 위치</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">사이드바 폭</span>
+                <input
+                  type="number"
+                  min={200}
+                  max={480}
+                  value={settings.plannerSidebarWidth}
+                  onChange={(e) => patch({ plannerSidebarWidth: Number(e.target.value) || 300 })}
+                />
+                <span className="dim settings-hint">픽셀 (200~480)</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">밀도</span>
+                <select
+                  value={settings.plannerDensity}
+                  onChange={(e) => patch({ plannerDensity: e.target.value as 'cozy' | 'compact' })}
+                >
+                  <option value="cozy">넉넉</option>
+                  <option value="compact">촘촘</option>
+                </select>
+                <span className="dim settings-hint">캘린더 일자별 항목 표시 밀도</span>
+              </label>
+              <div className="settings-section-label">알림·보조 기능</div>
+              <label className="settings-row">
+                <span className="settings-key">리마인드 기본(분)</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1440}
+                  value={settings.plannerRemindDefaultMin}
+                  onChange={(e) => {
+                    const raw = e.target.value
+                    const n = raw === '' ? 10 : Math.max(0, Number(raw))
+                    patch({ plannerRemindDefaultMin: Number.isNaN(n) ? 10 : n })
+                  }}
+                />
+                <span className="dim settings-hint">새 항목의 기본 알림 시간(분 전)</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">방치 기준(일)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={30}
+                  value={settings.plannerStaleDays}
+                  onChange={(e) => patch({ plannerStaleDays: Number(e.target.value) || 7 })}
+                />
+                <span className="dim settings-hint">항목이 미완료로 방치된 일수 — 넘으면 시각적 강조</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">방치 넛지</span>
+                <select
+                  value={settings.plannerNudge}
+                  onChange={(e) => patch({ plannerNudge: e.target.value as 'off' | 'daily' | 'weekly' })}
+                >
+                  <option value="off">끔</option>
+                  <option value="daily">매일</option>
+                  <option value="weekly">주 1회</option>
+                </select>
+                <span className="dim settings-hint">방치된 항목에 대한 자동 리마인드 빈도</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">브리핑에 포함</span>
+                <input
+                  type="checkbox"
+                  checked={settings.plannerInBriefing}
+                  onChange={(e) => patch({ plannerInBriefing: e.target.checked })}
+                />
+                <span className="dim settings-hint">아침 브리핑에 오늘 일정/할일 포함</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">체크리스트 대신 처리 제안</span>
+                <input
+                  type="checkbox"
+                  checked={settings.plannerOfferHelp}
+                  onChange={(e) => patch({ plannerOfferHelp: e.target.checked })}
+                />
+                <span className="dim settings-hint">방치된 할일에 대해 레인이 처리를 도울지 물어봄</span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">텔레그램 리마인드</span>
+                <input
+                  type="checkbox"
+                  checked={settings.plannerTelegramRemind}
+                  onChange={(e) => patch({ plannerTelegramRemind: e.target.checked })}
+                />
+                <span className="dim settings-hint">일정/할일 알림을 텔레그램 폰으로도 발송</span>
+              </label>
                   </>
                 )}
                 {cat === 'automation' && (
                   <>
+              {/* B11 — '동시 작업 cap'은 실행/자동화 성격이라 모델→자동화·고급으로 이동. */}
+              <label className="settings-row" data-skey="concurrencyCap">
+                <span className="settings-key">동시 작업 cap</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={settings.concurrencyCap}
+                  onChange={(e) => patch({ concurrencyCap: Number(e.target.value) || 1 })}
+                />
+                <span className="dim settings-hint">동시에 working 상태일 수 있는 작업 수 (§9-7)</span>
+              </label>
+              {/* D14 — 같은 프로젝트 병렬 opt-in. 1=현행(프로젝트당 1개), 충돌은 병합 시 rebase→verify가 판사. */}
+              <label className="settings-row">
+                <span className="settings-key">프로젝트 병렬 cap</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={4}
+                  value={settings.projectParallelCap}
+                  onChange={(e) => patch({ projectParallelCap: Number(e.target.value) || 1 })}
+                />
+                <span className="dim settings-hint">
+                  한 프로젝트에서 동시에 돌 수 있는 작업 수 — 1이면 기존처럼 순차. 같은 파일을 만질
+                  작업들은 병렬 대신 의존 체인 권장 (D14)
+                </span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">작업 토큰 예산</span>
+                <input
+                  type="number"
+                  min={0}
+                  step={100000}
+                  value={settings.taskTokenBudget}
+                  onChange={(e) => patch({ taskTokenBudget: Number(e.target.value) || 0 })}
+                />
+                <span className="dim settings-hint">
+                  작업 하나의 누적 토큰이 이 값을 넘으면 세션 경계에서 일시정지하고 보고 — 재개하면 이어감(작업트리·세션 보존). 0 = 제한 없음
+                </span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">전역 사용량 한도(토큰/1시간)</span>
+                <input
+                  type="number"
+                  min={0}
+                  step={500000}
+                  value={settings.usageWindowTokenLimit}
+                  onChange={(e) => patch({ usageWindowTokenLimit: Number(e.target.value) || 0 })}
+                />
+                <span className="dim settings-hint">
+                  최근 1시간 전체 누적 토큰이 이 값에 근접하면 신규 작업을 큐로 미루고 판정 모델을 저티어로 강등(크레딧 보호). 0 = 제한 없음
+                </span>
+              </label>
               <label className="settings-row">
                 <span className="settings-key">자동 우선순위</span>
                 <input
@@ -788,6 +1238,28 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 />
                 <span className="dim settings-hint">
                   스캔 변화 시 lain이 우선순위 보고 (판정 모델 호출)
+                </span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">TASK.md 자동 착수</span>
+                <input
+                  type="checkbox"
+                  checked={settings.autoStartTaskMd}
+                  onChange={(e) => patch({ autoStartTaskMd: e.target.checked })}
+                />
+                <span className="dim settings-hint">
+                  스캔이 새 TASK.md를 발견하면, autonomous 마커+verify_cmd가 있는 경우에 한해 자동 시작 (기본 off)
+                </span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">병합 자동 rebase</span>
+                <input
+                  type="checkbox"
+                  checked={settings.autoRebaseOnMerge}
+                  onChange={(e) => patch({ autoRebaseOnMerge: e.target.checked })}
+                />
+                <span className="dim settings-hint">
+                  결재(merge)가 ff 불가일 때 worktree 브랜치를 main에 자동 rebase→verify 재실행→ff 재시도. 충돌·verify실패면 브랜치만 남김(비파괴, 기본 on)
                 </span>
               </label>
               <label className="settings-row">
@@ -909,13 +1381,26 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                   Lain 응답이 이 시간 동안 진전 없으면 자동 종료 — 긴 작업(설치·빌드)을 고려해 넉넉히. ⚠ 단일 도구(npm install·빌드·풀 테스트) 한 번 실행이 이 시간을 넘으면 정상 작업도 종료되니 여유 있게. 0이면 끔
                 </span>
               </label>
+              <label className="settings-row">
+                <span className="settings-key">승인 재알림(분)</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1440}
+                  value={settings.approvalTimeoutMin}
+                  onChange={(e) => patch({ approvalTimeoutMin: Number(e.target.value) || 0 })}
+                />
+                <span className="dim settings-hint">
+                  무인 작업(백그라운드 Navi)의 승인·질문이 이 시간 무응답이면 재알림 1회(PC·텔레그램). ⚠ 거절이 아니다 — 이후에도 계속 대기하며 세션·작업트리는 보존되고, 응답하면 그 지점부터 이어진다. 0이면 재알림 없이 조용히 대기
+                </span>
+              </label>
 
                   </>
                 )}
                 {cat === 'telegram' && (
                   <>
               {/* §20.3 텔레그램 채널 — 자리 비웠을 때 폰으로 와이어드 지휘·결재 */}
-              <div className="dim" style={{ marginTop: 12, borderTop: '1px solid #1c3a2c', paddingTop: 8 }}>
+              <div className="dim settings-section-divider">
                 ── 텔레그램 (§20.3 폰에서 지휘·결재)
               </div>
               <label className="settings-row">
@@ -991,6 +1476,24 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 )}
                 {cat === 'voice' && (
                   <>
+              {/* B11 — PC 마이크 STT(입력창 PTT)와 텔레그램 음성 메시지 STT는 같은 Groq 키를 쓴다. 텔레그램
+                  카테고리에만 있어 음성 카테고리에서 못 찾던 문제 → 여기서도 동일 설정(groqApiKey)을 그대로
+                  렌더한다. 값은 한 곳에만 저장되고(이중 저장 아님), 어느 화면에서 바꿔도 즉시 서로 반영된다. */}
+              <div className="settings-section-label">음성 인식 (STT)</div>
+              <TelegramField
+                label="Groq API 키"
+                secret
+                value={settings.groqApiKey}
+                placeholder="gsk_..."
+                onSave={(v) => patch({ groqApiKey: v })}
+                howto={
+                  <>
+                    <b>console.groq.com/keys</b> → Create API Key. PC 마이크(입력창 🎙 PTT)·텔레그램 음성 메시지를{' '}
+                    Groq Whisper(무료)로 텍스트 변환 — 비우면 STT 비활성화. 텔레그램 카테고리와 <b>같은 키</b>라 한쪽에서
+                    바꾸면 양쪽에 반영된다. 시크릿이라 로그에 안 남는다.
+                  </>
+                }
+              />
               {/* §20.3 디스코드 음성 통화 — 폰/데스크 음성채널로 레인과 실시간 통화 */}
               <div className="settings-section-label">디스코드 음성 통화</div>
               <label className="settings-row">
@@ -1147,6 +1650,20 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                     </select>
                     <span className="dim settings-hint">참조 클립의 언어. 출력은 항상 한국어</span>
                   </label>
+                  <label className="settings-row">
+                    <span className="settings-key">말 속도</span>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={2.0}
+                      step={0.05}
+                      value={settings.gptSovitsSpeed ?? 1.15}
+                      onChange={(e) => patch({ gptSovitsSpeed: Number(e.target.value) })}
+                    />
+                    <span className="dim settings-hint">
+                      {(settings.gptSovitsSpeed ?? 1.15).toFixed(2)}x — 높을수록 빠름 (기본 1.15)
+                    </span>
+                  </label>
                 </>
               )}
               {settings.ttsBackend === 'supertonic' && (
@@ -1250,7 +1767,13 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                     <span className="settings-key">테스트</span>
                     <span className="upd-controls">
                       <button type="button" className="upd-btn" disabled={ttsTesting} onClick={runTtsTest}>
-                        {ttsTesting ? '생성 중…' : '▶ 테스트 재생'}
+                        {ttsTesting ? (
+                          '생성 중…'
+                        ) : (
+                          <>
+                            <Icon name="play" size={14} /> 테스트 재생
+                          </>
+                        )}
                       </button>
                     </span>
                     <span className="dim settings-hint">

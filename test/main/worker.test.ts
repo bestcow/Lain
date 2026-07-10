@@ -1,8 +1,30 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { sumUsageTokens, classifyDivergence, RISKY } from '../../src/main/worker'
+
+// store — waitApproval의 만료-거절 경로(resolveApprovalRow)만 스파이로 덮는다. 나머지 export는 실제 유지
+// (mcp.ts 등이 listMcpServers 실제 구현을 요구). 테스트가 쓰는 건 resolveApprovalRow뿐이고, hold 경로는
+// 이 함수를 아예 안 부르므로 실제 DB를 건드리지 않는다.
+const { resolveApprovalRow } = vi.hoisted(() => ({ resolveApprovalRow: vi.fn() }))
+vi.mock('../../src/main/store', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/main/store')>()
+  return { ...actual, resolveApprovalRow }
+})
+
+import {
+  sumUsageTokens,
+  sessionBaselineFor,
+  lifetimeTokensFor,
+  classifyDivergence,
+  RISKY,
+  approvalTimeoutMs,
+  waitApproval,
+  resolveApproval,
+  isAwaitingApproval,
+  abortNavi,
+} from '../../src/main/worker'
+import { budgetExceeded } from '../../src/main/usage'
 
 describe('sumUsageTokens — usage 4필드 합산', () => {
   it('input+output+cache_creation+cache_read 합산', () => {
@@ -27,6 +49,54 @@ describe('sumUsageTokens — usage 4필드 합산', () => {
   })
   it('빈 usage → 0', () => {
     expect(sumUsageTokens({ usage: {} })).toBe(0)
+  })
+})
+
+// I4 — 라이프타임 토큰 누적: 다중 세션이 예산을 넘기면 발동, 동일 세션 resume은 중복계수 안 함(순수 코어).
+describe('sessionBaselineFor / lifetimeTokensFor — I4 다중 세션 누적(순수)', () => {
+  it('sessionBaselineFor — resume이면 저장된 baseline, 아니면 tokensTotal을 승격', () => {
+    // resume(동일 세션 이어가기): 이 세션 이전 세션들 누계(sessionBaseTokens)를 유지.
+    expect(sessionBaselineFor(true, 300, 500)).toBe(300)
+    // 새 세션(신규/핸드오프 스왑): 이전 tokensTotal(=이전 세션 최종 누계)을 baseline으로 승격.
+    expect(sessionBaselineFor(false, 300, 500)).toBe(500)
+    // 신규 작업(tokensTotal=0) → baseline 0.
+    expect(sessionBaselineFor(false, 0, 0)).toBe(0)
+  })
+
+  it('lifetimeTokensFor — baseline + 세션 cumulative', () => {
+    expect(lifetimeTokensFor(0, 400)).toBe(400)
+    expect(lifetimeTokensFor(500, 400)).toBe(900)
+  })
+
+  it('동일 세션 resume은 중복 계수하지 않는다(교체)', () => {
+    // 세션1이 재개(resume)로 두 번 result를 보고: baseline은 고정(0), 세션 cumulative만 커진다.
+    const base = sessionBaselineFor(false, 0, 0) // 세션1 시작(신규) → baseline 0
+    const total1 = lifetimeTokensFor(base, 400) // 세션1 첫 result: cumulative 400 → total 400
+    // 같은 세션 resume(verify재시도 등): baseline은 저장된 sessionBaseTokens(=0) 유지.
+    const baseResume = sessionBaselineFor(true, base, total1) // resume → baseline 그대로 0
+    const total2 = lifetimeTokensFor(baseResume, 650) // 세션 cumulative가 650으로 성장 → total 650(400+650 아님)
+    expect(total2).toBe(650) // 400+650=1050이 아니라 650 — 세션 cumulative를 '교체'
+  })
+
+  it('다중 세션(핸드오프 스왑) 누적이 예산을 넘기면 trip', () => {
+    const budget = 1000
+    // 세션1: 신규, cumulative 700 → total 700 (예산 미달)
+    const base1 = sessionBaselineFor(false, 0, 0)
+    const total1 = lifetimeTokensFor(base1, 700)
+    expect(budgetExceeded(total1, budget)).toBe(false)
+    // 핸드오프 스왑 → 세션2 시작(새 세션): baseline은 이전 tokensTotal(700)로 승격.
+    const base2 = sessionBaselineFor(false, base1, total1) // = 700
+    // 세션2 cumulative 500 → total 700+500 = 1200 (예산 초과)
+    const total2 = lifetimeTokensFor(base2, 500)
+    expect(total2).toBe(1200)
+    expect(budgetExceeded(total2, budget)).toBe(true) // 다중 세션 누적으로 예산 발동(덮어쓰기였다면 500이라 미발동)
+  })
+
+  it('덮어쓰기(구 동작)였다면 다중 세션에서 예산이 안 걸렸을 것 — 회귀 방지 대조', () => {
+    const budget = 1000
+    // 구 동작: task.tokens = 세션 cumulative만(덮어쓰기). 세션2 cumulative 500 < 1000 → 미발동.
+    expect(budgetExceeded(500, budget)).toBe(false)
+    // 신규 동작: total 1200 → 발동(위 테스트). 대조로 회귀를 막는다.
   })
 })
 
@@ -131,5 +201,126 @@ describe('classifyDivergence — §21.5 자율/escalate 경계', () => {
   it('dep_change: devDependencies 선언도 인정', () => {
     fs.writeFileSync(path.join(wt, 'package.json'), JSON.stringify({ devDependencies: { vitest: '^1' } }))
     expect(classifyDivergence('dep_change', 'npm install vitest', wt).autonomous).toBe(true)
+  })
+})
+
+describe('approvalTimeoutMs — D4 분→ms(순수)', () => {
+  it('분을 ms로', () => {
+    expect(approvalTimeoutMs(30)).toBe(30 * 60_000)
+    expect(approvalTimeoutMs(1)).toBe(60_000)
+  })
+  it('0이면 0(재알림/데드라인 없음 = 무한 대기)', () => {
+    expect(approvalTimeoutMs(0)).toBe(0)
+  })
+  it('음수/소수는 보정(0 하한·내림)', () => {
+    expect(approvalTimeoutMs(-5)).toBe(0)
+    expect(approvalTimeoutMs(1.9)).toBe(60_000)
+  })
+})
+
+describe('waitApproval — D4 만료 동작(fake timer)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    resolveApprovalRow.mockClear()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('기존(포그라운드) 경로: 만료 시 자동 거절(rejected)', async () => {
+    const p = waitApproval(1) // hold 없음 → 30분 후 거절
+    vi.advanceTimersByTime(30 * 60_000)
+    const res = await p
+    expect(res.approved).toBe(false)
+    expect(resolveApprovalRow).toHaveBeenCalledWith(1, 'rejected')
+  })
+
+  it('hold(무인 작업): 만료해도 거절하지 않고 재알림 1회만 — 계속 대기', async () => {
+    const onRemind = vi.fn()
+    let settled = false
+    const p = waitApproval(2, { hold: true, timeoutMs: 30 * 60_000, onRemind }).then((v) => {
+      settled = true
+      return v
+    })
+    // 재알림 시점 통과 — 재알림은 1회 오지만 Promise는 미해결(거절 안 함).
+    vi.advanceTimersByTime(30 * 60_000)
+    await Promise.resolve()
+    expect(onRemind).toHaveBeenCalledTimes(1)
+    expect(resolveApprovalRow).not.toHaveBeenCalled()
+    expect(settled).toBe(false)
+    // 한참 더 지나도 추가 재알림·거절 없음(반복 알림 금지).
+    vi.advanceTimersByTime(3 * 60 * 60_000)
+    await Promise.resolve()
+    expect(onRemind).toHaveBeenCalledTimes(1)
+    expect(settled).toBe(false)
+    // 사용자가 응답하면 그제서야 그 지점부터 이어진다.
+    resolveApproval(2, true, 'ok')
+    const res = await p
+    expect(res.approved).toBe(true)
+    expect(res.answer).toBe('ok')
+    // hold 경로는 만료 시 resolveApprovalRow(rejected)를 부르지 않는다 —
+    // resolveApproval(응답)이 approved로 기록할 뿐(거절 경로 오염 없음).
+  })
+
+  it('hold + timeoutMs=0: 재알림 타이머조차 없음(무한 대기)', async () => {
+    const onRemind = vi.fn()
+    const p = waitApproval(3, { hold: true, timeoutMs: 0, onRemind })
+    vi.advanceTimersByTime(24 * 60 * 60_000)
+    await Promise.resolve()
+    expect(onRemind).not.toHaveBeenCalled()
+    resolveApproval(3, false)
+    const res = await p
+    expect(res.approved).toBe(false)
+  })
+})
+
+// C1 — hold 대기 진입 시 task를 awaiting-approval로 표시하고, 모든 종료 경로에서 clear한다(누수 방지).
+// 누수되면 held 작업이 슬롯·유휴 게이트를 영구 점유해 야간 무인 정지가 재발한다(안전 최우선).
+describe('isAwaitingApproval — C1 hold 대기 추적 set/clear', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    resolveApprovalRow.mockClear()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('hold+taskId 진입 시 표시, 정상 응답(승인)으로 clear', async () => {
+    const p = waitApproval(101, { hold: true, timeoutMs: 0, taskId: 'c1-approve' })
+    expect(isAwaitingApproval('c1-approve')).toBe(true)
+    resolveApproval(101, true, 'ok')
+    await p
+    expect(isAwaitingApproval('c1-approve')).toBe(false)
+  })
+
+  it('거절 응답으로도 clear된다', async () => {
+    const p = waitApproval(102, { hold: true, timeoutMs: 0, taskId: 'c1-reject' })
+    expect(isAwaitingApproval('c1-reject')).toBe(true)
+    resolveApproval(102, false)
+    await p
+    expect(isAwaitingApproval('c1-reject')).toBe(false)
+  })
+
+  it('abort(인터럽트/취소)로도 clear된다 — Promise 미해결이라도 누수 없음', () => {
+    void waitApproval(103, { hold: true, timeoutMs: 0, taskId: 'c1-abort' })
+    expect(isAwaitingApproval('c1-abort')).toBe(true)
+    abortNavi('c1-abort') // 등록된 AbortController가 없어도 set은 확실히 delete
+    expect(isAwaitingApproval('c1-abort')).toBe(false)
+  })
+
+  it('재알림(onRemind) 경과 후에도 대기 중이면 여전히 표시(무한 대기)', async () => {
+    const onRemind = vi.fn()
+    void waitApproval(104, { hold: true, timeoutMs: 60_000, taskId: 'c1-hold', onRemind })
+    vi.advanceTimersByTime(60_000)
+    await Promise.resolve()
+    expect(onRemind).toHaveBeenCalledTimes(1)
+    expect(isAwaitingApproval('c1-hold')).toBe(true) // 재알림은 clear가 아님
+    resolveApproval(104, true)
+  })
+
+  it('hold=false(포그라운드) 경로는 추적하지 않는다 — 슬롯 점유 개념이 무인 작업 전용', () => {
+    void waitApproval(105, { taskId: 'c1-foreground' }) // hold 없음
+    expect(isAwaitingApproval('c1-foreground')).toBe(false)
+    resolveApproval(105, false)
   })
 })

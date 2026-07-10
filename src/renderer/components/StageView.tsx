@@ -19,11 +19,15 @@ export function naviStatus(
         return { cls: 'st-working', label: '작업 중', prio: 3, kind: 'busy' }
       case 'clarifying':
         return { cls: 'st-working', label: '명확화', prio: 3, kind: 'busy' }
+      case 'queued':
+        // D1 — 슬롯 대기(아직 미착수). busy 아닌 대기 상태라 낮은 주목도로 둔다.
+        return { cls: 'st-idle', label: '대기', prio: 6, kind: 'idle' }
     }
   }
   const s = p.status
   if (!s) return { cls: 'st-idle', label: '미수집', prio: 7, kind: 'idle' }
   if (s.testState === 'fail') return { cls: 'st-error', label: '검증 실패', prio: 2, kind: 'attn' }
+  if (s.testState === 'running') return { cls: 'st-working', label: '검증 중', prio: 4, kind: 'busy' }
   if (s.dirtyFiles > 0) return { cls: 'st-dirty', label: '미커밋', prio: 5, kind: 'idle' }
   if (s.testState === 'pass') return { cls: 'st-done', label: '통과', prio: 6, kind: 'idle' }
   return { cls: 'st-idle', label: '대기', prio: 7, kind: 'idle' }

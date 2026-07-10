@@ -27,8 +27,13 @@ export function getOverlayWindow(): BrowserWindow | null {
   return overlayWin
 }
 
+// 커서가 있는 디스플레이 기준 — 보조 모니터에서 작업 중이면 그쪽에 뜬다(주모니터 고정 방지, B8).
+function cursorDisplay() {
+  return screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+}
+
 function bottomRight(width: number, height: number): { x: number; y: number } {
-  const { workArea } = screen.getPrimaryDisplay()
+  const { workArea } = cursorDisplay()
   return {
     x: workArea.x + workArea.width - width - MARGIN,
     y: workArea.y + workArea.height - height - MARGIN,
@@ -107,7 +112,9 @@ export function resizeOverlay(height: number): void {
   const win = overlayWin
   if (!win || win.isDestroyed()) return
   try {
-    const { workArea } = screen.getPrimaryDisplay()
+    // showOverlay가 잡은 커서 모니터를 리사이즈에서도 유지 — primary 고정이면 표시 후 첫 리사이즈에
+    // 창이 다시 주모니터로 튀는 회귀가 생긴다.
+    const { workArea } = cursorDisplay()
     const h = Math.max(40, Math.min(Math.floor(height) || OVERLAY_H, workArea.height - 2 * MARGIN))
     const x = workArea.x + workArea.width - OVERLAY_W - MARGIN
     const y = workArea.y + workArea.height - h - MARGIN

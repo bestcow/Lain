@@ -146,6 +146,20 @@ export function diffStat(project: Project, taskId: string): string {
   }
 }
 
+/** D6 체크포인트 — 브랜치 base(merge-base) 이후 커밋 수. diffStat과 동일 base 로직. 실패 시 0. */
+export function commitCount(project: Project, taskId: string): number {
+  const wtPath = path.join(WT_ROOT, taskId)
+  try {
+    const mainHead = git(project.path, 'rev-parse', 'HEAD')
+    const base = git(wtPath, 'merge-base', 'HEAD', mainHead)
+    const out = git(wtPath, 'rev-list', '--count', `${base}..HEAD`)
+    const n = Number(out.trim())
+    return Number.isFinite(n) ? n : 0
+  } catch {
+    return 0
+  }
+}
+
 /** 전체 diff 본문(merge-base..HEAD + 미커밋 추적변경). diffStat과 동일 base 로직, --stat 대신 patch.
  * 출력이 거대할 수 있어 상한(200KB)에서 절단 — 초과 시 말미에 잘림 표기. 실패 시 ''. */
 export function diffBody(project: Project, taskId: string): string {
@@ -181,22 +195,114 @@ export function changedFiles(project: Project, taskId: string): string[] {
   }
 }
 
+/** D8 — 병합/rebase 대상 = 메인 체크아웃이 현재 가리키는 브랜치 tip.
+ * createWorktree가 HEAD에서 분기하고 tryMerge가 project.path의 현재 브랜치로 ff하므로,
+ * rebase 대상도 동일하게 project.path의 HEAD여야 한다('main' 하드코딩 금지 — 프로젝트마다 다름).
+ * 실패 시 null(git 아님·detached 등) → 호출부가 rebase를 건너뛴다. */
+export function mergeTargetRef(project: Project): string | null {
+  try {
+    return git(project.path, 'rev-parse', 'HEAD')
+  } catch {
+    return null
+  }
+}
+
+/** D8 — 되돌릴 병합 범위. base=병합 직전 main tip(exclusive), head=병합 후 main tip(inclusive). */
+export interface MergeSha {
+  baseSha: string
+  headSha: string
+}
+
 /** 병합 시도: 메인 체크아웃이 clean하고 ff 가능할 때만 (PLAN.md §17 merge-back 보수적 버전)
  * untracked는 무시(-uno) — TASK.md 자체가 untracked로 프로젝트 루트에 있어서
  * 포함하면 모든 병합이 dirty 판정에 막힌다. ff 병합은 untracked와 충돌하지 않음
- * (Navi 브랜치는 HEAD에서 분기해 같은 untracked 파일을 갖지 않는다). */
-export function tryMerge(project: Project, taskId: string): { merged: boolean; reason: string } {
+ * (Navi 브랜치는 HEAD에서 분기해 같은 untracked 파일을 갖지 않는다).
+ * D8 — ff 성공 시 되돌릴 범위(baseSha=병합 직전 tip, mergedSha=병합 후 tip)를 함께 반환. */
+export function tryMerge(
+  project: Project,
+  taskId: string,
+): { merged: boolean; reason: string; baseSha?: string; mergedSha?: string } {
   const porcelain = git(project.path, 'status', '--porcelain', '--untracked-files=no')
   if (porcelain) {
     return { merged: false, reason: '메인 작업트리가 dirty — 브랜치만 남김. 직접 머지해라.' }
   }
+  // 병합 직전 main tip 포착 — ff 병합엔 머지커밋이 없어 되돌릴 범위(base..head)의 하한이 된다.
+  let baseSha: string | undefined
+  try {
+    baseSha = git(project.path, 'rev-parse', 'HEAD')
+  } catch {
+    baseSha = undefined
+  }
   try {
     git(project.path, 'merge', '--ff-only', branchName(taskId))
-    return { merged: true, reason: 'fast-forward 병합 완료' }
+    let mergedSha: string | undefined
+    try {
+      mergedSha = git(project.path, 'rev-parse', 'HEAD')
+    } catch {
+      mergedSha = undefined
+    }
+    return { merged: true, reason: 'fast-forward 병합 완료', baseSha, mergedSha }
   } catch {
     return {
       merged: false,
       reason: 'fast-forward 불가(분기 이후 메인에 새 커밋) — 브랜치만 남김. 직접 머지해라.',
     }
+  }
+}
+
+/** D8 — rebase 폴백: worktree 브랜치를 main tip 위로 rebase(비파괴 — worktree 브랜치 한정).
+ * 충돌 시 `git rebase --abort`로 worktree를 원복하고 실패 반환. **절대 메인·강제 병합/reset 금지.**
+ * 성공하면 worktree 브랜치가 main tip을 조상으로 갖게 돼 이후 ff 병합이 가능해진다.
+ * 반환 ok=true면 호출부가 verify 재실행 후 tryMerge를 다시 시도한다. */
+export function rebaseWorktreeOntoMain(
+  project: Project,
+  taskId: string,
+): { ok: boolean; reason: string } {
+  const wtPath = path.join(WT_ROOT, taskId)
+  const target = mergeTargetRef(project)
+  if (!target) return { ok: false, reason: 'rebase 대상(main tip) 확인 실패' }
+  try {
+    // rebase 전 worktree가 clean해야 안전 — 미커밋 변경이 있으면 rebase가 거부되거나 유실 위험.
+    // Navi는 커밋 후 review로 오므로 보통 clean이지만, 방어적으로 확인 후 진행.
+    git(wtPath, 'rebase', target)
+    return { ok: true, reason: 'rebase 완료(worktree 브랜치를 main tip 위로 재배치)' }
+  } catch {
+    // 충돌·기타 실패 → worktree 원복(rebase 진행 상태 폐기). abort 자체가 실패해도 삼켜서
+    // 상위가 keep-branch로 무해하게 폴백하게 한다(메인은 애초에 건드리지 않았다).
+    try {
+      git(wtPath, 'rebase', '--abort')
+    } catch {
+      /* rebase 진행 중이 아니었거나 이미 정리됨 — 무시 */
+    }
+    return { ok: false, reason: 'rebase 충돌 — 브랜치만 남김. 직접 머지해라.' }
+  }
+}
+
+/** D8 — 병합 되돌리기(비파괴): base..head 범위의 각 커밋을 개별 revert(새 revert 커밋 생성).
+ * ff 병합엔 머지커밋이 없으므로 `-m`(mainline) revert가 아니라 **범위 revert**를 쓴다.
+ * 메인이 dirty거나 충돌하면 `git revert --abort`로 원복하고 실패 반환. 강제·reset 금지.
+ * git이 자체적으로 --no-edit + --reverse(오래된 커밋부터)로 안전하게 순차 revert 커밋을 만든다. */
+export function revertMergeRange(
+  project: Project,
+  baseSha: string,
+  headSha: string,
+): { ok: boolean; reason: string } {
+  const porcelain = git(project.path, 'status', '--porcelain', '--untracked-files=no')
+  if (porcelain) {
+    return { ok: false, reason: '메인 작업트리가 dirty — 되돌리기 전 정리 필요. 수동 되돌리기 요망.' }
+  }
+  try {
+    // <base>..<head> = base 이후 head까지의 커밋들. --no-edit(자동 메시지) + --reverse가 없으면
+    // git revert는 최신→오래된 순으로 되돌린다. 범위 revert는 순서를 git이 알아서 처리한다.
+    git(project.path, 'revert', '--no-edit', `${baseSha}..${headSha}`)
+    return { ok: true, reason: '병합 되돌리기 완료(범위 revert — 새 revert 커밋 생성)' }
+  } catch {
+    // 충돌·기타 실패 → revert 진행 상태 폐기(원복). abort 실패는 삼킨다(진행 중이 아닐 수 있음).
+    try {
+      git(project.path, 'revert', '--abort')
+    } catch {
+      /* revert 진행 중이 아니었음 — 무시 */
+    }
+    return { ok: false, reason: 'revert 충돌 — 수동 되돌리기 필요. 강제하지 않음.' }
   }
 }

@@ -1,5 +1,5 @@
 // 앱 진입 (PLAN.md §14) — BrowserWindow 생성, 스토어/IPC 초기화
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, dialog, screen } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -20,6 +20,7 @@ import {
   getSetting,
   setSetting,
 } from './store'
+import { resolveWindowBounds, DEFAULT_WINDOW_BOUNDS } from './window-bounds'
 import { registerIpc } from './ipc'
 import { notifyUser } from './notify'
 import { scanProjects, addProject } from './registry'
@@ -27,7 +28,7 @@ import { collectStatus } from './collectors'
 import { sendToManager, reactToObservation } from './manager'
 import { setObserveHandler, stopWatcher } from './watcher'
 import { sendToNavi } from './navichat'
-import { startTask, answerClarify, recoverTasks, cancelTask } from './orchestrator'
+import { startTask, answerClarify, recoverTasks, recoverGroups, cancelTask } from './orchestrator'
 import { gcWorktrees } from './worktree'
 import { setupTray, isQuitting } from './tray'
 import {
@@ -38,6 +39,8 @@ import {
 } from './overlay-window'
 import { rearmScheduler, runScanOnce, briefNow } from './scheduler'
 import { applyCcHooks } from './cchooks'
+import { cleanupCheckpoints } from './rewind'
+import { startPlannerTick } from './planner'
 import { startTelegram, stopTelegram } from './telegram'
 import { startDiscord, stopDiscord } from './discord'
 import { DATA_DIR } from './paths'
@@ -68,12 +71,27 @@ app.disableHardwareAcceleration()
 
 let mainWin: BrowserWindow | null = null
 
+// B8 — 저장된 창 bounds 복원. 화면 밖(모니터 해제 등)이면 기본값으로 보정(window-bounds.ts 순수 로직).
+function loadWindowBounds(): { x?: number; y?: number; width: number; height: number } {
+  try {
+    const raw = getSetting('window_bounds')
+    const parsed = raw ? (JSON.parse(raw) as { x: number; y: number; width: number; height: number }) : null
+    // getDisplayMatching은 rect와 가장 많이 겹치는 디스플레이를 찾는다 — 저장 bounds 자체로 조회해야
+    // '그 창이 마지막에 있던 모니터'가 지금도 있는지 확인하는 의미가 있다(해제됐으면 자연히 primary로 대체됨).
+    const display = parsed ? screen.getDisplayMatching(parsed) : null
+    const resolved = resolveWindowBounds(raw, display)
+    return resolved ?? { ...DEFAULT_WINDOW_BOUNDS }
+  } catch {
+    return { ...DEFAULT_WINDOW_BOUNDS }
+  }
+}
+
 function createWindow(): void {
   // 자동 시작(--hidden)이면 트레이로만 기동 (§12.5b)
   const startHidden = process.argv.includes('--hidden')
+  const bounds = loadWindowBounds()
   const win = new BrowserWindow({
-    width: 1280,
-    height: 840,
+    ...bounds,
     minWidth: 900,
     minHeight: 600,
     title: 'Lain',
@@ -89,6 +107,19 @@ function createWindow(): void {
     },
   })
   mainWin = win
+  // B8 — 창 위치/크기 변경 시 저장(resize/move가 연속 발생하므로 500ms 디바운스). 재시작·deploy·업데이트에도 유지.
+  let boundsSaveTimer: NodeJS.Timeout | null = null
+  const saveBounds = () => {
+    if (boundsSaveTimer) clearTimeout(boundsSaveTimer)
+    boundsSaveTimer = setTimeout(() => {
+      // 최대화/전체화면 중엔 getBounds()가 전체화면 rect를 줘 '정상 복원 크기'로 오저장된다 → 건너뛰고
+      // 직전 일반 bounds를 유지(다음 실행은 일반 크기로 복원). 최소화도 스킵.
+      if (win.isDestroyed() || win.isMinimized() || win.isMaximized() || win.isFullScreen()) return
+      setSetting('window_bounds', JSON.stringify(win.getBounds()))
+    }, 500)
+  }
+  win.on('resize', saveBounds)
+  win.on('move', saveBounds)
   // PC 네이티브 음성(마이크) — 이 창은 번들된 로컬 콘텐츠만 로드하는 신뢰 앱이라 권한 요청을 허용한다.
   // (기본 Electron은 media 권한을 거부 → getUserMedia 실패. 마이크 캡처를 켜려면 이 핸들러가 필요.)
   win.webContents.session.setPermissionRequestHandler((_wc, _permission, callback) => callback(true))
@@ -110,6 +141,15 @@ function createWindow(): void {
   // Phase 3 트레이 상주: 닫기 = 숨김 (설정 closeToTray, 종료는 트레이 메뉴/before-quit)
   // getSettings()가 손상 DB에서 throw해도 close 핸들러가 깨져 '종료 불능'이 되지 않게 가드(기본=트레이 상주).
   win.on('close', (e) => {
+    // B8 — 디바운스 타이머가 미처 못 돈 채 닫히는 경우 대비, 마지막 bounds를 즉시 확정 저장.
+    try {
+      if (boundsSaveTimer) clearTimeout(boundsSaveTimer)
+      // 최대화/전체화면 rect를 정상 복원 크기로 저장하지 않는다(위 saveBounds와 동일 이유).
+      if (!win.isMinimized() && !win.isMaximized() && !win.isFullScreen())
+        setSetting('window_bounds', JSON.stringify(win.getBounds()))
+    } catch {
+      /* 손상 DB 등 — 저장 실패해도 종료/숨김 흐름은 계속 */
+    }
     let closeToTray = true
     try {
       closeToTray = getSettings().closeToTray
@@ -201,6 +241,23 @@ app.whenReady().then(async () => {
   if (!hasInstanceLock) return
   // 미실행 상태에서 deploy가 --quit로 호출한 경우(우리가 primary): 띄울 것 없이 즉시 종료.
   if (process.argv.includes('--quit')) return void app.quit()
+
+  // E9 — Windows 전용 앱을 소스로 macOS/Linux에서 실행하면 watcher(PowerShell)·deploy.ps1 등이
+  // 불명확한 에러로 실패한다. 부팅 최초에 명시 경고하고 계속/종료를 사용자가 고르게 한다.
+  if (process.platform !== 'win32') {
+    const response = dialog.showMessageBoxSync({
+      type: 'warning',
+      title: 'Lain',
+      message: 'Lain은 현재 Windows 전용입니다',
+      detail:
+        '화면 감시·배포 등 일부 기능이 동작하지 않습니다. 계속 진행하면 예기치 못한 오류가 발생할 수 있습니다.',
+      buttons: ['계속', '종료'],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    if (response === 1) return void app.quit()
+  }
+
   // 부팅 단계 격리 — 한 단계가 throw해도 나머지(특히 텔레그램 원격 lifeline·트레이·스케줄러)를 막지 않는다.
   // 손상 DB 부팅(quick_check 실패→REINDEX 후 잔여 손상)에서 getSettings 등이 터져 텔레그램까지 못 가
   // '반쪽 초기화'로 응답 불능이 되던 회귀를 차단(2026-06-22 사고). 실패 단계는 recovery.log에 남긴다.
@@ -265,6 +322,10 @@ app.whenReady().then(async () => {
   bootStep('updater', () => initUpdater())
   // 클로드코드 연동(개선 #2) — 켜져 있으면 훅 설치 + inbox 감시 시작(꺼졌으면 잔여 훅 제거). 격리.
   bootStep('ccHooks', () => applyCcHooks())
+  // D15 되감기 — 편집 체크포인트 보존 정리(14일/200MB 초과·고아 디렉터리). 격리.
+  bootStep('rewindCleanup', () => cleanupCheckpoints())
+  // 플래너 리마인드 1분 틱(§21b) — 스캔(10분 단위)과 독립된 자체 타이머.
+  bootStep('planner', () => startPlannerTick())
   // 시작 시 레인 브리핑 1회 생성(프로덕션엔 startup 스캔이 없어 주기 스캔 전까지 브리핑이 비던 것 교정).
   // 약간 지연 — 렌더러가 onBriefingUpdated 리스너를 등록한 뒤 push가 닿도록(생성 결과는 setting에도 영속).
   setTimeout(() => void briefNow(), 2500)
@@ -287,10 +348,12 @@ app.whenReady().then(async () => {
   try {
     const orphans = clearOrphanApprovals()
     const recovered = recoverTasks()
-    if (recovered > 0) {
+    // 재리뷰 #2 — 그룹 일괄 병합 도중 크래시(반쪽 병합) 감지·통지. 자동 병합/롤백은 안 한다(사람 결정).
+    const groupStuck = recoverGroups()
+    if (recovered > 0 || groupStuck > 0) {
       fs.appendFileSync(
         path.join(DATA_DIR, 'recovery.log'),
-        `${new Date().toISOString()} recovered=${recovered} orphan_approvals=${orphans}\n`,
+        `${new Date().toISOString()} recovered=${recovered} orphan_approvals=${orphans} group_merge_interrupted=${groupStuck}\n`,
       )
     }
   } catch (e) {

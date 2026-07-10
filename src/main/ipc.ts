@@ -9,20 +9,27 @@ import {
   getProject,
   listMessages,
   listTasks,
+  dailyTaskUsage,
+  listRecentActivity,
   updateTask,
   listApprovals,
   listTaskEvents,
   getSetting,
   getSettings,
   saveSettings,
+  backupDatabase,
   listNaviMessages,
   listConversationPreviews,
   listConversations,
   createConversation,
   listConversationMessages,
+  searchChatHistory,
+  messagesAround,
+  getConversation,
   ensureActiveConversation,
   setActiveConversation,
   deleteConversation,
+  conversationMessageCount,
   renameConversation,
   setChapter,
   listLessons,
@@ -33,6 +40,7 @@ import {
   pinLesson,
   insertLesson,
   revertConsolidationBatch,
+  lessonsAbsorbedInto,
   listRoutines,
   insertRoutine,
   setRoutineEnabled,
@@ -42,7 +50,23 @@ import {
   updateMcpServer,
   setMcpServerEnabled,
   deleteMcpServer,
+  listPlanItems,
+  upsertPlanItem,
+  archivePlanItem,
+  setPlanItemDone,
+  listPlanTags,
+  upsertPlanTag,
+  deletePlanTag,
+  listPlanSections,
+  upsertPlanSection,
+  deletePlanSection,
+  listBenchRuns,
+  lastChatActivityAt,
+  getTaskGroup,
+  tasksForGroup,
 } from './store'
+import { emitQuip, bindQuipSinks } from './quips'
+import { turnEditSummary, revertTurn } from './rewind'
 import { listPlugins, installPlugin, uninstallPlugin } from './plugins'
 import {
   getUpdateStatus,
@@ -55,17 +79,23 @@ import {
 import { sendToNavi, sendToAllNavis, stopNaviChat } from './navichat'
 import { diffBody } from './worktree'
 import { setInboxOpen } from './notify'
-import { scanProjects, addProject } from './registry'
+import { scanProjects, addProject, workspaceRoot, workspaceInfo } from './registry'
 import { collectStatus, runVerify } from './collectors'
+import { walkProjectFiles, MAX_FILES } from './filewalk'
 import {
   sendToManager,
   stopManager,
   resetManager,
+  compactManagerNow,
   bindManager,
   bindManagerRenderer,
   bindSettingsBroadcast,
   answerUserQuestion,
+  listPendingQuestions,
+  pushManagerNotice,
+  emitManagerCard,
 } from './manager'
+import { encodeEditDiffLine } from '../shared/editdiff'
 import { buildLearnPrompt } from './learnprompt'
 import { applyCcHooks, refreshCcLinkIfEnabled } from './cchooks'
 import { syncOverlayMode, openMainWindow, resizeOverlay, setOverlayVisible } from './overlay-window'
@@ -75,8 +105,11 @@ import {
   startTask,
   answerClarify,
   resolveReview,
+  resolveGroup,
+  revertMerge,
   cancelTask,
   resumeTask,
+  rerunTask,
 } from './orchestrator'
 import { resolveApproval } from './worker'
 import { bindScheduler, rearmScheduler } from './scheduler'
@@ -122,6 +155,11 @@ async function refresh(id: string | null): Promise<void> {
 export function registerIpc(): void {
   // 자동 업데이트 상태를 렌더러로 흘려보낼 broadcaster 주입(엔진은 index.ts initUpdater에서 시작)
   setUpdateBroadcaster((s) => broadcast('update:status', s))
+  // 상호작용 대사(quips) 싱크 주입 — 말풍선 broadcast + 매니저 인지 버퍼('하나의 레인', 순환 import 회피 bind 패턴)
+  bindQuipSinks(
+    (payload) => broadcast('quip:show', payload),
+    (text) => pushManagerNotice(text),
+  )
   // 창 제어 (frameless) — sender의 BrowserWindow에 위임
   ipcMain.handle('window:minimize', (e) => {
     BrowserWindow.fromWebContents(e.sender)?.minimize()
@@ -149,20 +187,25 @@ export function registerIpc(): void {
 
   ipcMain.handle('projects:scan', async () => {
     const added = scanProjects()
+    if (added > 0) emitQuip('project_add', { count: added })
     await refresh(null)
     return added
   })
 
+  // E6 — 유효 워크스페이스 정보(env 오버라이드 반영). 빈상태 문구·SCAN 제목·기본경로 동적 표시용.
+  ipcMain.handle('workspace:info', () => workspaceInfo())
+
   ipcMain.handle('projects:addDialog', async () => {
     const result = await dialog.showOpenDialog({
       title: '프로젝트 폴더 추가',
-      defaultPath: 'C:\\workspace',
+      defaultPath: workspaceRoot(), // E6 — 하드코딩 'C:\workspace' 대신 유효 루트
       properties: ['openDirectory'],
     })
     if (result.canceled || result.filePaths.length === 0) return null
     const project = addProject(result.filePaths[0])
     unhideProject(project.id) // 명시적 추가 → 제거 해제(전에 제거했던 폴더면 보존된 기록과 함께 복귀)
     setProjectMuted(project.id, false) // 명시적 추가 → '숨김'도 해제(다시 보이게 하려는 의도)
+    emitQuip('project_add')
     await refresh(project.id)
     return listProjects().find((p) => p.id === project.id) ?? null
   })
@@ -176,6 +219,7 @@ export function registerIpc(): void {
   // '제거' = 보드에서 숨김(데이터 보존). 하드 삭제 아님 — 같은 폴더 재추가 시 대화·교훈·작업 복원.
   ipcMain.handle('projects:remove', (_e, id: string) => {
     hideProject(id)
+    emitQuip('project_remove')
     pushProjects()
   })
 
@@ -210,6 +254,23 @@ export function registerIpc(): void {
     pushProjects()
   })
 
+  // A12 — @파일 자동완성 파일 목록. projectId 지정 시 그 프로젝트만(Navi 드릴, 상대경로 그대로),
+  // 미지정 시 등록된 모든(enabled) 프로젝트를 훑어 'projectId/상대경로'로 접두(레인 채팅 범위).
+  // 렌더러가 @ 진입 시 1회만 호출하고 이후 fuzzy 필터는 렌더러 쪽에서 처리(매 키 재-glob 금지).
+  ipcMain.handle('files:list', (_e, projectId?: string) => {
+    if (projectId) {
+      const p = getProject(projectId)
+      return p ? walkProjectFiles(p.path) : []
+    }
+    const projects = listProjects().filter((p) => p.enabled)
+    const out: string[] = []
+    for (const p of projects) {
+      if (out.length >= MAX_FILES) break
+      for (const rel of walkProjectFiles(p.path, MAX_FILES - out.length)) out.push(`${p.id}/${rel}`)
+    }
+    return out
+  })
+
   ipcMain.handle('chat:history', () => listMessages('manager'))
   ipcMain.handle('chat:previews', () => listConversationPreviews())
 
@@ -218,6 +279,17 @@ export function registerIpc(): void {
     // 여기서 다시 broadcast하면 이중 표시되므로 emit은 비워둔다.
     // /learn (학습루프 T2) — 채팅엔 '/learn …' 원문이 남고, 모델에겐 스킬 저작 지시문(modelText)이 간다.
     const learn = /^\/learn(\s|$)/.test(text) ? buildLearnPrompt(text.slice(6).trim()) : undefined
+    // quips — 심야 활동·오랜만 복귀. 사용자 활동의 결정론 진입점(메시지 추가 전 = lastChatActivityAt가
+    // 아직 '직전' 활동)이라 여기서 감지한다. 발화는 말풍선+매니저 버퍼라 바로 이어지는 이 턴이 맥락을 안다.
+    try {
+      const last = lastChatActivityAt() // UTC 'YYYY-MM-DD HH:MM:SS'
+      const lastMs = last ? Date.parse(last.replace(' ', 'T') + 'Z') : Number.NaN
+      if (Number.isFinite(lastMs) && Date.now() - lastMs >= 3 * 86_400_000)
+        emitQuip('long_absence', { days: Math.floor((Date.now() - lastMs) / 86_400_000) })
+      else if (new Date().getHours() < 4) emitQuip('late_night') // 00~04시(로컬) — 쿨다운 20h ≒ 1일 1회
+    } catch {
+      /* 플레이버 — 실패 무해 */
+    }
     await sendToManager(text, () => {}, false, attachments ?? [], 0, conversationId, 'pc', undefined, 0, learn)
   })
 
@@ -228,12 +300,20 @@ export function registerIpc(): void {
   // Lain 세션 새로고침 — 무한세션이라 'Navi 새 대화'가 없어, 옛 스레드로 헛도는 Lain을 리셋하는 전용 수단.
   ipcMain.handle('chat:reset', () => {
     resetManager()
+    emitQuip('manager_reset')
   })
+
+  // A5 — /compact 수동 압축: 임계 도달 전에도 사용자가 직접 요청. 자동 압축과 동일 로직(performCompact) 재사용.
+  ipcMain.handle('chat:compact', (_e, conversationId?: string) => compactManagerNow(conversationId))
 
   // ── Phase 1: tasks / approvals ──
   bindOrchestrator(
     (ev) => {
       broadcast('task:event', ev)
+      // A4 — TodoWrite 진행 체크리스트: worker.ts가 task.todos 스냅샷을 갱신했지만 state는 안 바뀌므로
+      // (working 유지) 기존 setState 경로의 tasks:updated가 안 나간다. NaviTile 진행률(n/m)이 실시간
+      // 갱신되게 todo 이벤트에 한해 여기서 직접 브로드캐스트(추가 IPC 없이 기존 tasks:updated 재사용).
+      if (ev.kind === 'todo') broadcast('tasks:updated', listTasks())
       broadcast('approvals:updated', listApprovals()) // 승인 생성/해소가 이벤트에 실려옴
       telegramReconcile() // §20.3 새 승인/질문/결재를 폰으로 즉시 푸시
       refreshTray()
@@ -280,6 +360,8 @@ export function registerIpc(): void {
       broadcast('approvals:updated', listApprovals())
       telegramReconcile()
     },
+    // 레인 도구(플래너 CRUD)發 변경을 렌더러에 브로드캐스트 — CRUD IPC 핸들러와 동일 채널.
+    refreshPlanner: () => broadcast('planner:updated', null),
   })
 
   // 텔레그램·PC·스케줄러 등 모든 출처의 Lain 대화 이벤트를 렌더러로 미러(conversationId 태깅).
@@ -313,6 +395,10 @@ export function registerIpc(): void {
   ipcMain.handle('app:startedAt', () => APP_STARTED_AT)
 
   ipcMain.handle('tasks:list', () => listTasks())
+  // C4 — 토큰 사용량 일별 집계용 원시 행(로컬 날짜 버킷팅은 렌더러). 창은 표시일수(14)보다 하루 넓게(15).
+  ipcMain.handle('usage:daily', (_e, windowDays?: number) => dailyTaskUsage(windowDays ?? 15))
+  // C6 — 전역 활동 피드 원시 행(task_events 의미있는 kind + cc_events). 시간 역순 병합은 렌더러.
+  ipcMain.handle('activity:recent', (_e, limit?: number) => listRecentActivity(limit ?? 20))
   ipcMain.handle('tasks:start', (_e, projectId: string) => startTask(projectId))
   ipcMain.handle('tasks:answer', (_e, taskId: string, answers: string) =>
     // 사용자 직접 답변(드로어 입력) → 사용자發 sender만 넘긴다. 태그는 answerClarify가 모델에 닿는
@@ -322,6 +408,12 @@ export function registerIpc(): void {
   ipcMain.handle('tasks:resolveReview', (_e, taskId: string, action: any) =>
     resolveReview(taskId, action),
   )
+  // D8 — 병합 되돌리기(비파괴 revert). 성공 시 task 갱신 브로드캐스트.
+  ipcMain.handle('tasks:revertMerge', async (_e, taskId: string) => {
+    const res = await revertMerge(taskId)
+    broadcast('tasks:updated', listTasks())
+    return res
+  })
   ipcMain.handle('tasks:cancel', (_e, taskId: string) => cancelTask(taskId))
   ipcMain.handle('tasks:resume', (_e, taskId: string) => resumeTask(taskId)) // B3 error 상태 수동 재개
   // P2 권한모드 — 작업별 도구 실행 권한 강도 변경. 진행 중 쿼리엔 즉시 반영 안 되고 다음 재개부터 적용.
@@ -356,6 +448,20 @@ export function registerIpc(): void {
   ipcMain.handle('tasks:setFastMode', (_e, taskId: string, on: boolean) => {
     updateTask(taskId, { fastMode: on })
     broadcast('tasks:updated', listTasks())
+  })
+  // D10 — 작업별 모델 고정('' = 전역 naviModel). 다음 실행/재개부터 적용.
+  ipcMain.handle(
+    'tasks:setModel',
+    (_e, taskId: string, model: import('../shared/types').ModelTier | '') => {
+      updateTask(taskId, { modelOverride: model })
+      broadcast('tasks:updated', listTasks())
+    },
+  )
+  // D11 — done/cancelled 작업을 같은 명세로 재실행(원본 보존, 새 task 생성).
+  ipcMain.handle('tasks:rerun', async (_e, taskId: string) => {
+    const r = await rerunTask(taskId)
+    broadcast('tasks:updated', listTasks())
+    return r
   })
   ipcMain.handle('tasks:events', (_e, taskId: string) => listTaskEvents(taskId))
 
@@ -393,14 +499,30 @@ export function registerIpc(): void {
     setActiveConversation(target, id)
     return id
   })
-  ipcMain.handle('conversations:messages', (_e, conversationId: string) =>
-    listConversationMessages(conversationId),
+  // A15 — beforeId(옵션)로 위로 스크롤 페이징: 그 id보다 오래된 메시지 limit개를 더 가져온다.
+  ipcMain.handle(
+    'conversations:messages',
+    (_e, conversationId: string, limit?: number, beforeId?: number) =>
+      listConversationMessages(conversationId, limit ?? 200, beforeId),
+  )
+  // A15 — Ctrl+F '전체 기간' 토글용 DB 전문검색(레인 대화, scope='manager') — store.searchChatHistory 그대로 노출.
+  ipcMain.handle('chat:searchHistory', (_e, query: string, limit?: number) =>
+    searchChatHistory(query, limit ?? 20),
+  )
+  // A15 — 전체기간 검색 히트 클릭 시 그 메시지가 속한 대화의 주변 구간을 시간순으로 로드(점프용).
+  ipcMain.handle('chat:messagesAround', (_e, messageId: number, before?: number, after?: number) =>
+    messagesAround(messageId, before ?? 30, after ?? 30),
   )
   ipcMain.handle('conversations:getActive', (_e, target: string) => ensureActiveConversation(target))
   ipcMain.handle('conversations:setActive', (_e, target: string, conversationId: string) =>
     setActiveConversation(target, conversationId),
   )
-  ipcMain.handle('conversations:delete', (_e, id: string) => deleteConversation(id))
+  ipcMain.handle('conversations:delete', (_e, id: string) => {
+    deleteConversation(id)
+    emitQuip('conv_delete')
+  })
+  // B9 — 삭제 확인창 정확도: 워터마크·limit 무관 전건 메시지 수(deleteConversation이 지우는 실제 개수).
+  ipcMain.handle('conversations:messageCount', (_e, id: string) => conversationMessageCount(id))
   ipcMain.handle('conversations:rename', (_e, id: string, title: string) =>
     renameConversation(id, title),
   )
@@ -410,10 +532,67 @@ export function registerIpc(): void {
   // 클립보드는 메인에서 처리(샌드박스 렌더러/preload는 clipboard 모듈 미노출)
   ipcMain.on('clipboard:write', (_e, text: string) => clipboard.writeText(text))
 
+  // A16 — 대화 전체를 markdown(.md)으로 저장. listConversationMessages 기본 limit(200)은 화면 표시용
+  // 절단이라 여기선 Number.MAX_SAFE_INTEGER로 넘겨 전체 이력을 가져온다.
+  ipcMain.handle('conversations:exportMarkdown', async (_e, conversationId: string) => {
+    const conv = getConversation(conversationId)
+    const messages = listConversationMessages(conversationId, Number.MAX_SAFE_INTEGER)
+    const { messagesToMarkdown } = await import('../shared/exportMarkdown')
+    const md = messagesToMarkdown(messages, conv?.title || undefined)
+    const safeName = (conv?.title || '대화').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60)
+    const result = await dialog.showSaveDialog({
+      title: '대화 내보내기',
+      defaultPath: `${safeName}.md`,
+      filters: [{ name: 'Markdown', extensions: ['md'] }],
+    })
+    if (result.canceled || !result.filePath) return { ok: false }
+    const fs = await import('node:fs')
+    try {
+      fs.writeFileSync(result.filePath, md, 'utf8')
+    } catch (e) {
+      // 디스크 풀·권한 등 저장 실패 — 렌더러가 사용자에게 알릴 수 있게 사유 반환(무피드백 방지)
+      return { ok: false, error: (e as Error).message }
+    }
+    return { ok: true, filePath: result.filePath }
+  })
+
+  // 채팅 텍스트 링크화(A3) — URL/경로 클릭은 반드시 main 경유(렌더러는 shell 직접 접근 불가).
+  // http/https만 허용(스킴 화이트리스트) — file:/javascript: 등은 렌더러가 애초에 링크화 안 하지만
+  // 방어적으로 여기서도 재검증한다(다른 호출 경로가 생겨도 안전).
+  ipcMain.handle('shell:openExternal', async (_e, url: string) => {
+    if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'scheme-not-allowed' }
+    await shell.openExternal(url)
+    return { ok: true }
+  })
+  // 파일 경로 열기 — 폴더에서 선택 상태로 보여준다(openPath로 바로 실행하면 실행파일 오클릭 위험,
+  // 소스/문서 열람 목적엔 showItemInFolder가 더 안전 — 탐색기만 열고 실행은 사용자 재확인 후).
+  // 상대경로는 렌더러가 cwd를 모르므로, 절대경로가 아니면 등록 프로젝트 루트들을 순회해 첫 존재 매치를 찾는다.
+  ipcMain.handle('shell:revealPath', async (_e, rawPath: string) => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const resolved = path.isAbsolute(rawPath)
+      ? rawPath
+      : (() => {
+          for (const p of listProjects()) {
+            const candidate = path.resolve(p.path, rawPath)
+            // 프로젝트 루트 밖으로 새어나가는 상대경로(../..)는 거부 — 임의 파일 탐색기 노출 방지
+            const rel = path.relative(p.path, candidate)
+            if (rel.startsWith('..') || path.isAbsolute(rel)) continue
+            if (fs.existsSync(candidate)) return candidate
+          }
+          return null
+        })()
+    if (!resolved || !fs.existsSync(resolved)) return { ok: false, error: 'not-found' }
+    shell.showItemInFolder(resolved)
+    return { ok: true }
+  })
+
   // 인박스 열림/닫힘 통지 — notify가 "자리 비움"·알림 재진입 억제 판단에 사용(단방향)
   ipcMain.on('ui:inbox-state', (_e, open: boolean) => setInboxOpen(open))
 
   ipcMain.handle('lessons:list', () => listLessons())
+  // C7 — 병합 통합본(umbrella)에 흡수된 원본 교훈 목록(absorbed_into 역참조). 상세창 계보 표시용.
+  ipcMain.handle('lessons:absorbedInto', (_e, umbrellaId: number) => lessonsAbsorbedInto(umbrellaId))
 
   // §24 교훈 수명주기 — 변경 후 lessons:updated push로 모든 패널 동기화.
   ipcMain.handle('lesson:flag', (_e, id: number) => {
@@ -527,8 +706,15 @@ export function registerIpc(): void {
     })
   })
 
+  // C10 — 영속된 벤치 이력 조회(run_id별 집계). 시간순(오래된 런 먼저).
+  ipcMain.handle('bench:list', async () => {
+    const { aggregate } = await import('./bench')
+    return listBenchRuns().map((run) => aggregate(run.runId, run.results, run.startedAt))
+  })
+
   ipcMain.handle('settings:get', () => getSettings())
   ipcMain.handle('settings:set', (_e, patch: Partial<LainSettings>) => {
+    const prev = getSettings() // quips — '실제로 값이 바뀐' 변경만 반응하기 위한 이전 값 캡처
     const s = saveSettings(patch)
     // Phase 3 부수효과: 스캔 타이머 재장전 + 로그인 자동 시작(트레이로) 반영
     if (patch.scanIntervalMin !== undefined) rearmScheduler()
@@ -556,6 +742,15 @@ export function registerIpc(): void {
     if (patch.overlayMonitoringEnabled !== undefined) syncOverlayMode()
     // 자동 다운로드 토글 변경을 업데이트 엔진에 반영
     if (patch.updateAutoDownload !== undefined) applyUpdaterSettings()
+    // 상호작용 대사(quips) — 설정 '전이'에만 반응(같은 값 재저장·슬라이더 중간 통과 노이즈는 전이 비교로 걸러짐)
+    if (prev.overlayMonitoringEnabled !== s.overlayMonitoringEnabled)
+      emitQuip(s.overlayMonitoringEnabled ? 'monitor_on' : 'monitor_off')
+    if (s.gptSovitsSpeed >= 1.9 && prev.gptSovitsSpeed < 1.9) emitQuip('tts_speed_max')
+    if (prev.naviModel !== s.naviModel || prev.managerModel !== s.managerModel)
+      emitQuip('model_change')
+    // 묵언 진입은 0에서 판정하면 자기모순으로 영영 침묵 — 직전 값으로 '마지막 한마디' 특례(§7)
+    if (s.chattiness === 0 && prev.chattiness > 0) emitQuip('chattiness_min', {}, prev.chattiness)
+    if (s.chattiness === 4 && prev.chattiness < 4) emitQuip('chattiness_max')
     broadcast('settings:updated', s) // 다른 창·컴포넌트가 최신 설정을 라이브로 반영(userTitle 라벨 등)
     return s
   })
@@ -607,11 +802,12 @@ export function registerIpc(): void {
   })
   // PC 네이티브 음성 — 임의 텍스트를 현재 설정 엔진으로 합성 → data URI(mime 포함).
   // 예전엔 Supertonic 고정이라 ttsBackend=gpt-sovits로 바꿔도 PC 창 음성이 안 바뀌었음 → 디스패처로 통일.
+  // fallback: true면 설정한 로컬 엔진이 실패해 edge로 대체됐다는 뜻(B7-2) — 렌더러가 통보.
   ipcMain.handle('tts:speak', async (_e, text: string) => {
-    if (!text || !text.trim()) return ''
+    if (!text || !text.trim()) return { uri: '' }
     const tts = await import('./tts')
-    const { audio, mime } = await tts.synthesizeBackend(text, getSettings())
-    return `data:${mime};base64,${audio.toString('base64')}`
+    const { audio, mime, fallback } = await tts.synthesizeBackend(text, getSettings())
+    return { uri: `data:${mime};base64,${audio.toString('base64')}`, fallback }
   })
 
   // 개인 보이스(로컬) 가져오기 — '찾아보기'로 파일 선택 → %APPDATA%\lain\voices\ 로 복사.
@@ -670,9 +866,180 @@ export function registerIpc(): void {
     return dir
   })
 
+  // E8 — 데이터 폴더 열기(설정·대화·교훈·플래너가 쌓이는 %APPDATA%\lain). 사용자가 직접 확인·백업.
+  ipcMain.handle('data:openFolder', async () => {
+    const { DATA_DIR } = await import('./paths')
+    await shell.openPath(DATA_DIR)
+    return DATA_DIR
+  })
+
+  // E8 — 백업 내보내기. 사용자가 고른 경로로 lain.sqlite(WAL 병합 후)를 복사. 외부 의존 없음.
+  ipcMain.handle('data:backup', async () => {
+    const stamp = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[:T-]/g, '') // YYYYMMDDHHMMSS
+    const result = await dialog.showSaveDialog({
+      title: '데이터 백업 내보내기',
+      defaultPath: `lain-backup-${stamp}.sqlite`,
+      filters: [{ name: 'SQLite DB', extensions: ['sqlite'] }],
+    })
+    if (result.canceled || !result.filePath) return { canceled: true }
+    const r = backupDatabase(result.filePath)
+    if (r.ok) emitQuip('backup_export')
+    return r
+  })
+
+  // D15 되감기 — 레인 직접 편집의 턴 체크포인트 요약(확인창 목록)/복원(편집 diff 카드 '이 턴 편집 되돌리기')
+  ipcMain.handle('edits:turnCheckpoints', (_e, turnId: string) => turnEditSummary(turnId))
+  ipcMain.handle('edits:revertTurn', (_e, turnId: string) => {
+    const r = revertTurn(turnId)
+    // 재리뷰 #4 — '복원의 복원' 진입점 노출: 복원 직전 스냅샷 그룹(r<ts>)을 카드로 채팅에 남긴다.
+    // 이 카드의 '이 턴 편집 되돌리기'가 곧 un-revert — 없으면 revertTurnId가 UI 어디에도 실리지 않아
+    // 확인창이 약속한 "복원 직전 상태도 되돌릴 수 있다"가 성립하지 않았다.
+    if (r.ok && r.revertTurnId && r.files.length) {
+      emitManagerCard(
+        encodeEditDiffLine({
+          tool: 'Write',
+          filePath: `${r.files.length}개 파일`,
+          label: `↩ 복원 직전 상태 (${r.files.length}개 파일) — 되돌리기 취소용`,
+          lines: r.files.map((f) => ({ kind: 'ctx' as const, text: f })),
+          truncated: false,
+          turnId: r.revertTurnId,
+        }),
+        r.conversationId || undefined,
+      )
+    }
+    return r
+  })
+
+  // D13 크로스레포 그룹 — 결재 패널용 정보 + 일괄 결재.
+  ipcMain.handle('groups:info', (_e, groupId: string) => {
+    const g = getTaskGroup(groupId)
+    if (!g) return null
+    const children = tasksForGroup(groupId).map((t) => ({
+      taskId: t.id,
+      projectId: t.projectId,
+      title: t.title,
+      state: t.state,
+      verifyResult: t.verifyResult,
+    }))
+    return { id: g.id, title: g.title, children }
+  })
+  ipcMain.handle('groups:resolve', async (_e, groupId: string, action: 'merge' | 'keep-branch' | 'discard') => {
+    const res = await resolveGroup(groupId, action)
+    broadcast('tasks:updated', listTasks())
+    pushProjects()
+    return res
+  })
+
   ipcMain.handle('telegram:status', () => telegramStatus())
 
   ipcMain.handle('discord:status', () => discordStatus())
+
+  // 온보딩(첫 실행 위저드) — 결정론 검사만: 번들 claude 바이너리 존재 + 로그인 자격증명
+  // (구독 OAuth ~/.claude/.credentials.json 또는 ANTHROPIC_API_KEY). LLM 호출 없음.
+  ipcMain.handle('onboarding:status', async () => {
+    const fs = await import('node:fs')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const { CLAUDE_BIN } = await import('./paths')
+    return {
+      claudeBin: fs.existsSync(CLAUDE_BIN),
+      loggedIn:
+        fs.existsSync(path.join(os.homedir(), '.claude', '.credentials.json')) ||
+        Boolean(process.env.ANTHROPIC_API_KEY) ||
+        // E5 — 앱에 저장한 API 키도 정식 인증 수단(spawn env로 주입됨). 시스템 env가 아니어도 인정.
+        Boolean(getSettings().anthropicApiKey.trim()),
+      // E10 진단용 — 미발견 시 어떤 경로를 봤는지 표기 + dev/패키징 분기 안내에 사용.
+      claudeBinPath: CLAUDE_BIN,
+      isPackaged: app.isPackaged,
+    }
+  })
+
+  // E2 — 온보딩 '로그인 터미널 열기'. 번들 CLAUDE_BIN으로 가시 콘솔에 `claude auth login`(구독 OAuth)을
+  // 직접 띄운다 — claude CLI가 PATH에 없는 설치본 사용자도 그 자리에서 로그인→'다시 확인'까지 완주.
+  // 결정론(프로세스 스폰만, LLM 없음). Windows: 경로 공백까지 안전하게 런처 .cmd를 DATA_DIR(정리된
+  // 경로)에 쓰고 `start "" "<bat>"`로 새 콘솔을 연다(spawn+cmd 이중파싱 따옴표 함정 회피, 실측 검증).
+  ipcMain.handle('onboarding:login', async () => {
+    const fs = await import('node:fs')
+    const { spawn } = await import('node:child_process')
+    const { CLAUDE_BIN } = await import('./paths')
+    if (!fs.existsSync(CLAUDE_BIN))
+      return { ok: false, error: '내장 Claude 실행 파일을 찾지 못했습니다.' }
+    try {
+      if (process.platform !== 'win32') {
+        // 현재 Windows 전용 — 그 외 플랫폼은 콘솔 가시성 보장 없이 실행만 시도.
+        spawn(CLAUDE_BIN, ['auth', 'login'], { detached: true, stdio: 'ignore' }).unref()
+        return { ok: true }
+      }
+      // 새 콘솔에 `claude auth login`(구독 OAuth)을 띄운다. 실행 파일 경로는 명령 문자열에 넣지 않고
+      // %CLAUDE_BIN% 환경변수로만 참조한다 — 경로에 비ASCII(CJK 사용자명 등)가 있어도 cmd 코드페이지에
+      // 걸리지 않는다(env는 CreateProcessW로 유니코드 전달, 명령 문자열은 순수 ASCII). /k로 창을 열어둬
+      // 사용자가 로그인 결과·에러를 확인하게 한다. (spawn+cmd 따옴표 함정 회피, 실측 검증)
+      const child = spawn(`start "lain - Claude login" cmd /k ""%CLAUDE_BIN%" auth login"`, {
+        shell: true,
+        windowsHide: false,
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, CLAUDE_BIN },
+      })
+      child.on('error', () => {})
+      child.unref()
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: (e as Error).message }
+    }
+  })
+
+  // ── 플래너 — CRUD는 결정론 직통, 변경은 planner:updated 브로드캐스트(레인 도구發 포함) ──
+  ipcMain.handle('planner:list', () => ({ items: listPlanItems(), tags: listPlanTags(), sections: listPlanSections() }))
+  ipcMain.handle('planner:upsertItem', (_e, input) => {
+    const id = upsertPlanItem(input)
+    broadcast('planner:updated', null)
+    // quips — 이번 주(월~일) 일정·마감이 6개 이상이면 한마디. startAt은 로컬 'YYYY-MM-DDTHH:mm'
+    // 고정 포맷이라 문자열 비교가 시간순과 일치한다(타임존 파싱 함정 회피).
+    try {
+      const now = new Date()
+      const mon = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7))
+      const next = new Date(mon.getFullYear(), mon.getMonth(), mon.getDate() + 7)
+      const fmt = (d: Date) =>
+        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}T00:00`
+      const lo = fmt(mon)
+      const hi = fmt(next)
+      const count = listPlanItems().filter((it) => it.startAt && it.startAt >= lo && it.startAt < hi).length
+      if (count >= 6) emitQuip('busy_week', { count })
+    } catch {
+      /* 플레이버 — 실패 무해 */
+    }
+    return id
+  })
+  ipcMain.handle('planner:deleteItem', (_e, id: number) => {
+    archivePlanItem(id)
+    broadcast('planner:updated', null)
+  })
+  ipcMain.handle('planner:setDone', (_e, id: number, done: boolean) => {
+    setPlanItemDone(id, done)
+    broadcast('planner:updated', null)
+  })
+  ipcMain.handle('planner:upsertTag', (_e, input) => {
+    const id = upsertPlanTag(input)
+    broadcast('planner:updated', null)
+    return id
+  })
+  ipcMain.handle('planner:deleteTag', (_e, id: number) => {
+    deletePlanTag(id)
+    broadcast('planner:updated', null)
+  })
+  ipcMain.handle('planner:upsertSection', (_e, input) => {
+    const id = upsertPlanSection(input)
+    broadcast('planner:updated', null)
+    return id
+  })
+  ipcMain.handle('planner:deleteSection', (_e, id: number) => {
+    deletePlanSection(id)
+    broadcast('planner:updated', null)
+  })
 
   ipcMain.handle('approvals:list', () => listApprovals())
   ipcMain.handle('approvals:resolve', (_e, id: number, approved: boolean, answer?: string) => {
@@ -684,4 +1051,7 @@ export function registerIpc(): void {
   ipcMain.handle('question:answer', (_e, questionId: string, answer: string[]) =>
     answerUserQuestion(questionId, answer),
   )
+
+  // B5 — 대기 중 인라인 질문 조회. 렌더러 마운트/리로드 시 재요청해 카드를 복원한다(pendingQuestion은 main 인메모리).
+  ipcMain.handle('question:pending', () => listPendingQuestions())
 }

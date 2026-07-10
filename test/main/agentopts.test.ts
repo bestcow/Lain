@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { thinkingOption, managerAgentOptions, tierQueryOptions } from '../../src/main/agentopts'
 
 describe('tierQueryOptions — 티어 → 모델/로컬 라우팅 옵션', () => {
-  const s = { localBaseUrl: 'http://127.0.0.1:8080' }
+  const s = { localBaseUrl: 'http://127.0.0.1:8080', anthropicApiKey: '' }
 
   it('Claude 티어는 고정 ID만 — env 미설정(기존 동작 불변)', () => {
     expect(tierQueryOptions('sonnet', s)).toEqual({ model: 'claude-sonnet-4-6' })
@@ -12,6 +12,20 @@ describe('tierQueryOptions — 티어 → 모델/로컬 라우팅 옵션', () =>
 
   it('미지 티어는 sonnet 폴백(modelId와 일관) — env 없음', () => {
     expect(tierQueryOptions('gpt-4', s)).toEqual({ model: 'claude-sonnet-4-6' })
+  })
+
+  it('E5: API 키 설정 시 non-local 티어 env에 ANTHROPIC_API_KEY 주입(baseEnv 스프레드)', () => {
+    const keyed = { localBaseUrl: 'http://127.0.0.1:8080', anthropicApiKey: '  sk-ant-user  ' }
+    const o = tierQueryOptions('opus', keyed, { PATH: 'C:\\bin' })
+    expect(o.model).toBe('claude-opus-4-8')
+    expect(o.env).toBeDefined()
+    expect(o.env!.ANTHROPIC_API_KEY).toBe('sk-ant-user') // trim 적용
+    expect(o.env!.PATH).toBe('C:\\bin') // baseEnv 유지(통째교체 방어)
+  })
+
+  it('E5: API 키 비었으면 non-local env 미설정(기존 구독 로그인 동작 불변)', () => {
+    expect(tierQueryOptions('sonnet', { localBaseUrl: 'x', anthropicApiKey: '   ' }).env).toBeUndefined()
+    expect(tierQueryOptions('opus', s).env).toBeUndefined()
   })
 
   it('local 티어 — 로컬 모델명 + llama-server 라우팅 env', () => {

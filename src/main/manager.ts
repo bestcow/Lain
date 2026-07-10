@@ -14,7 +14,17 @@ import { spawn, execFileSync } from 'node:child_process'
 import { app } from 'electron'
 import { DATA_DIR, AGENT_CWD, CLAUDE_BIN, SELF_SRC_DIR } from './paths'
 import { appendCapped } from './logfile'
-import type { ChatEvent, FileAttachment, ProjectView, NaviChatEvent } from '../shared/types'
+import type { ChatEvent, FileAttachment, ProjectView, NaviChatEvent, Task } from '../shared/types'
+import { encodeToolLine } from '../shared/toolline'
+import { parseTodoWriteInput, encodeTodoLine, todoProgress } from '../shared/todoline'
+import {
+  buildEditDiffLines,
+  buildWriteDiffLines,
+  foldDiffLines,
+  encodeEditDiffLine,
+  renderEditDiffText,
+  type EditDiffPayload,
+} from '../shared/editdiff'
 import { getForeground, type Observation } from './watcher'
 import { isTransientApiError, transientBackoffMs, MAX_TRANSIENT_RETRIES } from './retry'
 import {
@@ -24,11 +34,14 @@ import {
   saveSettings,
   listProjects,
   listTasks,
+  queuedTasks,
+  setTaskPriority,
   listApprovals,
   getProject,
   hideProject,
   lessonsForProject,
   bumpLessonInject,
+  retractLessons,
   searchHistory,
   searchChatHistory,
   messagesAround,
@@ -54,13 +67,36 @@ import {
   listRoutines,
   setRoutineEnabled,
   deleteRoutine,
+  insertApproval,
+  listPlanItems,
+  upsertPlanItem,
+  setPlanItemDone,
+  archivePlanItem,
+  listPlanTags,
+  upsertPlanTag,
+  deletePlanTag,
+  listPlanSections,
+  upsertPlanSection,
+  deletePlanSection,
 } from './store'
-import { managerAgentOptions, tierQueryOptions } from './agentopts'
+import { occurrencesInRange, parseLocal, fmtLocal } from '../shared/planmath'
+import { plannerDigestLine } from './planner'
+import { managerAgentOptions, tierQueryOptions, judgeQueryOptions } from './agentopts'
+import { summarizeDiffStat } from './checkpoint'
+import { QuestionBus, type PendingQuestion } from './questionbus'
 import { summarizeConversationTitle } from './title'
 import { summarizeWorldState } from './compact'
 import { shouldCompact, contextOccupancyTokens, occupancyForMaxTurns } from './compactgate'
-import { startTask, answerClarify, cancelTask, resolveReview } from './orchestrator'
-import { blocksSecretFile, blocksSecretPath, SECRET_DENY_MESSAGE, redactSecrets, scanSkillInjection } from './safety'
+import { startTask, answerClarify, cancelTask, resolveReview, rerunTask, revertMerge, setTaskDeps, startTaskGroup, resolveGroup } from './orchestrator'
+import {
+  blocksSecretFile,
+  blocksSecretPath,
+  SECRET_DENY_MESSAGE,
+  redactSecrets,
+  scanSkillInjection,
+  isSecretFile,
+} from './safety'
+import { checkpointEdit } from './rewind'
 import {
   isValidSkillName,
   readSkillBody,
@@ -69,7 +105,9 @@ import {
   skillsIndexBlock,
 } from './agentskills'
 import { isCodeEdit, isVerifyRun, shouldNudge, VERIFY_NUDGE_NOTE } from './verifynudge'
-import { sumUsageTokens } from './worker'
+import { sumUsageTokens, waitApproval, extractToolResults } from './worker'
+import { classifySystemDestructive } from './sysrisk'
+import { notifyUser } from './notify'
 import { sendToNavi, sendToAllNavis } from './navichat'
 import { scanProjects } from './registry'
 import { collectStatus, runVerify } from './collectors'
@@ -104,6 +142,10 @@ const SYSTEM_PROMPT = `${PERSONA_CORE}
 - 다이제스트에 [숨김] 표시된 내비는 사용자가 먼저 언급하기 전엔 네가 먼저 화제로 꺼내지 마라 — 브리핑·현황 보고·제안에서 생략한다. 감시·작업·위임과, 사용자가 그 내비를 물었을 때의 답변은 평소대로 한다.
 - 브라우저 조작: mcp__chrome__* 도구가 있으면(설정에서 등록 시) 크롬 창을 직접 열어 이동·클릭·입력·스크린샷·콘솔/네트워크 확인을 할 수 있다. 이 크롬은 전용 프로필이라 사용자의 일상 크롬 로그인과 분리돼 있다 — 로그인이 필요한 사이트는 그 창에서 사용자가 직접 한 번 로그인하게 요청해라(이후 유지). 구매·결제·게시·전송 같은 비가역 행동은 실행 전에 사용자 확인을 받는다.
 - 사용자가 행동을 지시하면 mcp__lain__* 와이어드 도구로 직접 수행한다. 도구 없이 "했다"고 말하지 마라.
+- 도구가 "시작했다"고 답한 것은 "완료됐다"가 아니다. 비동기 작업(deploy_lain·start_task 등)은 완료 증거(로그·재시작·상태 변화)를 확인하기 전에 완료로 보고하지 마라 — 확인 전엔 "시작함, 결과 확인 필요"까지만 말해라.
+- 사용자가 학습된 행동·사실을 정정하면(예: "그렇게 부르지 마", "그 규칙 틀렸어") retract_lessons로 관련 교훈을 철회해라 — 설정·프로필 수정만으로는 잘못 학습된 교훈이 계속 주입된다.
+- 플래너: 사용자가 일정·할일을 말하면 plan_manage로 등록하고 한 줄로 확인해라(잡담인지 애매하면 등록하지 말고 넘어간다). "오늘/이번 주 뭐 있지"는 plan_view로 답한다. 다이제스트의 "플래너:" 줄에 방치 항목이 보이고 설정상 넛지가 켜져 있으면, 한가한 턴에 한 번만 "할래, 버릴래, 내가 해줄까?"로 꺼내라 — 같은 항목을 거듭 조르지 마라.
+- 플래너 대신 처리: 조사·탐색·정리형 todo는 (설정 plannerOfferHelp가 켜져 있으면) "내가 해줄까?"를 1회 제안하고, 수락하면 수행 결과를 그 항목 body에 plan_manage(update)로 붙인 뒤 완료할지 물어라. 사용자가 직접 시키면 설정과 무관하게 즉시 수행한다.
 - 절차 스킬: 매 메시지의 <skills-index>에 네가 저장한 절차 스킬 목록이 주어진다. 관련 작업이면 **먼저 skill_view로 본문을 확인**하고 그 절차를 따른다. 네가 도구로 직접 수행해 검증까지 끝낸 절차는 skill_save로 바로 남기고 한 줄로 보고해라. 대화에서 나온 절차거나 저장 가치가 애매하면 먼저 "방금 내용을 스킬로 저장할까요?"라고 짧게 제안하고 수락 시 저장해라 — 같은 절차를 거듭 제안하지 말고, 거절한 절차는 다시 꺼내지 마라. 교훈(<lessons>)은 한두 문장 규칙, 스킬은 여러 단계 절차다 — 구분해 저장해라.
 - 사용자 프로필: 사용자 자체에 대한 지속 사실(호칭·선호·습관·기술 수준)을 새로 알게 되면 user_profile 도구로 저장·정리해라(상한 초과 에러가 오면 같은 턴에서 스스로 병합·정리 후 재시도). 프로필=사용자, 교훈=작업 규칙이다.
 - 과거 대화: 옛 대화 내용이 필요한데 기억(월드모델 요약)에 없으면 search_chat_history로 원문을 검색해라. 추측으로 "그때 ~라고 했다"고 말하지 마라.
@@ -116,9 +158,12 @@ ${SELF_SRC_LINE}
 - 명세 명확화로 막힌(blocked) 작업에 '명세 답변'을 줄 때는 answer_clarify를 쓴다(message_navi는 일반 지시·질의용 — 명세에 박히면 안 되는 잡담을 막힌 작업에 보내지 마라).
 - task_id·approval_id가 필요한 도구는 먼저 list_tasks·list_approvals로 정확한 id를 확인한 뒤 호출한다. id를 지어내지 마라.
 - 작업 시작(start_task)은 프로젝트에 TASK.md가 있거나, content로 작업 내용을 직접 줘야 한다.
+- 연쇄 작업("A 끝나면 B")은 네 기억에 남기지 마라 — B를 start_task의 depends_on:[A의 task_id]로 즉시 등록하면 A가 done 될 때 자동 착수된다(재시작·압축과 무관). 사후 조정·해제는 set_task_deps.
+- 한 요청이 여러 레포에 걸치면(공용 타입 변경 + 소비자 레포 수정 등) start_task_group으로 묶어라 — 공유 명세(spec)를 각 레포 child에 주입하고, 모두 review가 되면 resolve_group으로 all-or-nothing 일괄 병합한다(중간 실패 시 이미 병합된 것도 자동 롤백돼 한쪽만 병합되는 반쪽 상태가 없다). 그룹 child는 개별 resolve_review로 병합할 수 없다.
 - start_task의 skills로 그 작업에 맞는 스킬만 좁혀줄 수 있다(생략=전체 자율). 풀: brainstorming·systematic-debugging·test-driven-development·writing-plans·feature-dev·commit·code-review 등. 구현만 빠르게 할 자율 작업엔 과한 프로세스 스킬(brainstorming 등)을 빼는 게 낫다.
 - 위임 판단(A/B): 일을 맡길 때 — **격리해서 검토받고 끝낼 일이면 start_task(A)**(명확한 산출물·worktree 격리·검토(병합/폐기) 필요·테스트로 검증 가능·위험/대규모·병렬), **같이 만지며 이어갈 일이면 message_navi(B)**(탐색·디버깅·반복 질의·누적 맥락 의존·턴마다 방향 조정·사소한 즉시 수정). 헷갈리면: 끝나고 'diff를 리뷰'할 일=A, '대화하며 좁혀갈' 일=B. Navi 대화 세션은 컨텍스트가 차면 자동으로 핸드오프 md를 남기고 새 세션으로 갈아끼워지니(유한세션 교체) 길게 이어가도 된다.
 - 결재(merge/브랜치만/폐기)는 resolve_review로 직접 내릴 수 있다(사용자 위임). 비가역이니 먼저 list_tasks로 verify 결과·diff를 확인하고 신중히 결정한다. 단 Navi가 올린 위험명령 승인(list_approvals의 pending)은 여전히 사용자 전용 — 보고만 하고 결정은 사용자가 UI/폰 버튼으로 한다.
+- 완료(done)·폐기(cancelled) 작업을 다시 돌리고 싶다는 요청("다시 해줘", "재실행")엔 rerun_task를 쓴다. 원본 작업은 그대로 두고 같은 지시서로 새 task를 만들어 시작한다 — start_task로 처음부터 다시 적을 필요 없다.
 - 도구를 쓴 뒤에는 무엇을 했는지 한두 줄로 보고한다. 사용자가 안 시킨 일을 멋대로 벌이지 마라.
 - 사용자에게 정해진 보기 중에서 고르게 할 질문은 ask_user로 선택 카드를 띄운다(단일 선택 또는 multi=true 복수 선택) — 예/아니오·방향 선택처럼 답이 한정될 때. 답을 받을 때까지 대기하며 그 선택으로 이어간다. 자유 서술 답이 필요하면 카드 대신 평소처럼 텍스트로 묻는다.
 - 보고 형식(멀티프로젝트): 두 개 이상의 프로젝트를 한 번에 보고·언급할 땐 반드시 프로젝트별로 끊어서, 각 항목을 정확히 '■ <프로젝트id> — <상태 한마디>' 형태의 헤더 줄로 시작하고, 그 아래 1~2줄로 핵심과 (있으면) "너에게 필요한 결정/입력"을 적는다. 산문 한 덩어리로 뭉치지 말고 스캔 가능하게. 프로젝트가 하나뿐이거나 일반 대화면 이 형식은 불필요하다. (이 '■' 헤더는 폰에서 프로젝트별 메시지로 자동 분리된다.)
@@ -159,7 +204,7 @@ function loadUserProfile(): string | null {
 // 곁가지(음성·오버레이·웹조사) 공용 페르소나 — PERSONA_CORE + soul.md + 사용자 프로필(있으면). 곁가지도
 // 일회성 query() systemPrompt라 1회 append는 누출면이 메인과 동일하다(relay/addMessage/digest/title엔
 // 미주입). 이걸 곁가지 sys 앞에 prepend해, 메인만 고쳐도 말투·정체성이 모든 표면에 일관 반영된다.
-// 사용자 호칭 줄 — 설정(userTitle, 기본 '마스터')을 조립 시 라이브로 읽어 주입한다. 정적 PERSONA_CORE/
+// 사용자 호칭 줄 — 설정(userTitle, 기본 '유저')을 조립 시 라이브로 읽어 주입한다. 정적 PERSONA_CORE/
 // SYSTEM_PROMPT는 모듈 로드 시 박제라, 호칭 변경이 즉시 반영되게 여기서 동적으로 덧댄다.
 function userAddressLine(): string {
   const title = getSettings().userTitle || '유저'
@@ -175,29 +220,62 @@ function personaCore(): string {
   return out
 }
 
-export function buildDigest(projects: ProjectView[]): string {
+// D6 — 프로젝트별 '진행 중 working 작업'의 최신 진행 한 조각. worker가 체크포인트마다 task.turns·diffStat를
+// 라이브 갱신하므로 세션 종료 전에도 반영된다. 인자 미주입 시 listTasks()로 조회(테스트는 주입 가능).
+// projectId당 첫 working 작업만(가장 최근 생성순 — listTasks가 created_at DESC) 붙인다.
+function checkpointFragments(tasks: Task[]): Map<string, string> {
+  const byProject = new Map<string, string>()
+  for (const t of tasks) {
+    if (t.state !== 'working' || byProject.has(t.projectId)) continue
+    // diffStat 요약(+X/-Y)만 — worker의 체크포인트와 동일 로직(summarizeDiffStat) 재사용.
+    byProject.set(t.projectId, `진행중: ${t.turns}턴 · ${summarizeDiffStat(t.diffStat ?? '')}`)
+  }
+  return byProject
+}
+
+export function buildDigest(projects: ProjectView[], tasks?: Task[]): string {
   const enabled = projects.filter((p) => p.enabled)
-  if (enabled.length === 0) return '(등록된 프로젝트 없음 — 스캔 필요)'
-  return enabled
-    .map((p) => {
-      const s = p.status
-      // [숨김] — 유저가 숨긴 내비. 관리(수집·작업)는 정상이나 레인이 먼저 화제로 꺼내면 안 됨(SYSTEM_PROMPT 규칙).
-      const idLabel = p.muted ? `${p.id} [숨김]` : p.id
-      if (!s) return `${idLabel} | 상태 미수집`
-      const parts = [
-        idLabel,
-        p.stack ?? 'stack?',
-        s.gitBranch ? `branch ${s.gitBranch}` : 'non-git',
-        `dirty ${s.dirtyFiles}`,
-        `ahead ${s.ahead}/behind ${s.behind}`,
-        s.lastCommit ? `last "${s.lastCommit}" (${s.lastCommitAt ?? '?'})` : 'no commits',
-        `test ${s.testState}`,
-        `TODO ${s.todoCount}`,
-      ]
-      if (s.summary) parts.push(`요약: ${s.summary}`)
-      return parts.join(' | ')
-    })
-    .join('\n')
+  // task 조회 실패(DB 미초기화 등)는 무해 — 체크포인트 조각만 생략하고 기존 다이제스트 유지.
+  let cp: Map<string, string>
+  try {
+    cp = checkpointFragments(tasks ?? listTasks())
+  } catch {
+    cp = new Map()
+  }
+  const base =
+    enabled.length === 0
+      ? '(등록된 프로젝트 없음 — 스캔 필요)'
+      : enabled
+          .map((p) => {
+            const s = p.status
+            // [숨김] — 유저가 숨긴 내비. 관리(수집·작업)는 정상이나 레인이 먼저 화제로 꺼내면 안 됨(SYSTEM_PROMPT 규칙).
+            const idLabel = p.muted ? `${p.id} [숨김]` : p.id
+            const progress = cp.get(p.id)
+            if (!s) return progress ? `${idLabel} | 상태 미수집 | ${progress}` : `${idLabel} | 상태 미수집`
+            const parts = [
+              idLabel,
+              p.stack ?? 'stack?',
+              s.gitBranch ? `branch ${s.gitBranch}` : 'non-git',
+              `dirty ${s.dirtyFiles}`,
+              `ahead ${s.ahead}/behind ${s.behind}`,
+              s.lastCommit ? `last "${s.lastCommit}" (${s.lastCommitAt ?? '?'})` : 'no commits',
+              `test ${s.testState}`,
+              `TODO ${s.todoCount}`,
+            ]
+            if (s.summary) parts.push(`요약: ${s.summary}`)
+            if (progress) parts.push(progress)
+            return parts.join(' | ')
+          })
+          .join('\n')
+  // 플래너 요약 1줄(§21b) — 설정으로 끄면 브리핑에서 제외. DB 미가용 등 실패는 무해하게 base만 반환.
+  try {
+    const s = getSettings()
+    if (!s.plannerInBriefing) return base
+    const line = plannerDigestLine(listPlanItems(), new Date(), s)
+    return line ? `${base}\n${line}` : base
+  } catch {
+    return base
+  }
 }
 
 // Lain은 와이어드 지휘 + 등록 저장소 직접 파일 읽기·수정(옵션1 2026-06-15)을 한다 — 다파일 작업은 도구
@@ -227,6 +305,9 @@ export function setStartupBriefing(text: string): void {
 let stopped = false // 정지 버튼 latch — 이어가기/재시도 재귀가 새 컨트롤러로 되살아나는 걸 막는다(새 사용자 턴에 해제)
 let turnSeq = 0 // 매니저 턴 일련번호 — 정지로 버려진 orphan 턴이 새 턴의 busy/abort를 덮어쓰지 않게 가드
 let forceStopTurn: ((reason: string) => void) | null = null // 현재 턴 강제 종료기(stopManager·워치독이 호출) — abort가 스트림을 못 끊을 때의 대비책
+// 현재 턴 워치독 진전 갱신기 — 도구 배열(모듈 스코프)에서 정의되는 ask_user가 per-turn lastActivityAt에 직접
+// 접근할 수 없으므로, 턴이 자신의 갱신기를 여기 등록한다(forceStopTurn과 동형). 무턴이면 null이라 no-op.
+let bumpManagerActivity: (() => void) | null = null
 
 // 렌더러 미러 — 호출 출처(PC·텔레그램·스케줄러)와 무관하게 모든 Lain 대화 이벤트를
 // PC 렌더러로 흘려보낸다(conversationId 태깅). ipc.ts가 startup에 바인딩한다.
@@ -249,8 +330,8 @@ export function stopManager(): void {
   stopped = true
   currentAbort?.abort()
   // 대기 중인 인라인 질문이 있으면 빈 선택으로 깨워 블록된 턴을 풀어준다(abort는 도구 promise를 못 깨운다).
-  for (const resolve of userAnswerWaiters.values()) resolve([])
-  userAnswerWaiters.clear()
+  // B5 — questionBus.clearAll이 pendingQuestion·타임아웃 타이머·waiter를 모든 종료 경로에서 함께 정리(유령 카드·누수 방지).
+  questionBus.clearAll()
   // ⚠️ abort가 SDK 스트림을 못 끊는 경우가 있다(서브프로세스 행·도구 멈춤·모델 무한대기). 그때도 UI가
   // "응답 중"에 영구히 묶이지 않게, 현재 턴을 직접 강제 종료한다 — 종료 이벤트 발신 + busy 해제. (이 한 줄이
   // 없으면 정지 버튼은 'abort가 통할 때만' 동작해, 스트림이 멎으면 무력해진다.)
@@ -285,11 +366,59 @@ export function resetManager(): void {
   setConversationSdkSession(convId, '') // 새 SDK 세션(resume 끊김)
   setConversationWorldState(convId, '') // 압축 월드모델 폐기 → 옛 맥락 재주입 안 함
   resetConversationContextTokens(convId)
+  // 재리뷰 #5 — 리셋 전 오버레이/큍 자발 발화 버퍼도 폐기: 남기면 '새 세션' 첫 턴에 옛 맥락이
+  // 재주입돼 리셋 직후 큍("잊어버린 기분")과 리셋 전 발화를 동시에 말하는 자기모순이 생긴다.
+  // (ipc의 post-reset 큍은 이 함수 '이후'에 push되므로 살아남는다 — 의도된 순서.)
+  clearPendingOverlayForManager()
   rendererMirror?.({
     kind: 'tool',
     text: '🔄 Lain 세션 새로고침 — 다음 메시지부터 새 세션(누적 맥락 비움). 채팅 로그는 보존.',
     conversationId: convId,
   })
+}
+
+// 무한세션 압축 본체(A5) — sendToManager의 자동 압축 분기와 /compact 수동 트리거(IPC)가 공유한다.
+// 순수 판정(threshold 등)은 호출부 책임 — 이 함수는 "지금 압축을 실행"만 담당(부작용: DB 갱신 + LLM 1회 호출).
+// 성공/실패 여부와 사람이 읽을 한 줄 메시지(기존 자동 압축 흔적 라인과 동일 문구)를 반환한다.
+export async function performCompact(
+  conversationId: string,
+): Promise<{ ok: boolean; message: string }> {
+  const prevWorld = getConversationWorldState(conversationId)
+  const recent = listConversationDialogue(conversationId, 40) // user/assistant 원문만(도구 로그에 윈도 잠식 방지)
+  const ws = await summarizeWorldState(prevWorld, recent)
+  // ⚠ 요약 실패(null)면 세션을 끊지 않는다 — 최근 대화가 월드모델에 흡수되지 않은 채 절단하면
+  // 맥락이 소리 없이 유실된다(judge 티어가 local인데 llama-server 다운 등). 세션 유지 + 경고만 남기고,
+  // 자동 경로는 shouldCompact가 다음 턴에 자연 재시도한다. (리뷰 확정 결함 수정 2026-07-02)
+  if (!ws) {
+    return {
+      ok: false,
+      message:
+        '🧠 컨텍스트 압축 실패 — 요약 모델이 응답하지 않아 세션을 유지한다(다음 턴 재시도). 판정 모델이 local이면 llama-server 상태를 확인해줘.',
+    }
+  }
+  setConversationWorldState(conversationId, ws)
+  setConversationSdkSession(conversationId, '') // SDK 세션 끊기 → 새 세션 시작
+  resetConversationContextTokens(conversationId) // 점유 0 — 재귀 재진입 시 즉시 재압축 방지
+  const compactNote = '🧠 컨텍스트 압축 — 누적 맥락을 월드모델로 요약하고 새 세션으로 이어감'
+  addMessage('manager', 'tool', compactNote, conversationId) // 영속 — 재로드 시에도 세션 경계 흔적 유지
+  // 단일 세션 화면 정리 — 압축 직후 최근 40개만 화면에 남긴다(이전은 숨김·DB 보존). world_state가 진짜 기억.
+  setManagerViewWindow(conversationId, 40)
+  return { ok: true, message: compactNote }
+}
+
+// /compact 수동 트리거(IPC chat:compact) — 사용자가 임계 도달 전에도 직접 압축을 요청할 수 있게 한다.
+// busy 중엔 거부한다: performCompact가 SDK 세션·점유를 갱신하는데, 진행 중인 sendToManager 턴(자동 압축
+// 포함)과 동시에 돌면 같은 대화 row를 경합해 덮어쓸 수 있다(레이스). 사용자에겐 안내만 하고 조용히 무시하지 않는다.
+export async function compactManagerNow(conversationId?: string): Promise<{ ok: boolean; message: string }> {
+  const convId = conversationId || ensureActiveConversation('manager')
+  if (busy) {
+    const message = '레인이 응답 중이라 지금은 압축할 수 없다. 끝난 뒤 다시 시도해줘.'
+    rendererMirror?.({ kind: 'tool', text: message, conversationId: convId })
+    return { ok: false, message }
+  }
+  const result = await performCompact(convId)
+  rendererMirror?.({ kind: 'tool', text: result.message, conversationId: convId })
+  return result
 }
 
 // UI 갱신 훅 — orchestrator를 거치지 않는 도구(scan/verify/refresh/message)는 자체 broadcast가
@@ -310,6 +439,8 @@ type ManagerHooks = {
   onNaviEvent: (ev: NaviChatEvent) => void
   // #1: 채팅으로 받은 디스코드 설정을 저장+어댑터 재기동(ipc가 주입 — manager→discord 순환참조 회피).
   setDiscordConfig: (cfg: DiscordConfigPatch) => void
+  // 플래너(스펙 2026-07-05): 레인 도구(plan_manage 등)가 store를 바꾼 뒤 렌더러 플래너 뷰 갱신 요청.
+  refreshPlanner: () => void
 }
 let hooks: ManagerHooks = {
   refreshProjects: () => {},
@@ -317,6 +448,7 @@ let hooks: ManagerHooks = {
   refreshApprovals: () => {},
   onNaviEvent: () => {},
   setDiscordConfig: () => {},
+  refreshPlanner: () => {},
 }
 export function bindManager(h: ManagerHooks): void {
   hooks = h
@@ -324,22 +456,76 @@ export function bindManager(h: ManagerHooks): void {
 
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] })
 
-// ── 인라인 사용자 질문 (개선 #1) — Lain이 선택형/체크형 질문을 던지고 답을 받아 같은 턴에서 이어간다.
+// ── 플래너 이름→id resolve — 레인은 태그/섹션 id를 모르니 이름으로만 지정한다.
+// plan_tags.name은 UNIQUE라 upsertPlanTag(id 없이)를 그대로 부르면 동명 재등록 시 제약 위반 —
+// 기존 이름이 있으면 그 id를 재사용하고, 없을 때만 새로 만든다(plan_sections도 동형으로 통일).
+function resolvePlanTagId(name: string, color = '#b18cf0'): number {
+  const existing = listPlanTags().find((t) => t.name === name)
+  return existing ? existing.id : upsertPlanTag({ name, color })
+}
+function resolvePlanSectionId(name: string): number {
+  const existing = listPlanSections().find((s) => s.name === name)
+  return existing ? existing.id : upsertPlanSection({ name })
+}
+
+// ── 인라인 사용자 질문 (개선 #1 + B5 크로스서피스) — Lain이 선택형/체크형 질문을 던지고 답을 받아 이어간다.
 // ask_manager(worker→Lain)와 동형의 블로킹 패턴이되, 여기선 Lain→사용자 채팅 인라인 카드로 띄운다.
-// 카드는 라이브 전용(rendererMirror), 영속은 답을 받은 뒤 "❓질문 → ✅선택" tool 라인 한 줄로 남긴다.
+// 카드는 라이브(rendererMirror) + 텔레그램 미러 + main 인메모리 보관(리로드 복원). 영속은 답 뒤 tool 라인.
+// B5: waitForUserAnswer는 questionbus가 단일 resolve 보장(타임아웃·답변·취소 경합에도 정확히 한 번).
 let currentManagerConv: string | null = null // 진행 중 manager 턴의 대화 id — 도구가 영속·relay에 쓴다
 let questionSeq = 0
-const userAnswerWaiters = new Map<string, (answer: string[]) => void>()
-function waitForUserAnswer(questionId: string): Promise<string[]> {
-  return new Promise((resolve) => userAnswerWaiters.set(questionId, resolve))
+// B5 — ask_user 무응답 타임아웃(기본 30분, 기존 approvalTimeoutMin 관행과 일치). 만료 시 '(응답 없음)'으로
+// resolve해 폰에서 시작한 턴이 영구 교착되지 않게 한다. 함수 인자로 열어둬 향후 설정 연결 가능.
+const ASK_USER_TIMEOUT_MS = 30 * 60_000
+
+// 텔레그램 미러 훅 — telegram.ts가 등록. question을 폰에 inline_keyboard로 밀고(push), 답/타임아웃 시 카드를 정리(resolve).
+let questionMirror: ((q: PendingQuestion) => void) | null = null
+let questionResolvedMirror: ((questionId: string, answerText: string) => void) | null = null
+export function bindManagerQuestionMirror(
+  push: (q: PendingQuestion) => void,
+  resolve: (questionId: string, answerText: string) => void,
+): void {
+  questionMirror = push
+  questionResolvedMirror = resolve
 }
-/** 렌더러 인라인 카드에서 선택 제출 시 호출(IPC) — 대기 중인 ask_user 도구를 깨운다. */
+
+const questionBus = new QuestionBus((q) => {
+  // 타임아웃 만료 — PC·폰 카드 소거 + 만료 표시(questionResolved 미러). resolve 자체는 bus가 이미 처리.
+  addMessage('manager', 'tool', `❓ ${q.question} → ⏱ (응답 없음·만료)`, q.conversationId)
+  rendererMirror?.({ kind: 'questionResolved', questionId: q.questionId, answerText: '(응답 없음)', conversationId: q.conversationId })
+  questionResolvedMirror?.(q.questionId, '(응답 없음·만료)')
+})
+
+/** 인라인 질문을 띄우고(PC 렌더러 + main 보관 + 텔레그램 미러) 답을 기다린다. 정확히 한 번 resolve(타임아웃 포함). */
+function emitQuestion(
+  q: { questionId: string; question: string; options: string[]; multi: boolean; conversationId: string },
+): Promise<string[]> {
+  const p = questionBus.wait(q, ASK_USER_TIMEOUT_MS)
+  rendererMirror?.({ kind: 'question', ...q })
+  const full = questionBus.get(q.questionId)
+  if (full) questionMirror?.(full)
+  return p
+}
+
+/** 질문 해소 표시 — PC 카드 제거 이벤트 + 텔레그램 카드 정리. bus 소거는 answer/timeout이 이미 처리. */
+function resolveQuestionMirror(questionId: string, conversationId: string, answerText: string): void {
+  rendererMirror?.({ kind: 'questionResolved', questionId, answerText, conversationId })
+  questionResolvedMirror?.(questionId, answerText)
+}
+
+/** 렌더러 인라인 카드·텔레그램 콜백에서 선택 제출 시 호출 — 대기 중인 ask_user 도구를 깨운다(단일 resolve). */
 export function answerUserQuestion(questionId: string, answer: string[]): void {
-  const w = userAnswerWaiters.get(questionId)
-  if (w) {
-    userAnswerWaiters.delete(questionId)
-    w(answer)
-  }
+  questionBus.answer(questionId, answer)
+}
+
+/** 리로드 복원 — 현재 대기 중 인라인 질문 스냅샷(question:pending 조회 IPC). */
+export function listPendingQuestions(): PendingQuestion[] {
+  return questionBus.list()
+}
+
+/** 텔레그램 콜백이 보기 인덱스→텍스트 변환에 쓰는 pending 질문 조회(없으면 undefined — 위조·구형 무시). */
+export function getPendingQuestion(questionId: string): PendingQuestion | undefined {
+  return questionBus.get(questionId)
 }
 
 // 와이어드 지휘 도구 — 읽기·작업 시작·Navi 메시징·정비·결재(resolve_review, 사용자 위임 2026-06-15).
@@ -364,23 +550,19 @@ const lainServer = createSdkMcpServer({
         const conv = currentManagerConv ?? ensureActiveConversation('manager')
         const qid = `q${++questionSeq}`
         const m = !!multi
-        rendererMirror?.({
-          kind: 'question',
-          questionId: qid,
-          question,
-          options,
-          multi: m,
-          conversationId: conv,
-        })
-        const answer = await waitForUserAnswer(qid)
+        // B5 — PC 카드 + main 보관(리로드 복원) + 텔레그램 미러를 한 번에. 무응답이면 30분 뒤 '(응답 없음)' resolve.
+        // 응답 대기는 정상 블록 — 워치독(무진전 자동종료, 기본 10분 < 30분 타임아웃)이 느린 사용자 응답 중 턴을
+        // 강제 종료하면 유령 카드·dead-turn 재활성이 생기므로 Edit/plan과 동일하게 keep-alive로 막는다.
+        const askKeepAlive = setInterval(() => { bumpManagerActivity?.() }, 15_000)
+        let answer: string[]
+        try {
+          answer = await emitQuestion({ questionId: qid, question, options, multi: m, conversationId: conv })
+        } finally {
+          clearInterval(askKeepAlive)
+        }
         const answerText = answer.length ? answer.join(', ') : '(선택 없음)'
         addMessage('manager', 'tool', `❓ ${question} → ✅ ${answerText}`, conv)
-        rendererMirror?.({
-          kind: 'questionResolved',
-          questionId: qid,
-          answerText,
-          conversationId: conv,
-        })
+        resolveQuestionMirror(qid, conv, answerText)
         return ok(`사용자 선택: ${m ? JSON.stringify(answer) : (answer[0] ?? '')}`)
       },
     ),
@@ -388,9 +570,9 @@ const lainServer = createSdkMcpServer({
     // 이후 모든 응답·채팅 라벨에 즉시 반영된다(레인은 사용자 뜻에 맞춰 성장하는 컨셉).
     tool(
       'set_user_title',
-      '사용자가 자신을 부르는 호칭을 바꿔달라고 할 때 호출한다(예: "나를 대표님이라고 불러"). 새 호칭을 설정에 저장하면 이후 레인의 모든 말과 채팅 라벨에 그 호칭이 쓰인다. 기본 호칭은 "마스터".',
+      '사용자가 자신을 부르는 호칭을 바꿔달라고 할 때 호출한다(예: "나를 대표님이라고 불러"). 새 호칭을 설정에 저장하면 이후 레인의 모든 말과 채팅 라벨에 그 호칭이 쓰인다. 기본 호칭은 "유저".',
       {
-        title: z.string().min(1).max(20).describe('사용자를 부를 새 호칭(예: 마스터, 대표님, 이름 등)'),
+        title: z.string().min(1).max(20).describe('사용자를 부를 새 호칭(예: 대표님, 이름 등)'),
       },
       async ({ title }) => {
         const t = title.trim()
@@ -402,19 +584,27 @@ const lainServer = createSdkMcpServer({
     ),
     tool(
       'list_tasks',
-      '작업(task) 목록과 상태를 조회한다. answer/cancel/message 전에 task_id·프로젝트·상태를 확인할 때 쓴다.',
+      '작업(task) 목록과 상태를 조회한다. answer/cancel/message 전에 task_id·프로젝트·상태를 확인할 때 쓴다. state=queued는 대기 큐 — queue_pos(대기순위, 낮을수록 먼저)·priority가 함께 나온다(reorder_queue로 순서 조정).',
       {},
-      async () =>
-        ok(
+      async () => {
+        // D1 — queued 작업의 대기순위(1-based). queuedTasks()는 priority ASC·created_at ASC 순.
+        const queueOrder = new Map(queuedTasks().map((t, i) => [t.id, i + 1]))
+        return ok(
           JSON.stringify(
             listTasks().map((t) => ({
               id: t.id,
               project: t.projectId,
               title: t.title,
               state: t.state,
+              ...(t.state === 'queued' ? { queue_pos: queueOrder.get(t.id), priority: t.priority } : {}),
+              // D2 — 선행 의존(전부 done 돼야 착수). 대기 이유 파악·set_task_deps 조정용.
+              ...(t.dependsOn.length > 0 ? { depends_on: t.dependsOn } : {}),
+              // D13 — 크로스레포 그룹 소속(개별 병합 불가 — resolve_group으로 일괄 결재).
+              ...(t.groupId ? { group: t.groupId } : {}),
             })),
           ),
-        ),
+        )
+      },
     ),
     tool('list_approvals', '대기 중인 승인 요청을 조회한다(보고용 — 결정은 사용자가).', {}, async () =>
       ok(
@@ -477,8 +667,20 @@ const lainServer = createSdkMcpServer({
           .boolean()
           .optional()
           .describe('Opus 빠른 출력 모드. 단순·기계적이거나 빨리 끝낼 작업에 on. 어려운 추론·설계 작업엔 끄는 게 낫다. 생략=off'),
+        engine: z
+          .enum(['claude', 'codex'])
+          .optional()
+          .describe(
+            '실행 엔진. codex=OpenAI Codex CLI(별도 설치·로그인 필요, Claude 크레딧 절약). 사용자가 명시로 원할 때만 codex — 단 codex는 승인 큐·ask_manager 질문·교훈/스킬 주입이 없고(샌드박스가 방어선) autonomous 미지원. 생략=claude',
+          ),
+        depends_on: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "D2 — 선행 task id 배열. 전부 done(병합/브랜치 보존 결재)이 될 때까지 대기했다가 자동 착수한다. 'A 끝나면 B' 연쇄는 A의 start_task가 돌려준 task_id를 B의 depends_on에 넣어 즉시 등록해라 — 기억으로 챙기지 말 것(재시작·압축에도 L0이 진행시킨다)",
+          ),
       },
-      async ({ project_id, content, mode, permission_mode, thinking, disallowed_tools, skills, fast }) => {
+      async ({ project_id, content, mode, permission_mode, thinking, disallowed_tools, skills, fast, engine, depends_on }) => {
         const r = await startTask(project_id, {
           content,
           mode,
@@ -487,14 +689,239 @@ const lainServer = createSdkMcpServer({
           disallowedTools: disallowed_tools,
           skills,
           fastMode: fast,
+          engine,
+          dependsOn: depends_on,
         })
         hooks.refreshTasks()
         hooks.refreshProjects()
+        if (r.error) return ok(`작업 시작 실패: ${r.error}`)
+        if (r.queued)
+          // D1 — cap 초과·프로젝트 중복이면 거절이 아니라 큐 적재. 슬롯이 열리면 자동 착수(reorder_queue로 순서 조정).
+          return ok(
+            `작업 큐 적재됨 (task ${r.taskId}, mode ${r.mode ?? '?'}, ${r.queuePos ?? '?'}번째 대기) — 슬롯이 열리면 자동 착수한다.`,
+          )
+        return ok(`작업 시작됨 (task ${r.taskId}, mode ${r.mode ?? '?'})`)
+      },
+    ),
+    // D1 — 대기 큐 순서 조정. priority가 낮을수록 먼저 착수한다(기본 0). list_tasks의 queue_pos로 확인 후 조정.
+    tool(
+      'reorder_queue',
+      '대기 큐(state=queued) 작업의 착수 우선순위를 조정한다. priority가 낮을수록 먼저 착수(기본 0, 음수 허용). 슬롯이 열리면 이 순서대로 자동 착수한다. list_tasks로 queue_pos·현재 priority를 먼저 확인해라. queued 아닌 작업은 무시된다.',
+      {
+        orders: z
+          .array(z.object({ task_id: z.string(), priority: z.number() }))
+          .min(1)
+          .describe('각 대기 작업의 새 priority(낮을수록 먼저). 예: [{"task_id":"...","priority":-1}]'),
+      },
+      async ({ orders }) => {
+        const queuedIds = new Set(queuedTasks().map((t) => t.id))
+        const applied: string[] = []
+        const skipped: string[] = []
+        for (const o of orders) {
+          if (!queuedIds.has(o.task_id)) {
+            skipped.push(o.task_id)
+            continue
+          }
+          setTaskPriority(o.task_id, o.priority)
+          applied.push(`${o.task_id}=${o.priority}`)
+        }
+        hooks.refreshTasks()
+        const nextOrder = queuedTasks()
+          .map((t, i) => `${i + 1}. ${t.id} (p${t.priority}) ${t.title.slice(0, 40)}`)
+          .join('\n')
+        const skippedMsg = skipped.length ? `\n무시(대기 아님/없음): ${skipped.join(', ')}` : ''
         return ok(
-          r.error
-            ? `작업 시작 실패: ${r.error}`
-            : `작업 시작됨 (task ${r.taskId}, mode ${r.mode ?? '?'})`,
+          applied.length
+            ? `우선순위 갱신 ${applied.length}건 (${applied.join(', ')}).${skippedMsg}\n\n대기 순서:\n${nextOrder || '(없음)'}`
+            : `적용된 항목 없음 — 지정한 task는 대기 큐에 없다.${skippedMsg}`,
         )
+      },
+    ),
+    // D2 — 대기 작업의 선행 의존 사후 조정(신규 등록은 start_task의 depends_on). 선행 실패로 잠긴 후행을 풀 때도 사용.
+    tool(
+      'set_task_deps',
+      "대기(queued) 작업의 선행 의존(depends_on)을 교체한다(빈 배열=해제 — 선행 실패로 잠긴 작업을 풀 때). 선행이 전부 done이 되면 자동 착수한다. 사이클·자기참조·없는 id는 거부. 신규 연쇄 등록은 start_task의 depends_on을 써라.",
+      {
+        task_id: z.string().describe('대상 작업 id (state=queued만, list_tasks로 확인)'),
+        depends_on: z.array(z.string()).describe('새 선행 task id 배열(빈 배열=의존 해제)'),
+      },
+      async ({ task_id, depends_on }) => {
+        const r = setTaskDeps(task_id, depends_on)
+        hooks.refreshTasks()
+        if (r.error) return ok(`의존 변경 실패: ${r.error}`)
+        return ok(`의존 갱신됨: ${task_id} ← [${depends_on.join(', ') || '없음'}] — 선행이 전부 done이면 자동 착수한다.`)
+      },
+    ),
+    // 학습 철회 — 사용자 정정 시 잘못 학습된 교훈(+병합 파생본)을 즉시 주입 중단(2026-07-05 사고 재발 방지).
+    tool(
+      'retract_lessons',
+      '사용자가 학습된 행동·사실이 틀렸다고 정정하면 호출한다(예: "그렇게 부르지 마", "그 규칙 틀렸어, 지워"). 키워드로 관련 교훈을 찾아 보관 처리해 주입을 즉시 중단한다 — 큐레이터 병합 파생본(umbrella)까지 함께. 설정·프로필 수정만으로는 잘못 학습된 교훈이 계속 주입되니, 학습 정정엔 반드시 이것도 호출해라.',
+      {
+        keyword: z
+          .string()
+          .min(2)
+          .max(60)
+          .describe('철회할 교훈을 특정하는 핵심 키워드(교훈 본문에 실제로 들어 있는 고유 단어 — 이름, 규칙의 핵심어)'),
+      },
+      async ({ keyword }) => {
+        const removed = retractLessons(keyword)
+        if (!removed.length) return ok(`"${keyword}"에 해당하는 활성 교훈이 없다 — 키워드를 바꿔 다시 시도하거나, 교훈이 아니라 프로필(user_profile)/호칭(set_user_title) 문제인지 확인해라.`)
+        return ok(
+          `교훈 ${removed.length}건 보관(주입 중단):\n${removed.map((r) => `- [L${r.id}] ${r.lesson.replace(/\s+/g, ' ').slice(0, 100)}`).join('\n')}`,
+        )
+      },
+    ),
+    // ── 플래너(스펙 2026-07-05) — 자연어 시각 해석은 레인이, 저장·검증은 결정론 ──
+    tool(
+      'plan_manage',
+      '플래너에 일정(event)·할일(todo)을 등록·수정·완료·보관한다. 사용자가 일정/할일을 말하면 이걸로 등록하고 한 줄 확인해라. start_at은 로컬 "YYYY-MM-DDTHH:mm" — "내일 3시" 같은 자연어는 네가 현재 시각 기준으로 변환해서 넣는다. todo는 start_at 생략 가능(주면 마감일).',
+      {
+        action: z.enum(['add', 'update', 'done', 'undone', 'remove']),
+        id: z.number().optional().describe('update/done/undone/remove 시 — plan_view로 확인'),
+        kind: z.enum(['event', 'todo']).optional(),
+        title: z.string().max(200).optional(),
+        body: z.string().max(4000).optional().describe('메모·링크(md)'),
+        start_at: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/).optional(),
+        end_at: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/).optional(),
+        all_day: z.boolean().optional(),
+        recur: z.string().regex(/^(none|daily|weekly:[0-6]|monthly:([1-9]|[12][0-9]|3[01]))$/).optional(),
+        tag: z.string().optional().describe('태그 이름(없으면 생성)'),
+        section: z.string().optional().describe('체크리스트 섹션 이름(todo용, 없으면 생성)'),
+        remind_min: z.number().min(0).max(1440).optional(),
+        pinned: z.boolean().optional(),
+      },
+      async (a) => {
+        if (a.action === 'add') {
+          if (!a.title || !a.kind) return ok('add에는 kind와 title이 필요하다.')
+          if (a.kind === 'event' && !a.start_at) return ok('event에는 start_at이 필요하다.')
+          const tagId = a.tag ? resolvePlanTagId(a.tag) : null
+          const sectionId = a.section ? resolvePlanSectionId(a.section) : null
+          const id = upsertPlanItem({
+            kind: a.kind, title: a.title, body: a.body ?? '', startAt: a.start_at ?? null,
+            endAt: a.end_at ?? null, allDay: a.all_day ?? false, recur: a.recur ?? 'none',
+            tagId, sectionId, remindOffsetMin: a.remind_min ?? null, pinned: a.pinned ?? false, origin: 'lain',
+          })
+          hooks.refreshPlanner()
+          return ok(`등록됨 [P${id}] ${a.kind === 'event' ? `${a.start_at} ` : ''}${a.title}`)
+        }
+        if (!a.id) return ok('id가 필요하다 — plan_view로 확인해라.')
+        if (a.action === 'done' || a.action === 'undone') setPlanItemDone(a.id, a.action === 'done')
+        else if (a.action === 'remove') archivePlanItem(a.id)
+        else {
+          const cur = listPlanItems(true).find((i) => i.id === a.id)
+          if (!cur) return ok(`P${a.id} 없음`)
+          upsertPlanItem({
+            ...cur,
+            title: a.title ?? cur.title, body: a.body ?? cur.body,
+            startAt: a.start_at ?? cur.startAt, endAt: a.end_at ?? cur.endAt,
+            allDay: a.all_day ?? cur.allDay, recur: a.recur ?? cur.recur,
+            tagId: a.tag ? resolvePlanTagId(a.tag) : cur.tagId,
+            sectionId: a.section ? resolvePlanSectionId(a.section) : cur.sectionId,
+            remindOffsetMin: a.remind_min ?? cur.remindOffsetMin, pinned: a.pinned ?? cur.pinned,
+          })
+        }
+        hooks.refreshPlanner()
+        return ok(`${a.action} 완료 [P${a.id}]`)
+      },
+    ),
+    tool(
+      'plan_view',
+      '플래너 조회 — 기간 내 일정(반복 전개 포함)과 체크리스트를 본다. 브리핑·"오늘 뭐 있지"·대신 처리 판단에 사용.',
+      {
+        from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('기본 오늘'),
+        to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('기본 from+7일'),
+        include_done: z.boolean().optional(),
+      },
+      async ({ from, to, include_done }) => {
+        const items = listPlanItems().filter((i) => include_done || !i.done)
+        const now = new Date()
+        const f = from ? `${from}T00:00` : fmtLocal(new Date(now.getFullYear(), now.getMonth(), now.getDate()))
+        const tD = to ? parseLocal(`${to}T00:00`) : new Date(parseLocal(f).getTime() + 7 * 86_400_000)
+        const t = fmtLocal(tD)
+        const tags = new Map(listPlanTags().map((x) => [x.id, x.name]))
+        const secs = new Map(listPlanSections().map((x) => [x.id, x.name]))
+        const evs = items
+          .flatMap((i) => occurrencesInRange(i, f, t).map((o) => ({ i, o })))
+          .sort((a, b) => a.o.localeCompare(b.o))
+          .map(({ i, o }) => `- [P${i.id}] ${o.replace('T', ' ')} ${i.title}${i.tagId ? ` #${tags.get(i.tagId)}` : ''}${i.recur !== 'none' ? ' ↻' : ''}`)
+        const todos = items
+          .filter((i) => i.kind === 'todo')
+          .map((i) => `- [P${i.id}] ${i.done ? '☑' : '☐'} ${i.title}${i.sectionId ? ` (${secs.get(i.sectionId)})` : ''}${i.startAt ? ` 마감 ${i.startAt.slice(0, 10)}` : ''}${i.body ? ' 📎' : ''}`)
+        return ok(`기간 ${f.slice(0, 10)}~${t.slice(0, 10)}\n[일정]\n${evs.join('\n') || '(없음)'}\n[체크리스트]\n${todos.join('\n') || '(없음)'}`)
+      },
+    ),
+    tool(
+      'plan_tag_manage',
+      '플래너 태그 관리 — 목록·추가·이름변경·색변경·삭제. 태그 색은 #rrggbb.',
+      {
+        action: z.enum(['list', 'add', 'rename', 'recolor', 'remove']),
+        id: z.number().optional().describe('rename/recolor/remove 시 — list로 확인'),
+        name: z.string().max(40).optional().describe('add/rename 시 이름'),
+        color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().describe('add/recolor 시 색'),
+      },
+      async (a) => {
+        if (a.action === 'list') {
+          const tags = listPlanTags()
+          return ok(tags.length ? tags.map((t) => `- [T${t.id}] ${t.name} ${t.color}`).join('\n') : '태그 없음')
+        }
+        if (a.action === 'add') {
+          if (!a.name) return ok('add에는 name이 필요하다.')
+          const dup = listPlanTags().find((t) => t.name === a.name)
+          if (dup) return ok(`태그 '${a.name}' 이미 있음(기존 색 유지) — 색 변경은 action:'recolor'`)
+          const id = resolvePlanTagId(a.name, a.color ?? '#b18cf0')
+          hooks.refreshPlanner()
+          return ok(`태그 등록됨 [T${id}] ${a.name}`)
+        }
+        if (!a.id) return ok('id가 필요하다 — list로 확인해라.')
+        const cur = listPlanTags().find((t) => t.id === a.id)
+        if (!cur) return ok(`T${a.id} 없음`)
+        if (a.action === 'remove') {
+          deletePlanTag(a.id)
+        } else if (a.action === 'rename') {
+          if (!a.name) return ok('rename에는 name이 필요하다.')
+          upsertPlanTag({ id: cur.id, name: a.name, color: cur.color, sortOrder: cur.sortOrder })
+        } else if (a.action === 'recolor') {
+          if (!a.color) return ok('recolor에는 color가 필요하다.')
+          upsertPlanTag({ id: cur.id, name: cur.name, color: a.color, sortOrder: cur.sortOrder })
+        }
+        hooks.refreshPlanner()
+        return ok(`${a.action} 완료 [T${a.id}]`)
+      },
+    ),
+    tool(
+      'plan_section_manage',
+      '플래너 체크리스트 섹션 관리 — 목록·추가·이름변경·삭제·순서변경.',
+      {
+        action: z.enum(['list', 'add', 'rename', 'remove', 'reorder']),
+        id: z.number().optional().describe('rename/remove/reorder 시 — list로 확인'),
+        name: z.string().max(40).optional().describe('add/rename 시 이름'),
+        sort_order: z.number().optional().describe('reorder 시 새 순서값'),
+      },
+      async (a) => {
+        if (a.action === 'list') {
+          const secs = listPlanSections()
+          return ok(secs.length ? secs.map((s) => `- [S${s.id}] ${s.name} (order ${s.sortOrder})`).join('\n') : '섹션 없음')
+        }
+        if (a.action === 'add') {
+          if (!a.name) return ok('add에는 name이 필요하다.')
+          const id = resolvePlanSectionId(a.name)
+          hooks.refreshPlanner()
+          return ok(`섹션 등록됨 [S${id}] ${a.name}`)
+        }
+        if (!a.id) return ok('id가 필요하다 — list로 확인해라.')
+        const cur = listPlanSections().find((s) => s.id === a.id)
+        if (!cur) return ok(`S${a.id} 없음`)
+        if (a.action === 'remove') {
+          deletePlanSection(a.id)
+        } else if (a.action === 'rename') {
+          if (!a.name) return ok('rename에는 name이 필요하다.')
+          upsertPlanSection({ id: cur.id, name: a.name, sortOrder: cur.sortOrder, collapsed: cur.collapsed })
+        } else if (a.action === 'reorder') {
+          if (a.sort_order === undefined) return ok('reorder에는 sort_order가 필요하다.')
+          upsertPlanSection({ id: cur.id, name: cur.name, sortOrder: a.sort_order, collapsed: cur.collapsed })
+        }
+        hooks.refreshPlanner()
+        return ok(`${a.action} 완료 [S${a.id}]`)
       },
     ),
     tool(
@@ -550,6 +977,74 @@ const lainServer = createSdkMcpServer({
         hooks.refreshTasks()
         hooks.refreshProjects()
         return ok(`결재(${action}): ${res}`)
+      },
+    ),
+    // D13 — 크로스레포 작업 그룹. 한 요청이 여러 repo에 걸칠 때 공유 명세 + repo별 몫으로 묶어 생성.
+    tool(
+      'start_task_group',
+      "한 요청이 여러 레포에 걸칠 때(예: 공용 타입/스키마 변경 + 소비자 레포 수정) 크로스레포 작업 그룹을 만든다. 각 child는 공유 명세(spec)를 받고 자기 레포 몫(content)만 구현한다. 모든 child가 결재 대기(review)가 되면 resolve_group으로 all-or-nothing 일괄 병합한다(중간 실패 시 이미 병합된 것도 자동 롤백 — 반쪽 병합 없음). child는 서로 다른 프로젝트여야 한다. 순서가 필요하면(예: 타입 레포 먼저) 개별 start_task의 depends_on을 대신 써라.",
+      {
+        title: z.string().describe('그룹 제목(무엇을 하는 크로스레포 변경인지 한 줄)'),
+        spec: z
+          .string()
+          .describe('모든 child에 공통 주입할 공유 명세 — 바꾸려는 인터페이스/계약을 명확히(각 레포가 자기 쪽을 이에 맞춘다)'),
+        children: z
+          .array(z.object({ project_id: z.string(), content: z.string() }))
+          .min(2)
+          .describe('레포별 몫. project_id는 list_projects로 확인, content는 그 레포에서 할 일'),
+      },
+      async ({ title, spec, children }) => {
+        const r = await startTaskGroup(
+          title,
+          spec,
+          children.map((c) => ({ projectId: c.project_id, content: c.content })),
+        )
+        hooks.refreshTasks()
+        hooks.refreshProjects()
+        if (r.error) return ok(`그룹 생성 실패: ${r.error}`)
+        const lines = (r.started ?? []).map((s) => `- ${s.projectId}: ${s.taskId}${s.queued ? ' (대기)' : ''}`)
+        return ok(
+          `크로스레포 그룹 생성됨 (group ${r.groupId}, child ${r.started?.length ?? 0}개):\n${lines.join('\n')}\n\n모든 child가 review가 되면 resolve_group으로 일괄 병합해라.`,
+        )
+      },
+    ),
+    tool(
+      'resolve_group',
+      "크로스레포 그룹을 일괄 결재한다. merge=모든 child가 review일 때만 순차 병합(하나라도 막히면 이미 병합된 것도 자동 롤백 — 반쪽 상태 없음), keep-branch=child 브랜치 전부 보존, discard=child 전부 폐기. 그룹 소속 작업은 개별 resolve_review로 병합할 수 없다(keep-branch/discard는 개별도 가능). group_id는 list_tasks의 child에 표시되거나 start_task_group이 반환한다.",
+      {
+        group_id: z.string().describe('그룹 id (start_task_group 반환값 또는 작업의 group 표시)'),
+        action: z.enum(['merge', 'keep-branch', 'discard']).describe('merge=일괄 병합(all-or-nothing) / keep-branch=브랜치 전부 보존 / discard=전부 폐기'),
+      },
+      async ({ group_id, action }) => {
+        const res = await resolveGroup(group_id, action)
+        hooks.refreshTasks()
+        hooks.refreshProjects()
+        return ok(`그룹 결재(${action}): ${res}`)
+      },
+    ),
+    // D11 — 종결(done/cancelled) 작업의 원클릭 재실행. 원본은 손대지 않고 같은 지시서로 새 task를 만든다.
+    tool(
+      'rerun_task',
+      'done(완료) 또는 cancelled(폐기) 상태인 작업을 같은 지시서(elicitation으로 확정된 합격 기준 포함)로 다시 시작한다. 원본 작업은 그대로 보존되고 새 task가 생성된다. 사용자가 "다시 해줘"/"재실행" 등으로 과거 작업을 가리키면 먼저 list_tasks로 대상 task_id를 확인하고 호출해라.',
+      { task_id: z.string().describe('done 또는 cancelled 상태인 작업의 task_id (list_tasks로 확인)') },
+      async ({ task_id }) => {
+        const r = await rerunTask(task_id)
+        hooks.refreshTasks()
+        hooks.refreshProjects()
+        return ok(r.error ? `재실행 실패: ${r.error}` : `재실행 시작됨 (새 task ${r.taskId}, mode ${r.mode ?? '?'})`)
+      },
+    ),
+    // D8 — 이미 main에 fast-forward 병합된 작업을 되돌린다(비파괴 — 새 revert 커밋 생성, reset/force 금지).
+    // resolve_review(review 상태 결재)와 별개 경로: 대상은 done 상태 + 병합 범위가 저장된 작업뿐이다.
+    tool(
+      'revert_merge',
+      'done(완료)이고 이미 main에 병합된 작업의 병합을 되돌린다. 해당 커밋 범위를 git revert(새 revert 커밋 생성 — 비파괴, 히스토리 유실 없음)한다. 사용자가 "방금 병합한 거 되돌려"/"롤백" 등을 요청할 때 먼저 list_tasks로 대상 task_id를 확인하고 호출한다. keep-branch/discard로 끝난 작업은 되돌릴 병합이 없어 대상이 아니다. 메인이 dirty거나 revert 충돌이면 자동 abort하고 실패를 알린다(강제하지 않음).',
+      { task_id: z.string().describe('done 상태이고 병합된 작업의 task_id (list_tasks로 확인)') },
+      async ({ task_id }) => {
+        const res = await revertMerge(task_id)
+        hooks.refreshTasks()
+        hooks.refreshProjects()
+        return ok(`병합 되돌리기: ${res}`)
       },
     ),
     // ── Lain → Navi 직접 메시징 (삼각 쌍방향의 한 변) ──
@@ -740,15 +1235,47 @@ const lainServer = createSdkMcpServer({
           return ok(`배포 전 git 확인 실패: ${String(e).slice(0, 150)}`)
         }
         // deploy.ps1을 detached로 실행 → Lain 종료돼도 계속 실행·재시작 완료. 모든 출력은 deploy.ps1이
-        // %APPDATA%\lain\deploy.log에 남기므로, 실패 시 그 로그를 읽어 원인을 본다.
+        // %APPDATA%\lain\deploy.log에 남긴다.
+        // ⚠ 낙관 보고 금지(2026-07-05 조용한 실패 사고): fire-and-forget으로 "시작"만 반환하면
+        // 스폰이 소리 없이 죽어도 성공처럼 보인다 — 스크립트가 실제로 로그를 쓰기 시작했는지 확인한다.
+        const deployLog = path.join(DATA_DIR, 'deploy.log')
+        let logBefore = 0
+        try {
+          logBefore = fs.statSync(deployLog).mtimeMs
+        } catch {
+          /* 로그 첫 생성 — 0 유지 */
+        }
+        let spawnErr = ''
         const ps = spawn(
           'powershell.exe',
           ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(src, 'scripts', 'deploy.ps1')],
           { detached: true, stdio: 'ignore', cwd: src },
         )
+        ps.on('error', (e) => {
+          spawnErr = String((e as Error)?.message ?? e)
+        })
         ps.unref()
+        // 시작 검증 — 최대 10초간 deploy.log에 새 기록이 생기는지 폴링. 없으면 실패로 보고한다.
+        const deadline = Date.now() + 10_000
+        let started = false
+        while (Date.now() < deadline && !spawnErr) {
+          await new Promise((r) => setTimeout(r, 500))
+          try {
+            if (fs.statSync(deployLog).mtimeMs > logBefore) {
+              started = true
+              break
+            }
+          } catch {
+            /* 아직 없음 — 계속 대기 */
+          }
+        }
+        if (spawnErr) return ok(`배포 실패: 스크립트를 실행하지 못했다 — ${spawnErr.slice(0, 150)}. 사용자에게 그대로 알려라.`)
+        if (!started)
+          return ok(
+            '배포 실패: 10초가 지나도 deploy.log에 기록이 없다 — 배포 스크립트가 시작되지 않았다. "배포했다"고 보고하지 말고 사용자에게 실패를 알려라. (수동 실행: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\deploy.ps1)',
+          )
         return ok(
-          '배포 시작 — 빌드·패키지 후 Lain 자동 재시작(1~2분). 결과·실패원인은 %APPDATA%\\lain\\deploy.log 또는 BUILD_COMMIT.txt 변화로 확인. 봇이 잠깐 끊겼다 돌아옴.',
+          '배포 스크립트 실행 확인(deploy.log 기록 시작) — 빌드·패키지 후 Lain이 자동 재시작된다(1~2분). 아직 완료는 아니다: 재시작이 안 오면 %APPDATA%\\lain\\deploy.log 끝부분을 읽어 실패 원인을 보고해라.',
         )
       },
     ),
@@ -964,7 +1491,9 @@ export function isManagerStalled(
 
 // tool_use 블록 → 회색 라인 한 줄 요약 (Navi 직접 채팅과 동일 형식: Read/Edit/$ 명령/Grep/도구명).
 // 시크릿·잡음 방지로 인자 값은 짧게만 노출(경로·명령·패턴). 알 수 없으면 도구명만.
-function formatToolUse(b: any): string {
+// A17 — display(축약, 기존 slice 그대로 유지)와 별개로 raw(잘리기 전 원문)도 함께 반환한다. 호출부가
+// encodeToolLine(display, raw)로 합쳐 content 하나에 저장 — DB 스키마 변경 없이 원문을 보존(감사 A17).
+function formatToolUse(b: any): { display: string; raw: string } {
   const name = String(b?.name ?? '')
   const input = (b?.input ?? {}) as Record<string, unknown>
   const fp = String(input.file_path ?? input.path ?? '')
@@ -975,16 +1504,41 @@ function formatToolUse(b: any): string {
     case 'Write':
     case 'Edit':
     case 'NotebookEdit':
-      return fp ? `${name} ${fp}` : name
+      // 파일 경로는 자르지 않는다 — raw=fp는 display에 그대로 포함되므로 encodeToolLine이 태그를 생략한다.
+      return { display: fp ? `${name} ${fp}` : name, raw: fp }
     case 'Bash':
     case 'PowerShell':
-      return cmd ? `$ ${cmd.slice(0, 160)}` : name
+      return { display: cmd ? `$ ${cmd.slice(0, 160)}` : name, raw: cmd }
     case 'Grep':
     case 'Glob':
-      return pat ? `${name} ${pat.slice(0, 120)}` : name
+      return { display: pat ? `${name} ${pat.slice(0, 120)}` : name, raw: pat }
     default:
-      return name || 'tool'
+      return { display: name || 'tool', raw: '' }
   }
+}
+
+// A6 — Edit/Write tool_use의 input에서 diff 카드 payload를 만든다. 시크릿 파일이면(canUseTool이
+// 어차피 deny) null — 시크릿 내용을 채팅에 실을 이유가 없다. 큰 diff는 foldDiffLines로 접는다.
+function buildEditDiff(name: string, input: unknown): EditDiffPayload | null {
+  if (name !== 'Edit' && name !== 'Write') return null
+  const i = (input ?? {}) as Record<string, unknown>
+  const filePath = String(i.file_path ?? i.path ?? '')
+  if (!filePath || isSecretFile(filePath)) return null
+  const rawLines =
+    name === 'Edit'
+      ? buildEditDiffLines(String(i.old_string ?? ''), String(i.new_string ?? ''))
+      : buildWriteDiffLines(String(i.content ?? ''))
+  const { lines, truncated } = foldDiffLines(rawLines)
+  return { tool: name, filePath, lines, truncated }
+}
+
+// 도구 실패(tool_result is_error) 요약 — A7. 원문은 스택트레이스·긴 diff 등으로 길 수 있어 한 줄로 축약한다.
+// 줄바꿈은 공백으로 접어 한 줄 유지, 길면 잘라 말줄임(…). 빈 본문이면 도구명 자체가 실패 사유일 수 있어 대체 문구.
+const TOOL_ERROR_SUMMARY_MAX = 200
+export function summarizeToolError(raw: string): string {
+  const flat = raw.trim().replace(/\s+/g, ' ')
+  if (!flat) return '(오류 메시지 없음)'
+  return flat.length > TOOL_ERROR_SUMMARY_MAX ? `${flat.slice(0, TOOL_ERROR_SUMMARY_MAX)}…` : flat
 }
 
 // 음성 빠른 경로(하이브리드 §C) — 디스코드 음성 발화를 무한세션 본체 대신 경량 query()로 즉답한다.
@@ -1034,7 +1588,7 @@ ${digest}
         systemPrompt: sys,
         allowedTools: [],
         maxTurns: 2,
-        ...tierQueryOptions(getSettings().judgeModel, getSettings()), // 빠른 티어(local 라우팅 포함)
+        ...judgeQueryOptions(), // 빠른 티어(local 라우팅 + D7 사용량 가드 강등)
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN,
       },
@@ -1091,6 +1645,7 @@ async function tryFastChat(
   conversationId: string,
   origin: 'pc' | 'telegram' | 'discord',
   abort: AbortController,
+  overlayCtx: string, // 오버레이 인지 맥락 — sendToManager가 소모적으로 취해 넘긴다(여기선 clear 안 함)
 ): Promise<'answered' | 'escalate' | 'aborted'> {
   const digest = buildDigest(listProjects())
   const worldState =
@@ -1111,7 +1666,7 @@ async function tryFastChat(
 - 지금 맥락만으론 불확실하거나 더 조사(파일·기록)해야 제대로 답할 질문도 '<<ACT>>'로 승격한다(본체가 도구로 처리).
 <현황>
 ${digest}
-</현황>${worldStateText}${recentText}`
+</현황>${worldStateText}${recentText}${overlayCtx}`
   let out = ''
   try {
     const stream = query({
@@ -1173,6 +1728,31 @@ ${digest}
 let reacting = false
 let recentReactions: string[] = []
 const REACTION_MEM_MAX = 4
+// 오버레이→본체 인지 버퍼 — 오버레이가 방금 먼저 건 말을 본체(sendToManager)의 다음 한 턴에만 맥락으로
+// 주입한다. listConversationDialogue는 origin='overlay'를 (월드모델 압축 오염 방지 위해) 의도적으로 제외하므로,
+// 본체·빠른레인은 이 말을 못 본다 — 사용자가 "그거 도와줘"로 오버레이 제안을 이어받을 때 맥락 단절을 이 버퍼로 메운다.
+// takeOverlayContext()가 소모(clear)하므로 턴당 정확히 한 번만 취하고, 취하지 않은 다음 턴엔 재주입되지 않는다.
+let pendingOverlayForManager: string[] = []
+const OVERLAY_CTX_MAX = 4
+// 상호작용 대사(quips) 등 '레인 자신의 자발 발화'를 본체 다음 턴 맥락에 얹는 공용 진입점 — 오버레이
+// 발화와 같은 버퍼를 쓴다(별도 버퍼로 주입 지점을 늘리지 않는다). ipc.bindQuipSinks가 '[UI 반응] …'
+// 접두로 push해, 말풍선 직후 사용자가 채팅으로 대꾸해도 맥락이 이어진다('하나의 레인').
+export function pushManagerNotice(text: string): void {
+  pendingOverlayForManager.push(text)
+  if (pendingOverlayForManager.length > OVERLAY_CTX_MAX)
+    pendingOverlayForManager = pendingOverlayForManager.slice(-OVERLAY_CTX_MAX)
+}
+// 재리뷰 #5 — resetManager 전용: 리셋 전 자발 발화 잔여분을 비워 '새 세션'에 옛 맥락이 새지 않게 한다.
+function clearPendingOverlayForManager(): void {
+  pendingOverlayForManager = []
+}
+// 채팅에 영속 tool 라인(카드)을 남기고 렌더러에 미러 — manager 밖(ipc 등)에서 카드를 낼 때의 단일 진입점.
+// 재리뷰 #4 — 되감기 un-revert 카드(edits:revertTurn)가 첫 소비자.
+export function emitManagerCard(text: string, conversationId?: string): void {
+  const convId = conversationId || ensureActiveConversation('manager')
+  addMessage('manager', 'tool', text, convId)
+  rendererMirror?.({ kind: 'tool', text, conversationId: convId })
+}
 // 앱별 해석 지침 — 스크린샷을 '무엇으로' 읽을지. 소문자 프로세스명 부분일치, 첫 매치 사용.
 const BROWSER_HINT =
   '웹 브라우저다 — 창 제목이 지금 보는 페이지 제목이다. 페이지 내용에서 사용자가 무엇을 하려는지(검색·문서 읽기·쇼핑·영상 시청·개발 등) 파악하고 그 목적에 맞춰 판단하라.'
@@ -1198,6 +1778,13 @@ const appHint = (app: string): string => {
 }
 export async function reactToObservation(obs: Observation): Promise<void> {
   if (busy || reacting) return // 본체 응답 중이거나 직전 반응이 진행 중이면 끼어들지 않음
+  // 묵언(chattiness 0) — LLM 호출 '전' 게이트: 선제 발화만 억제하고 감시·관찰(월드스테이트·화면 맥락
+  // 주입)은 유지한다. 마스터 on/off는 overlayMonitoringEnabled — 이 게이트는 빈도(말수) 축이다.
+  try {
+    if (getSettings().chattiness === 0) return
+  } catch {
+    return
+  }
   reacting = true
   try {
     let conversationId: string
@@ -1288,7 +1875,7 @@ ${digest}
           systemPrompt: sys,
           allowedTools: [],
           maxTurns: 2,
-          ...tierQueryOptions(getSettings().judgeModel, getSettings()), // 빠른·저렴 티어(local 라우팅 포함)
+          ...judgeQueryOptions(), // 빠른·저렴 티어(local 라우팅 + D7 사용량 가드 강등)
           executable: 'node',
           pathToClaudeCodeExecutable: CLAUDE_BIN,
         },
@@ -1319,6 +1906,10 @@ ${digest}
     rendererMirror?.({ kind: 'assistant', text: reply, proactive: true, conversationId })
     recentReactions.push(reply)
     if (recentReactions.length > REACTION_MEM_MAX) recentReactions = recentReactions.slice(-REACTION_MEM_MAX)
+    // 본체가 다음 턴에 이 발화를 맥락으로 인지하도록 버퍼에 쌓는다(recentReactions와 동형 캡).
+    pendingOverlayForManager.push(reply)
+    if (pendingOverlayForManager.length > OVERLAY_CTX_MAX)
+      pendingOverlayForManager = pendingOverlayForManager.slice(-OVERLAY_CTX_MAX)
   } finally {
     reacting = false
   }
@@ -1342,7 +1933,7 @@ async function researchObservation(obs: Observation): Promise<string | null> {
         systemPrompt: sys,
         allowedTools: ['WebSearch', 'WebFetch'], // 읽기 전용 조사만(무인 안전)
         maxTurns: 6,
-        ...tierQueryOptions(getSettings().judgeModel, getSettings()),
+        ...judgeQueryOptions(), // §9b 판정류(local 라우팅 + D7 사용량 가드 강등)
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN,
       },
@@ -1360,6 +1951,16 @@ async function researchObservation(obs: Observation): Promise<string | null> {
     return null
   }
   return out.trim() || null
+}
+
+// 자발 발화 인지 맥락을 소모적으로(clear) 취한다 — 이번 턴 프롬프트에 붙일 블록을 만들고 버퍼를 비운다.
+// 오버레이(화면 관찰) 발화와 UI 반응 대사(quips, '[UI 반응]' 접두)가 같은 버퍼를 공유한다.
+// 라벨은 이 발화들이 '레인 자신'이 먼저 건 말임을 명시해, 본체가 사용자 발언으로 오인하지 않게 한다.
+function takeOverlayContext(): string {
+  if (pendingOverlayForManager.length === 0) return ''
+  const lines = pendingOverlayForManager.map((r) => `- ${r}`).join('\n')
+  pendingOverlayForManager = []
+  return `\n\n<최근 자발 발화>\n너(레인)가 방금 사용자 화면을 보고, 또는 사용자의 UI 조작에 반응해([UI 반응] 표기) 먼저 이렇게 말을 걸었다 — 사용자가 이 말을 이어받아 대꾸할 수 있으니 맥락으로 인지하고 자연스럽게 이어가라(사용자가 '그거 도와줘' 식으로 참조할 수 있다):\n${lines}\n</최근 자발 발화>`
 }
 
 export async function sendToManager(
@@ -1382,6 +1983,10 @@ export async function sendToManager(
   currentAbort = new AbortController()
   const myTurn = ++turnSeq // 이 턴의 일련번호 — finally·강제종료가 '내 턴'일 때만 상태를 건드리게 가드
   if (!isRetry) stopped = false // 새 사용자 턴 — 직전 정지 latch 해제(이어가기/재시도 재귀는 latch 보존)
+  // 오버레이 인지 맥락 — 새 사용자 턴에서만 정확히 한 번 소모적으로 취해 빠른레인·본체 양쪽에 같은 문자열로 전달한다.
+  // 재시도·이어가기·재귀(isRetry/continueRound/transientAttempt/modelText)에선 취하지 않아 버퍼가 다음 턴까지 보존된다.
+  const overlayText =
+    !isRetry && continueRound === 0 && transientAttempt === 0 && !modelText ? takeOverlayContext() : ''
   // ②③ 빠른 대화 레인 — 새 사용자 턴이고(재시도·이어가기·재귀 아님) 첨부·대체본문 없고 설정 on이면
   // 도구 없는 경량 선응답을 먼저 시도한다. 답하면 여기서 종료, 행동/작업이면 아래 본체(무한세션)로 승격한다.
   // 전체를 가드로 감싼다 — 설정/DB 등 어떤 문제로든 throw하면 조용히 본체로 승격(busy 유지, 본체가 이어받음).
@@ -1404,7 +2009,7 @@ export async function sendToManager(
         // 스트림이 응답 없이 멈춰도 busy가 영구 고착되지 않게 한다(타임아웃=취소+에러 종료). finally로 타이머 정리.
         let fastTimer: ReturnType<typeof setTimeout> | undefined
         const verdict = await Promise.race([
-          tryFastChat(text, emit, fastConv, origin, currentAbort).finally(() => {
+          tryFastChat(text, emit, fastConv, origin, currentAbort, overlayText).finally(() => {
             if (fastTimer) clearTimeout(fastTimer)
           }),
           new Promise<'timeout'>((resolve) => {
@@ -1451,8 +2056,14 @@ export async function sendToManager(
   // 워치독 진전 추적 — 턴 시작·마지막 활동 시각·마지막 동작 설명. 무진전 자동 종료(아래 setInterval)와
   // 강제 종료 진단 줄(forceStopTurn의 '마지막 동작 · N초 경과')의 근거다.
   const turnStartedAt = Date.now()
+  // D15 되감기 — 이 턴(라운드)의 편집 체크포인트 그룹 id. 편집 diff 카드에 실려 '이 턴 편집 되돌리기'의 키가 된다.
+  const editTurnId = `t${turnStartedAt}`
   let lastActivityAt = Date.now()
   let lastActivity = '시작'
+  // ask_user(모듈 스코프 도구)가 응답 대기 중 워치독을 살려두게 이 턴의 갱신기를 등록. finally에서 해제.
+  bumpManagerActivity = () => {
+    lastActivityAt = Date.now()
+  }
   // relay를 먼저 정의 — 어느 단계(DB·스트림)에서 throw해도 종료 이벤트를 렌더러로 흘릴 수 있게.
   const relay = (ev: ChatEvent) => {
     if (abandoned) return // 정지로 버려진 턴 — 늦게 도착한 출력은 무시
@@ -1468,6 +2079,10 @@ export async function sendToManager(
     abandoned = true
     terminalSent = true
     busy = false
+    // 강제 종료 경로(워치독 등 stopManager를 안 거치는 경로)에서도 대기 중 질문을 비운다 — pending·waiter·타이머가
+    // 남으면 리로드 시 유령 카드가 되살아나고(B5 복원) 뒤늦은 응답이 abandoned된 턴을 재활성한다. stopManager는
+    // 이미 clearAll을 부르므로 여기 추가로 워치독 강제종료까지 커버(clearAll은 멱등).
+    questionBus.clearAll()
     // 사용자 가시 진단 — 왜·언제·어디서 멎었는지 채팅에 한 줄로 남긴다(addMessage로 영속 → 직후 result가
     // 렌더러 conversationMessages 재로드를 트리거해 이 tool 라인이 채팅에 노출됨). 로그가 아니라 채팅에 보인다.
     const elapsedSec = Math.round((Date.now() - turnStartedAt) / 1000)
@@ -1520,28 +2135,9 @@ export async function sendToManager(
       resume &&
       shouldCompact(getConversationContextTokens(conversationId), getSettings().contextCompactThreshold)
     ) {
-      const prevWorld = getConversationWorldState(conversationId)
-      const recent = listConversationDialogue(conversationId, 40) // user/assistant 원문만(도구 로그에 윈도 잠식 방지)
-      const ws = await summarizeWorldState(prevWorld, recent)
-      // ⚠ 요약 실패(null)면 세션을 끊지 않는다 — 최근 대화가 월드모델에 흡수되지 않은 채 절단하면
-      // 맥락이 소리 없이 유실된다(judge 티어가 local인데 llama-server 다운 등). 세션 유지 + 경고만 남기고,
-      // shouldCompact가 다음 턴에 자연 재시도한다. (리뷰 확정 결함 수정 2026-07-02)
-      if (ws) {
-        setConversationWorldState(conversationId, ws)
-        setConversationSdkSession(conversationId, '') // SDK 세션 끊기 → 새 세션 시작
-        resetConversationContextTokens(conversationId) // 점유 0 — 재귀 재진입 시 즉시 재압축 방지
-        resume = undefined
-        const compactNote = '🧠 컨텍스트 압축 — 누적 맥락을 월드모델로 요약하고 새 세션으로 이어감'
-        addMessage('manager', 'tool', compactNote, conversationId) // 영속 — 재로드 시에도 세션 경계 흔적 유지
-        relay({ kind: 'tool', text: compactNote })
-        // 단일 세션 화면 정리 — 압축 직후 최근 40개만 화면에 남긴다(이전은 숨김·DB 보존). world_state가 진짜 기억.
-        setManagerViewWindow(conversationId, 40)
-      } else {
-        relay({
-          kind: 'tool',
-          text: '🧠 컨텍스트 압축 실패 — 요약 모델이 응답하지 않아 세션을 유지한다(다음 턴 재시도). 판정 모델이 local이면 llama-server 상태를 확인해줘.',
-        })
-      }
+      const result = await performCompact(conversationId)
+      relay({ kind: 'tool', text: result.message })
+      if (result.ok) resume = undefined // SDK 세션 끊김 — 이번 턴은 새 세션으로 시작
     }
   } catch (e) {
     busy = false
@@ -1598,7 +2194,7 @@ export async function sendToManager(
   // 현재 화면 맥락 — 유저 감시가 돌고 있으면 사용자가 지금 PC에서 보고 있는 앱/창을 본체도 안다(민감 앱 제외).
   const fg = getForeground()
   const fgText = fg ? `\n[사용자의 현재 PC 화면: ${fg.app}${fg.title ? ` — "${fg.title}"` : ''}]` : ''
-  const fullText = `[현재 시각: ${nowAnchor} (UTC) | 출처: ${originLabel}] — 아래 현황은 이 시점 기준이다. 이미 완료된 작업을 다시 지시하지 마라.${fgText}\n\n<status-digest>\n${digest}\n</status-digest>${worldStateText}${startupText}${lessonsText}${skillsIdxText}\n\n${modelText ?? text}${textSuffix}${nudgeText}${suggestText}`
+  const fullText = `[현재 시각: ${nowAnchor} (UTC) | 출처: ${originLabel}] — 아래 현황은 이 시점 기준이다. 이미 완료된 작업을 다시 지시하지 마라.${fgText}\n\n<status-digest>\n${digest}\n</status-digest>${worldStateText}${startupText}${overlayText}${lessonsText}${skillsIdxText}\n\n${modelText ?? text}${textSuffix}${nudgeText}${suggestText}`
 
   // 이미지 파일 → SDKUserMessage content block. SDK(Anthropic)가 받는 media_type은 4종뿐.
   const imageAttachments = attachments.filter((a) => a.isImage)
@@ -1634,6 +2230,10 @@ export async function sendToManager(
   let lastOccupancy = 0 // 스트림 중 본 마지막 컨텍스트 점유(assistant usage) — max-turns throw 경로의 점유 보정용
   // 이번 라운드의 도구 사용 시그니처 — 자동 이어가기 정체 판정용(isManagerStalled). formatToolUse로 식별.
   const roundSigs = new Set<string>()
+  // A7 — 도구 실패 표시: tool_use.id → 요약 라인(formatToolUse) 매핑(뒤이은 user 메시지의 tool_result와 상관용),
+  // 이번 턴 실패 건수(성공은 침묵, 실패만 result 배지로 노출).
+  const toolLineById = new Map<string, string>()
+  let turnFailedTools = 0
   // 편집 가능 정체성(soul.md)·사용자 프로필(user.md, T5)이 있으면 systemPrompt에 1회 append
   // (temporal-anchor concat과 동형 seam). 무한세션이라 프로필 갱신은 세션 교체(압축) 후 반영.
   const soul = loadSoul()
@@ -1697,29 +2297,119 @@ export async function sendToManager(
           if (argText && blocksSecretPath(argText)) {
             return { behavior: 'deny', message: SECRET_DENY_MESSAGE }
           }
+          // 시스템/PC 파괴 명령 게이트(HANDOFF 2026-07-04) — Lain은 셸 전권이라(2026-06-19 승인)
+          // shutdown·format·레지스트리 삭제 같은 OS 파괴만은 승인 큐(PC+폰 버튼)로 막는다.
+          // bypass·자동 모드 예외 없음. 분류는 sysrisk.ts 순수함수(오탐 방지 단위테스트 필수).
+          if (toolName === 'Bash' || toolName === 'PowerShell') {
+            const cmd = String((input as { command?: unknown })?.command ?? '')
+            const sys = classifySystemDestructive(cmd)
+            if (sys) {
+              const approvalId = insertApproval('lain', 'system', cmd)
+              const waitNote = `⚠ 시스템 명령 승인 대기 [${sys}]: ${cmd.slice(0, 160)}`
+              addMessage('manager', 'tool', waitNote, conversationId)
+              relay({ kind: 'tool', text: waitNote })
+              hooks.refreshApprovals() // PC 승인함 + 텔레그램 버튼 즉시 푸시
+              notifyUser('lain — 시스템 명령 승인 필요', `[${sys}] ${cmd.slice(0, 120)}`)
+              // 승인 대기는 정상 블록 — 워치독(무진전 자동종료)이 턴을 죽이지 않게 keep-alive.
+              const keepAlive = setInterval(() => { lastActivityAt = Date.now() }, 15_000)
+              let res: { approved: boolean }
+              try {
+                res = await waitApproval(approvalId)
+              } finally {
+                clearInterval(keepAlive)
+              }
+              hooks.refreshApprovals()
+              const doneNote = `${res.approved ? '✅ 승인됨' : '❌ 거절됨'}: ${cmd.slice(0, 120)}`
+              addMessage('manager', 'tool', doneNote, conversationId)
+              relay({ kind: 'tool', text: doneNote })
+              if (!res.approved) {
+                return {
+                  behavior: 'deny',
+                  message: '사용자가 이 시스템 명령을 거절했다. 실행하지 말고 다른 방법을 제안해라.',
+                }
+              }
+            }
+          }
+          // PI2 — Edit/Write diff 카드는 게이트 '결정 이후'에만 emit한다. SDK가 tool_use 담은 assistant를
+          // canUseTool 실행 전에 방출하므로, assistant 처리부에서 만들면 '거부'해도 diff 카드가 이미 저장돼
+          // (거부 라인 + 전체 diff가 둘 다 남는 모순) — emit 책임을 여기로 옮겨 비거부 경로에서만 낸다.
+          // 시크릿 파일이면 buildEditDiff가 null → 카드 없이 blocksSecretFile deny로 흘러간다.
+          const emitEditDiff = (): void => {
+            // D15 — 편집 '실행 전' 원본 스냅샷. 이 함수의 호출 지점 = 비거부(allow) 경로와 정확히 일치하고
+            // canUseTool은 도구 실행 전에 돌므로 여기서 뜨는 스냅샷이 곧 pre-edit 상태다(시크릿은 rewind가 재차 거름).
+            checkpointEdit(editTurnId, conversationId ?? '', toolName, input)
+            const diff = buildEditDiff(toolName, input)
+            if (!diff) return
+            const line = encodeEditDiffLine({ ...diff, turnId: editTurnId })
+            addMessage('manager', 'tool', line, conversationId)
+            relay({ kind: 'tool', text: line })
+          }
+          // A6 — default 권한모드일 때만 Edit/Write 편집 승인 카드(ExitPlanMode와 동형). 레인은 등록된
+          // 모든 레포를 직접 수정하는데(격리 없음) 기본은 자동 allow라 뭐가 바뀌는지 볼 수단이 없었다.
+          // default가 아니면(acceptEdits/plan/bypass) 게이트 없이 아래 최종 allow로 떨어지며 거기서 diff emit.
+          if ((toolName === 'Edit' || toolName === 'Write') && getSettings().managerPermissionMode === 'default') {
+            const diff = buildEditDiff(toolName, input)
+            // 시크릿 파일이면 diff가 없다(buildEditDiff가 null) — 이 요청은 뒤이어 blocksSecretFile이 어차피
+            // deny하므로 승인 카드 없이 통과시켜 아래 시크릿 체크로 넘긴다(순서를 바꾸지 않음, 이중 승인 방지).
+            if (diff) {
+              const conv = currentManagerConv ?? ensureActiveConversation('manager')
+              const qid = `edit${++questionSeq}`
+              // B5 — 편집 승인 카드도 PC + main 보관 + 텔레그램 미러로 크로스서피스. 무응답 30분이면 '(응답 없음)'→거부 취급.
+              // 승인 대기는 정상 블록 — 워치독(무진전 자동종료)이 느린 사용자 응답 중 턴을 죽이지 않게 keep-alive.
+              const editKeepAlive = setInterval(() => { lastActivityAt = Date.now() }, 15_000)
+              let answer: string[]
+              try {
+                answer = await emitQuestion({
+                  questionId: qid,
+                  question: `✎ 이 편집을 적용할까?\n\n${renderEditDiffText(diff)}`,
+                  options: ['승인', '거부'],
+                  multi: false,
+                  conversationId: conv,
+                })
+              } finally {
+                clearInterval(editKeepAlive)
+              }
+              const approved = answer[0] === '승인'
+              resolveQuestionMirror(qid, conv, approved ? '승인' : '거부')
+              if (!approved) {
+                // 거부 — '거부' 라인만 남긴다(diff 카드는 emit하지 않아 모순 제거).
+                addMessage('manager', 'tool', `✎ 편집 ❌ 거부: ${diff.filePath}`, conv)
+                relay({ kind: 'tool', text: `✎ 편집 ❌ 거부: ${diff.filePath}` })
+                return {
+                  behavior: 'deny',
+                  message: '사용자가 이 편집을 거부했다. 다른 접근을 제안하거나 사용자에게 의견을 물어라.',
+                }
+              }
+              // 승인 — diff 카드를 지금(결정 이후) emit하고 아래 최종 allow로 떨어진다.
+              emitEditDiff()
+              return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
+            }
+          }
+          // 비-default 모드(acceptEdits/plan/bypass)의 Edit/Write — 게이트는 없지만 diff 카드는 낸다(표시 회귀 방지).
+          if (toolName === 'Edit' || toolName === 'Write') emitEditDiff()
           // plan 모드 — 모델이 계획을 제시(ExitPlanMode)하면 계획 전문을 보여주고 사용자 승인까지 블록한다.
           // allow하면 SDK가 같은 스트림에서 곧바로 실행으로 전환(실측 2026-06-28). deny면 계획을 수정한다.
           if (toolName === 'ExitPlanMode') {
             const plan = String((input as { plan?: unknown })?.plan ?? '(계획 본문 없음)')
             const conv = currentManagerConv ?? ensureActiveConversation('manager')
             const qid = `plan${++questionSeq}`
-            rendererMirror?.({
-              kind: 'question',
-              questionId: qid,
-              question: `📋 이 계획대로 실행할까?\n\n${plan}`,
-              options: ['실행', '거부'],
-              multi: false,
-              conversationId: conv,
-            })
-            const answer = await waitForUserAnswer(qid)
+            // 계획 승인 대기도 keep-alive로 워치독 force-kill 방어(편집 승인과 동일). B5 — 크로스서피스 미러·타임아웃 공용.
+            const planKeepAlive = setInterval(() => { lastActivityAt = Date.now() }, 15_000)
+            let answer: string[]
+            try {
+              answer = await emitQuestion({
+                questionId: qid,
+                question: `📋 이 계획대로 실행할까?\n\n${plan}`,
+                options: ['실행', '거부'],
+                multi: false,
+                conversationId: conv,
+              })
+            } finally {
+              clearInterval(planKeepAlive)
+            }
             const approved = answer[0] === '실행'
             addMessage('manager', 'tool', `📋 계획 ${approved ? '✅ 실행' : '❌ 거부'}\n\n${plan.slice(0, 2000)}`, conv)
-            rendererMirror?.({
-              kind: 'questionResolved',
-              questionId: qid,
-              answerText: approved ? '실행' : '거부',
-              conversationId: conv,
-            })
+            resolveQuestionMirror(qid, conv, approved ? '실행' : '거부')
             if (approved) return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
             return { behavior: 'deny', message: '사용자가 계획을 거부했다. 계획을 수정하거나 다른 접근을 제안해라.' }
           }
@@ -1736,6 +2426,30 @@ export async function sendToManager(
       if (msg.type === 'system' && msg.subtype === 'init') {
         lastActivity = '세션 시작'
         setConversationSdkSession(conversationId, msg.session_id)
+      } else if (msg.type === 'system') {
+        // A18 — 서브에이전트/백그라운드 task_* 가시화(worker.ts B2와 동일 미러). 레인이 Agent 도구나
+        // 백그라운드 작업을 띄워도 여태 채팅에 아무것도 안 뜨던 문제 — '⑂' tool 라인으로 relay하면
+        // T1이 만든 도구 라인 라이브 경로(managerLiveTool)에 자연히 얹혀 라이브로도 보인다.
+        // started/notification은 영속(addMessage, worker.ts log와 동일 — 대화 기록에 남길 가치 있음),
+        // 고빈도 progress/updated는 휘발 relay만(영속 시 messages 테이블 폭주 — worker.ts와 동일 정책).
+        const m = msg as any
+        if (m.subtype === 'task_started') {
+          if (!m.skip_transcript) {
+            const line = `⑂ 시작 [${m.subagent_type ?? m.task_type ?? 'task'}] ${m.description ?? ''}`.trim()
+            lastActivity = line
+            addMessage('manager', 'tool', line, conversationId)
+            relay({ kind: 'tool', text: line })
+          }
+        } else if (m.subtype === 'task_notification') {
+          const line = `⑂ ${m.status ?? '완료'} ${m.summary ?? ''}`.trim()
+          lastActivity = line
+          addMessage('manager', 'tool', line, conversationId)
+          relay({ kind: 'tool', text: line })
+        } else if (m.subtype === 'task_progress' || m.subtype === 'task_updated') {
+          const line = `⑂ ${m.description ?? m.patch?.status ?? '진행'}`.trim()
+          lastActivity = line
+          relay({ kind: 'tool', text: line })
+        }
       } else if (msg.type === 'stream_event') {
         // ① 스트리밍 — 최상위 레인 텍스트 증분만 라이브로 흘린다(서브에이전트 parent_tool_use_id≠null 제외).
         // thinking_delta 등은 무시하고 text_delta만. 렌더러가 라이브 버블에 이어붙이고 최종 assistant로 확정한다.
@@ -1750,13 +2464,34 @@ export async function sendToManager(
         // 도구 사용 가시화 — workerchat과 동일하게 tool_use를 회색 라인으로 relay(같은 채널).
         for (const b of blocks) {
           if ((b as any)?.type === 'tool_use') {
-            const line = formatToolUse(b)
-            lastActivity = `도구 ${line}` // 워치독 진단 — 어느 도구에서 멎었는지 가시화
-            roundSigs.add(line) // 진전 판정용 시그니처 수집(isManagerStalled)
-            // 검증 넛지(T7) — 코드 수정/검증 실행을 결정론 감지(판단·주입은 턴 종료 후).
             const tu = b as any
+            // A4 — TodoWrite는 formatToolUse의 default(도구명만) 대신 접이식 진행 칩으로 인코딩해 저장.
+            // ChatPanel(MessageBody)이 todo 인코딩을 감지해 위젯으로 렌더 — role은 기존과 동일 'tool'이라
+            // 다른 처리(검색·복사 등)는 그대로 적용된다.
+            const todos = tu.name === 'TodoWrite' ? parseTodoWriteInput(tu.input) : null
+            // PI2 — Edit/Write diff 카드는 여기서 만들지 않는다. SDK가 이 assistant 메시지를 canUseTool
+            // 실행 전에 방출하므로, 여기서 emit하면 '거부'해도 카드가 이미 저장되는 모순이 생긴다. diff 카드
+            // emit은 canUseTool의 게이트 결정 이후(비거부 경로)로 옮겼다. 여기선 turn 추적(아래 bookkeeping)만.
+            const isEditDiff = !todos && buildEditDiff(tu.name, tu.input) !== null
+            let display: string, raw: string
+            if (todos) {
+              const p = todoProgress(todos)
+              display = `TodoWrite ${p.done}/${p.total}`
+              raw = ''
+            } else {
+              ;({ display, raw } = formatToolUse(b))
+            }
+            lastActivity = `도구 ${display}` // 워치독 진단 — 어느 도구에서 멎었는지 가시화
+            roundSigs.add(display) // 진전 판정용 시그니처 수집(isManagerStalled) — 축약 기준(원문 섞이면 시그니처 흔들림)
+            // 검증 넛지(T7) — 코드 수정/검증 실행을 결정론 감지(판단·주입은 턴 종료 후).
             if (isCodeEdit(tu.name, tu.input)) turnCodeEdit = true
             if (isVerifyRun(tu.name, tu.input)) turnVerifyRun = true
+            if (tu.id) toolLineById.set(tu.id, display) // A7 — 이후 tool_result(is_error) 상관용(축약 기준)
+            // Edit/Write diff 카드는 canUseTool이 emit하므로 여기선 라인을 내지 않는다(중복 방지).
+            if (isEditDiff) continue
+            // A17 — 원문(잘리기 전 명령·경로 등)을 표시 축약 뒤에 인코딩해 함께 영속(스키마 변경 없음).
+            // todo는 별도 인코딩이 우선 — encodeToolLine과 태그 형식이 달라 겹치지 않는다.
+            const line = todos ? encodeTodoLine(todos) : encodeToolLine(display, raw)
             addMessage('manager', 'tool', line, conversationId)
             relay({ kind: 'tool', text: line })
           }
@@ -1774,17 +2509,41 @@ export async function sendToManager(
         // 점유 추적 — result가 안 와도(throw 경로) 다음 턴 압축 게이트가 잠들지 않게 마지막 점유를 보존.
         const occ = contextOccupancyTokens(msg.message)
         if (occ > 0) lastOccupancy = occ
+      } else if (msg.type === 'user') {
+        // A7 — tool_result(is_error) 파싱. 성공은 침묵(노이즈 방지), 실패만 해당 도구 라인 뒤에
+        // '→ ✗ 요약' 한 줄로 영속+relay하고 이번 턴 실패 카운트를 올린다(worker.ts extractToolResults 재사용).
+        for (const { toolUseId, result, isError } of extractToolResults(msg)) {
+          if (!isError) continue
+          turnFailedTools++
+          const line = toolLineById.get(toolUseId) ?? '도구'
+          const note = `→ ✗ ${line}: ${summarizeToolError(result)}`
+          addMessage('manager', 'tool', note, conversationId)
+          relay({ kind: 'tool', text: note })
+        }
       } else if (msg.type === 'result') {
         if ('session_id' in msg && msg.session_id)
           setConversationSdkSession(conversationId, msg.session_id)
         if ('subtype' in msg && msg.subtype === 'error_max_turns') hitMaxTurns = true
         // 무한세션 — 이번 턴 컨텍스트 점유(input+캐시, output 제외) 기록 → 다음 턴 진입에서 임계 판정.
-        setConversationContextTokens(conversationId, contextOccupancyTokens(msg))
+        const resultOccupancy = contextOccupancyTokens(msg)
+        setConversationContextTokens(conversationId, resultOccupancy)
+        // A7 — 실패 배지도 DB에 영속(tool 행)해 둔다. relay의 failedTools는 렌더러 낙관 표시용이고,
+        // 이 addMessage가 result 후 DB 재로드에서도 배지가 사라지지 않게 하는 실제 근거다.
+        if (turnFailedTools > 0) {
+          addMessage('manager', 'tool', `⚠ 이번 턴 도구 실패 ${turnFailedTools}건`, conversationId)
+        }
+        // A5 — 컨텍스트 게이지 배선: 조회 IPC 대신 이번 result 이벤트에 편승(추가 왕복 없음). threshold<=0
+        // (압축 비활성)이면 게이지가 의미 없으므로 둘 다 생략 — 렌더러가 undefined면 게이지를 숨긴다.
+        const gaugeThreshold = getSettings().contextCompactThreshold
         relay({
           kind: 'result',
           costUsd: 'total_cost_usd' in msg ? (msg.total_cost_usd ?? null) : null,
           tokens: sumUsageTokens(msg),
           sessionId: 'session_id' in msg ? (msg.session_id ?? null) : null,
+          failedTools: turnFailedTools || undefined, // 0건이면 배지 미표시(생략)
+          ...(gaugeThreshold > 0
+            ? { contextTokens: resultOccupancy, contextThreshold: gaugeThreshold }
+            : {}),
         })
       }
     }
@@ -1853,6 +2612,7 @@ export async function sendToManager(
       busy = false
       currentAbort = null
       forceStopTurn = null
+      bumpManagerActivity = null
     }
   }
   // 정지됐으면 어떤 이어가기·재시도도 하지 않는다 — 플래그를 내려 아래 재귀를 모두 건너뛰고

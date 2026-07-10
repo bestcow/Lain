@@ -2,6 +2,7 @@
 // 이 패널만 신규. 만기 루틴의 prompt를 scheduler가 Lain에게 보낸다(routinesEnabled=on일 때만).
 import { useEffect, useState } from 'react'
 import type { Routine, Project } from '../../shared/types'
+import { Icon } from './icons'
 
 type Kind = 'daily' | 'hourly' | 'weekly' | 'interval'
 const pad = (n: number) => String(n).padStart(2, '0')
@@ -80,7 +81,7 @@ export function RoutinesPanel({ onClose }: { onClose: () => void }) {
       <div className="drawer-head">
         <span className="drawer-title">[ wired://routines — 반복 실행 §loop ]</span>
         <span className="dim">{all.length}개</span>
-        <button onClick={onClose}>✕</button>
+        <button onClick={onClose}><Icon name="x-circle" size={18} /></button>
       </div>
 
       {!routines ? (
@@ -115,7 +116,7 @@ export function RoutinesPanel({ onClose }: { onClose: () => void }) {
                   title="삭제"
                   onClick={() => window.lain.deleteRoutine(r.id)}
                 >
-                  🗑
+                  <Icon name="trash" size={14} />
                 </button>
               </div>
             </div>

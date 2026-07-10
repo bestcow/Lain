@@ -66,6 +66,12 @@
   font-display: swap;
 }
 
+/* 내장 아이콘(reicon, components/icons.tsx) 공통 정렬 — 텍스트 옆 인라인 배치 시 베이스라인 보정. */
+.ri {
+  vertical-align: -3px;
+  flex-shrink: 0;
+}
+
 :root {
   /* primitive — 보라 네온 사이버펑크 (과채도 아닌 차분한 톤)
      배경을 한 단계 더 짙은 보라로(거의-검정 → 보랏빛이 또렷한 어둠). 텍스트 대비는 유지. */
@@ -420,6 +426,131 @@ body {
   flex: none;
 }
 
+/* ── C4 토큰 사용량 팝오버 — 헤더 토큰 클릭 → 최근 14일 미니 바차트 + 프로젝트별 상위 ── */
+.usage-anchor {
+  position: static; /* .bar-stat이 overflow:hidden이라 팝오버는 fixed로(클리핑 회피) */
+  flex: none;
+}
+.stat-usage-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--font);
+  font-size: inherit;
+  padding: 1px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+.stat-usage-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.usage-pop-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 59;
+  -webkit-app-region: no-drag;
+}
+.usage-pop {
+  position: fixed;
+  top: 44px;
+  left: 12px;
+  z-index: 60;
+  width: 340px;
+  max-width: calc(100vw - 24px);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+.usage-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.usage-pop-title {
+  font-size: 12px;
+  color: var(--text);
+  letter-spacing: 0.5px;
+}
+.usage-pop-close {
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.usage-pop-today {
+  font-size: 11px;
+}
+.usage-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 90px;
+}
+.usage-bar-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+}
+.usage-bar-track {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+.usage-bar-fill {
+  width: 100%;
+  min-height: 1px;
+  background: var(--signal);
+  opacity: 0.55;
+}
+.usage-bar-today {
+  opacity: 1;
+  background: var(--presence);
+}
+.usage-bar-label {
+  font-size: 8px;
+  white-space: nowrap;
+  transform: scale(0.9);
+}
+.usage-pop-projects {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.usage-pop-subhead {
+  font-size: 10px;
+  letter-spacing: 0.5px;
+}
+.usage-proj-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+}
+.usage-proj-name {
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-proj-tok {
+  flex: none;
+  font-size: 10px;
+}
+
 /* ── 본문 — 세로 2분할: 위(top-zone: Navi 그리드/워크스페이스) · divider · 아래(lain-zone: 레인 고정) ── */
 .body {
   flex: 1;
@@ -578,6 +709,7 @@ body {
 }
 /* 왼쪽 = 레인 캐릭터 (full height, 세로 중앙) + 상시 현재 상태. 캐릭터가 곧 lain 본인. */
 .lain-char {
+  position: relative; /* quips 말풍선(.lain-bubble) 절대배치 기준 */
   flex: 0 0 auto;
   align-self: stretch;
   width: 250px;
@@ -587,6 +719,53 @@ body {
   justify-content: center;
   gap: 8px;
   min-height: 0;
+}
+/* 상호작용 대사(quips) 말풍선 — 캐릭터 머리 위, 클릭 통과. 표시시간은 인라인 animation-duration(글자수 비례). */
+.lain-bubble {
+  position: absolute;
+  top: 6px;
+  left: 10px;
+  right: 10px;
+  z-index: 5;
+  pointer-events: none;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  color: var(--signal-bright);
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  animation-name: lain-bubble-life;
+  animation-fill-mode: both; /* 종료 후 opacity 0 유지(깜빡임 방지) */
+}
+.lain-bubble::after {
+  /* 꼬리 — 스프라이트(아래쪽)를 향한다 */
+  content: '';
+  position: absolute;
+  left: 26px;
+  top: 100%;
+  border: 6px solid transparent;
+  border-top-color: var(--border);
+}
+@keyframes lain-bubble-life {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  6% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  88% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
 }
 .lain-char .sprite-manager {
   flex: 0 1 auto;
@@ -838,6 +1017,13 @@ body {
 .confirm-note code {
   color: var(--text-2);
   word-break: break-all;
+}
+.confirm-diffstat {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
 }
 .confirm-actions {
   display: flex;
@@ -1133,6 +1319,15 @@ body {
 .msg-lain .msg-prefix { color: var(--presence); }
 .msg-tool .msg-body { color: var(--st-error); font-size: 11px; }
 
+/* A2 — 매니저 busy 표시줄의 라이브 도구 활동(임시) + 경과 시간. sys> tool 라인보다 옅게(진행중임을 시사). */
+.msg-live-tool {
+  color: var(--text-3);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Navi 대화창(navi-log)만 3색 발신자 구분 — 메인 Lain 채팅 색은 건드리지 않게 스코핑.
    user=청록(사용자), lain=마젠타(레인), navi=앰버(내비). 색만 prefix에.
    lain은 --presence(마젠타, 테마 불변)를 쓴다 — --signal은 .theme-amber에서 앰버로 덮여 navi(--hum=앰버)와
@@ -1185,6 +1380,29 @@ body {
   color: var(--text-2);
   line-height: 1.5;
 }
+/* A4 — TodoWrite 진행 체크리스트(TaskDrawer 상단) */
+.task-todos {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--presence);
+  padding: 6px 9px;
+  font-size: 11px;
+}
+.task-todos-head {
+  color: var(--presence);
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+.task-todo-item {
+  display: flex;
+  gap: 6px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.task-todo-icon { flex-shrink: 0; }
+.task-todo-completed { color: var(--st-done); text-decoration: line-through; opacity: 0.7; }
+.task-todo-in_progress { color: var(--presence); }
+.task-todo-pending { color: var(--text-2); }
 .task-mode-badge {
   font-size: 10px;
   padding: 1px 5px;
@@ -1199,6 +1417,9 @@ body {
 .st-task-review { color: var(--presence); }
 .st-task-error { color: var(--st-error); }
 .st-task-done { color: var(--st-done); }
+.st-task-ready { color: var(--text-3); }
+.st-task-queued { color: var(--st-idle); } /* D1 — 대기 큐(슬롯 대기) */
+.st-task-cancelled { color: var(--text-3); }
 
 .drawer-title {
   flex: 1;
@@ -1289,9 +1510,45 @@ body {
 
 .review-actions { display: flex; gap: 8px; }
 
+/* D13 — 크로스레포 그룹 결재 패널 */
+.group-review {
+  border: 1px dashed var(--presence);
+  border-radius: 4px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.group-review-head {
+  font-size: 12px;
+}
+.group-review-children {
+  margin: 0;
+  padding-left: 4px;
+  list-style: none;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.group-review-children .ok {
+  color: var(--signal-bright);
+}
+.group-review .review-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.group-review-msg {
+  white-space: pre-wrap;
+  font-size: 11px;
+  margin: 0;
+  color: var(--hum);
+}
+
 .drawer-error { font-size: 11px; white-space: pre-wrap; }
 
 .drawer-log {
+  position: relative;
   flex: 1;
   min-height: 60px;
   overflow-y: auto;
@@ -1305,6 +1562,10 @@ body {
 .ev-tool .ev-text { color: var(--text-2); }
 .ev-status .ev-text { color: var(--signal); }
 .ev-error .ev-text { color: var(--st-error); }
+/* D12 — codex 명령 실행 감사: 승인 큐 없는 codex의 사후 관측창이라 tool보다 또렷이(감사 톤). 실패(exit!=0)는 경고색. */
+.ev-exec .ev-prefix { color: var(--presence); }
+.ev-exec .ev-text { color: var(--text-2); font-family: var(--mono, monospace); }
+.ev-exec-fail .ev-prefix, .ev-exec-fail .ev-text { color: var(--st-error); }
 .ev-text { white-space: pre-wrap; word-break: break-word; }
 /* 대화 트랜스크립트 화자 귀속 — Navi=바이올렛 / Lain=마젠타 / 나(인터럽트)=앰버. 발화는 본문색을 또렷하게. */
 .ev-sp-worker .ev-prefix { color: var(--signal); }
@@ -1353,6 +1614,22 @@ body {
 .inbox-panel {
   max-height: 52vh; /* 메시지 전체 표시용 여유 — 넘치면 내부 스크롤 */
 }
+/* B10 — 인박스 헤더 아래 키보드 힌트 한 줄 */
+.inbox-hint {
+  font-size: 11px;
+  padding: 2px 2px 6px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.inbox-hint kbd {
+  font-family: var(--font);
+  font-size: 10px;
+  color: var(--signal-bright);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  padding: 0 5px;
+}
 .inbox-list {
   display: flex;
   flex-direction: column;
@@ -1380,6 +1657,16 @@ body {
   border-radius: 3px;
   padding: 0 4px;
   font-size: 10px;
+}
+/* C5 — 대기 시간 배지. 임계(10분) 초과 시 강조색으로 눈에 띄게. */
+.ir-wait {
+  margin-left: 6px;
+  color: var(--text-3);
+  font-size: 10px;
+}
+.ir-wait-over {
+  color: var(--glitch);
+  font-weight: 600;
 }
 .ir-cmd {
   display: block;
@@ -1818,13 +2105,20 @@ body {
 .imb-watch.imb-on {
   color: var(--signal-bright);
 }
+/* A5 — 컨텍스트 게이지. conic-gradient 채움 링(인라인 style로 %배선), 배경은 미채움 영역 색. */
 .imb-orb {
   flex: none;
   width: 12px;
   height: 12px;
   border-radius: 50%;
   border: 1px solid var(--text-3);
+  background-color: transparent;
   cursor: pointer;
+  transition: background 0.2s;
+}
+.imb-orb-warn {
+  border-color: var(--st-dirty); /* 임계 접근(80%+) 경고색 — 기존 dirty/경고 팔레트 재사용 */
+  --imb-orb-fill: var(--st-dirty);
 }
 
 .prompt-prefix {
@@ -1987,9 +2281,43 @@ body {
   color: var(--signal);
   opacity: 1;
 }
+/* B7-3 — 재생 중 표시(점멸). 클릭하면 정지(App.tsx voicePlaying 분기). */
+.voiceout-btn.playing {
+  color: var(--signal);
+  opacity: 1;
+  animation: voiceout-pulse 1s ease-in-out infinite;
+}
 @keyframes mic-pulse {
   50% {
     background: rgba(255, 90, 130, 0.18);
+  }
+}
+@keyframes voiceout-pulse {
+  50% {
+    background: rgba(0, 255, 140, 0.18);
+  }
+}
+
+/* B6/B7-2 — 음성 실패·폴백 힌트: 입력창 위 잠깐 뜨는 배지(자동 소멸) */
+.voice-hint {
+  align-self: flex-start;
+  margin-bottom: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: var(--signal);
+  border: 1px solid var(--signal-soft);
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.3);
+  animation: voice-hint-in 0.15s ease-out;
+}
+@keyframes voice-hint-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
@@ -2080,6 +2408,41 @@ button:disabled {
   padding: 1px 0;
   white-space: pre-wrap;
 }
+/* C10 — 벤치 런 이력 추이(시간순, 최신이 위) */
+.bench-trend {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.bench-trend-label {
+  font-size: 10.5px;
+  color: var(--text-3);
+  margin-bottom: 4px;
+}
+.bench-trend-list {
+  max-height: 140px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bench-trend-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  padding: 2px 0;
+}
+.bench-trend-run {
+  color: var(--text-2);
+}
+.bench-trend-cond {
+  color: var(--signal-soft);
+}
+.bench-trend-warn {
+  color: var(--glitch);
+  cursor: help;
+}
 
 /* ── 학습 패널 (§22 자기개선) ── */
 .lessons-panel {
@@ -2090,6 +2453,451 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+/* C7 — 정리 후보(주입>0·인용0 '죽은 교훈') 뱃지 + 병합 계보(흡수된 원본) 목록 */
+.lesson-status-cleanup {
+  color: var(--st-dirty);
+  border: 1px solid var(--st-dirty);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.lesson-detail-cleanup {
+  margin-left: 6px;
+  font-size: 10px;
+}
+.lesson-absorbed {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.lesson-absorbed-head {
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+.lesson-absorbed-list {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.lesson-absorbed-item {
+  font-size: 11px;
+  color: var(--text-2);
+}
+.lesson-absorbed-date {
+  font-size: 10px;
+}
+
+/* ── C3 작업 이력(HISTORY) 패널 ── */
+.history-panel {
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.history-list {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.history-row {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  padding: 5px 2px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.history-row:hover {
+  background: var(--surface-2, rgba(255, 255, 255, 0.03));
+}
+.history-state {
+  flex: none;
+  height: fit-content;
+  min-width: 52px;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  letter-spacing: 0.5px;
+}
+.history-body {
+  min-width: 0;
+  flex: 1;
+}
+.history-title {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-proj {
+  color: var(--signal);
+}
+.history-meta {
+  font-size: 10px;
+  margin-top: 2px;
+}
+
+/* ── C6 전역 활동 피드(ACTIVITY) 패널 ── */
+.activity-panel {
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.activity-list {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.activity-row {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  padding: 5px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.activity-src {
+  flex: none;
+  height: fit-content;
+  min-width: 42px;
+  text-align: center;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  letter-spacing: 0.5px;
+}
+.activity-src-cc {
+  color: var(--phosphor);
+}
+.activity-src-task {
+  color: var(--signal);
+}
+.activity-body {
+  min-width: 0;
+  flex: 1;
+}
+.activity-label {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-proj {
+  color: var(--signal);
+}
+.activity-meta {
+  font-size: 10px;
+  margin-top: 2px;
+}
+
+/* ── 플래너 패널 — 월/주/일 캘린더 + 체크리스트 사이드바 ── */
+.planner-panel {
+  max-height: 82vh;
+  min-height: 60vh;
+}
+.planner-viewsw {
+  display: flex;
+  gap: 2px;
+}
+.planner-tagfilter {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+.planner-tag-chip {
+  border-width: 1px;
+}
+.planner-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 0;
+}
+.planner-side-left {
+  flex-direction: row;
+}
+.planner-side-right {
+  flex-direction: row;
+}
+.planner-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+/* 월 그리드 — 7열, 42셀 */
+.planner-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  grid-auto-rows: minmax(64px, 1fr);
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+}
+[data-density='compact'] .planner-grid {
+  grid-auto-rows: minmax(44px, 1fr);
+}
+.planner-dow {
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-3);
+  padding: 3px 0;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.planner-cell {
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 3px 4px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  overflow: hidden;
+}
+.planner-cell:hover {
+  background: var(--surface-2);
+}
+.planner-cell-outside {
+  color: var(--text-3);
+  background: var(--surface);
+  opacity: 0.55;
+}
+.planner-cell-today .planner-cell-date {
+  color: var(--signal-bright);
+  font-weight: 700;
+}
+.planner-cell-date {
+  font-size: 11px;
+  color: var(--text-2);
+}
+.planner-cell-evs {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow: hidden;
+}
+
+.planner-ev {
+  font-size: 10px;
+  padding: 1px 4px;
+  border-left: 3px solid var(--signal);
+  background: var(--surface-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.planner-ev-todo {
+  border-left-style: dashed;
+}
+.planner-ev-done {
+  opacity: 0.5;
+  text-decoration: line-through;
+}
+.planner-ev-routine {
+  border-left-color: var(--st-dirty);
+  color: var(--st-dirty);
+  cursor: default;
+}
+.planner-ev-task {
+  border-left-color: var(--st-working);
+  color: var(--st-working);
+  cursor: default;
+}
+
+/* 주/일 뷰 — 시간축 */
+.planner-timeline-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.planner-timeline-head,
+.planner-timeline-allday {
+  display: grid;
+  grid-template-columns: 56px repeat(var(--planner-cols, 7), 1fr);
+  border-bottom: 1px solid var(--border);
+}
+.planner-timeline-gutter {
+  font-size: 10px;
+  padding: 3px 4px;
+}
+.planner-timeline-daylabel {
+  text-align: center;
+  font-size: 11px;
+  padding: 4px 0;
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+}
+.planner-timeline-alldaycell {
+  border-left: 1px solid var(--border);
+  min-height: 20px;
+  padding: 1px 3px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.planner-timeline-body {
+  display: grid;
+  grid-template-columns: 56px repeat(var(--planner-cols, 7), 1fr);
+  flex: 1;
+  overflow-y: auto;
+  position: relative;
+}
+.planner-timeline-gutter-col {
+  display: flex;
+  flex-direction: column;
+}
+.planner-timeline-hour {
+  height: 32px;
+  font-size: 10px;
+  color: var(--text-3);
+  border-top: 1px solid var(--border);
+  padding: 1px 4px;
+}
+.planner-timeline-daycol {
+  position: relative;
+  border-left: 1px solid var(--border);
+}
+.planner-timeline-slot {
+  height: 32px;
+  border-top: 1px solid var(--border);
+}
+.planner-ev-timed {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  border-left: 3px solid var(--signal);
+  background: var(--surface-2);
+  font-size: 10px;
+  padding: 1px 3px;
+  overflow: hidden;
+}
+
+/* 사이드바 */
+.planner-side {
+  flex: none;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+}
+.planner-side-left .planner-side {
+  border-left: none;
+  border-right: 1px solid var(--border);
+}
+.planner-side-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+}
+.planner-side-handle-left {
+  left: -2px;
+}
+.planner-side-handle-right {
+  right: -2px;
+}
+.planner-side-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+}
+.planner-section {
+  margin-bottom: 6px;
+}
+.planner-section-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-2);
+  padding: 3px 0;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.planner-todo-row {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  font-size: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.planner-todo-row input[type='checkbox'] {
+  margin-top: 2px;
+  accent-color: var(--signal);
+}
+.planner-todo-body {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+.planner-todo-done .planner-todo-title {
+  text-decoration: line-through;
+  opacity: 0.5;
+}
+.planner-stale-badge {
+  color: var(--st-dirty);
+}
+.planner-todo-due {
+  font-size: 10px;
+}
+.planner-todo-note {
+  font-size: 10px;
+  word-break: break-word;
+}
+.planner-todo-note a {
+  color: var(--signal);
+}
+.planner-todo-note a:hover {
+  color: var(--signal-bright);
+}
+.planner-side-add {
+  margin: 6px 8px;
+}
+
+/* 편집 폼(모달) */
+.planner-edit-form {
+  width: 480px;
+  max-width: 92vw;
+}
+.planner-edit-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+.planner-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.planner-edit-title {
+  flex: 1;
+  min-width: 120px;
+}
+.planner-edit-newtag {
+  width: 100px;
+}
+.planner-edit-note {
+  min-height: 60px;
+  resize: vertical;
+  font-family: inherit;
+  width: 100%;
+  box-sizing: border-box;
+}
+.planner-edit-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 /* B5 loop-mode — 루틴 패널 */
@@ -2241,6 +3049,25 @@ button:disabled {
   accent-color: var(--signal);
 }
 
+/* 말수 슬라이더 — 좌'묵언'/우'수다쟁이' 라벨을 슬라이더 양끝에 붙인다(Ambient Quips). */
+.chattiness-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.chattiness-ctl input[type='range'] {
+  width: 130px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  accent-color: var(--signal);
+}
+.chattiness-ctl .dim {
+  font-size: 11px;
+  flex: none;
+}
+
 .settings-hint {
   font-size: 11px;
 }
@@ -2255,6 +3082,37 @@ button:disabled {
   margin-top: 8px;
   color: var(--text-2);
   font-weight: 600;
+}
+
+/* B16 — PrefsModal '── 섹션 헤더' 반복 인라인 스타일 치환. 테마 토큰(--border)이라 amber/mono에서도 정합. */
+.settings-section-divider {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+/* B11 — 설정 검색 입력(modal-head). settings-row input의 90px 폭 규칙에 눌리지 않게 명시. */
+.prefs-search {
+  flex: 1;
+  max-width: 300px;
+  margin: 0 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 12px;
+  padding: 5px 9px;
+  outline: none;
+}
+.prefs-search:focus {
+  border-color: var(--border-strong);
+}
+/* 검색 매치 하이라이트 — 매치된 설정 행에 좌측 신호선 + 은은한 배경. */
+.settings-row.prefs-hit {
+  background: rgba(177, 140, 240, 0.1);
+  box-shadow: inset 2px 0 0 var(--signal);
+  border-radius: 3px;
 }
 
 /* 텔레그램 필드 — 입력 + 저장 버튼 + 옆에 안내(howto) */
@@ -2467,6 +3325,9 @@ button:disabled {
   color: var(--signal-bright);
   margin-bottom: 8px;
   font-size: 13px;
+  /* A6 — 편집 승인 카드(diff)·ExitPlanMode 계획 전문처럼 여러 줄 텍스트가 실릴 수 있어 줄바꿈 보존. */
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .cq-opts {
@@ -2662,6 +3523,94 @@ button:disabled {
   color: var(--text-3);
   padding: 16px;
   text-align: center;
+}
+/* B10 — 팔레트 항목 우측 메타(힌트 + 단축키 뱃지) */
+.cmdk-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.cmdk-hotkey {
+  font-family: var(--font);
+  font-size: 10px;
+  color: var(--text-2);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+/* ── B10 단축키 도움말 오버레이 (modal-backdrop 위) ── */
+.shortcuts-window {
+  width: 560px;
+  max-width: 86vw;
+  max-height: 80vh;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+.shortcuts-head {
+  display: flex;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.shortcuts-title {
+  flex: 1;
+  color: var(--signal);
+  letter-spacing: 1px;
+  font-size: 13px;
+}
+.shortcuts-body {
+  overflow-y: auto;
+  padding: 8px 14px;
+}
+.shortcuts-group {
+  margin: 10px 0;
+}
+.shortcuts-group-title {
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+.shortcuts-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 4px 2px;
+}
+.shortcuts-key {
+  flex: none;
+  min-width: 92px;
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--signal-bright);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  padding: 2px 8px;
+  text-align: center;
+}
+.shortcuts-desc {
+  color: var(--text-2);
+  font-size: 12px;
+}
+.shortcuts-foot {
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  text-align: right;
 }
 
 /* ── '/' 슬래시 명령 팝업 (입력창 위) ── */
@@ -2917,7 +3866,7 @@ button:disabled {
   height: 22px;
   padding: 0;
   border-radius: 50%;
-  border: 1px solid var(--hum);
+  border: 1px solid transparent; /* 테두리는 호버 시에만(.lain-reset:hover) — 평소엔 안 뜨게 */
   color: var(--hum);
   background: var(--surface);
   font-size: 11px;
@@ -2932,6 +3881,7 @@ button:disabled {
     transform 0.2s ease;
 }
 .lain-reset:hover {
+  border-color: var(--hum); /* 호버 시에만 원 테두리 표시 */
   box-shadow: 0 0 11px currentColor;
   transform: rotate(120deg);
 }
@@ -2979,6 +3929,20 @@ button:disabled {
   opacity: 0.5;
   cursor: default;
 }
+/* A15 — Ctrl+F '전체 기간' 토글(DB 전문검색). 켜지면 .chat-search-nav-on으로 강조. */
+.chat-search-nav-on {
+  color: var(--signal-bright);
+  border-color: var(--signal);
+  background: var(--surface-2);
+}
+/* A15 — 위로 스크롤 페이징 중 상단 로딩 표시 */
+.chat-load-more {
+  text-align: center;
+  color: var(--text-3);
+  font-size: 11px;
+  padding: 6px 0;
+  opacity: 0.8;
+}
 mark.chat-hl {
   background: rgba(177, 140, 240, 0.35);
   color: var(--signal-bright);
@@ -2991,6 +3955,25 @@ mark.chat-hl {
 /* ══════════════════════════════════════════════════════════════
    병렬 개선 — 신규 클래스 일괄 (공유 계약 §4)
    ════════════════════════════════════════════════════════════ */
+
+/* ── URL/파일 경로 링크화 (shell:openExternal·shell:revealPath, §4-A3) — 밑줄+시그널 컬러로
+   클릭 가능함을 표시. 인라인 코드 안 경로는 폰트만 code 유지하고 색만 링크로 바꿔
+   '코드처럼 보이는 경로'를 구분되게 한다. ── */
+.msg-link {
+  color: var(--signal);
+  text-decoration: underline dotted;
+  cursor: pointer;
+}
+.msg-link:hover {
+  color: var(--signal-bright);
+  text-decoration-style: solid;
+}
+code.msg-path-link {
+  color: var(--signal);
+}
+code.msg-path-link:hover {
+  color: var(--signal-bright);
+}
 
 /* ── 작업 diff 뷰 (tasks:diff, §4-A) — TaskDrawer 내 전체 diff 펼침 ── */
 .task-diff {
@@ -3025,6 +4008,68 @@ mark.chat-hl {
 .diff-del { color: var(--glitch); }
 .diff-hunk { color: var(--signal); }
 .diff-meta { color: var(--text-3); }
+
+/* C9 — diff 파일 목록 요약 + 파일별 접이식 섹션 */
+.diff-summary {
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 3px 2px;
+  letter-spacing: 0.5px;
+}
+.diff-file {
+  border: 1px solid var(--border);
+  border-bottom: none;
+  background: var(--surface);
+}
+.diff-file:last-child {
+  border-bottom: 1px solid var(--border);
+}
+.diff-file-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  padding: 3px 8px;
+  font-size: 11px;
+  border: none;
+  border-radius: 0;
+  color: var(--text-2);
+  background: transparent;
+}
+.diff-file-head:hover {
+  background: var(--surface-2, rgba(255, 255, 255, 0.03));
+}
+.diff-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.diff-file-tag {
+  flex: none;
+  font-size: 9px;
+  padding: 0 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  color: var(--text-3);
+}
+.diff-file-stat {
+  flex: none;
+  font-size: 10px;
+  color: var(--phosphor);
+  letter-spacing: 0.5px;
+}
+.diff-file-bin {
+  color: var(--text-3);
+}
+.diff-file-body {
+  border: none;
+  border-top: 1px solid var(--border);
+  max-height: 260px;
+}
 
 /* ── 학습 수명주기 UI (lesson:flag/unflag/pin/add, §4-B) ── */
 .lesson-actions {
@@ -3200,6 +4245,138 @@ mark.chat-hl {
 .code-copy-done {
   color: var(--phosphor);
   border-color: var(--phosphor);
+}
+
+/* ── A17: 긴 코드블록 접기 — 기본 접힘(max-height + 하단 페이드) + '펼치기' 토글 ── */
+.msg-code-folded {
+  max-height: 340px;
+  overflow-y: hidden;
+  mask-image: linear-gradient(to bottom, #000 85%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 85%, transparent 100%);
+}
+.code-fold-toggle {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 3px 0;
+  font-size: 10px;
+  color: var(--text-3);
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 3px;
+}
+.code-fold-toggle:hover {
+  color: var(--signal-bright);
+  border-color: var(--border-strong);
+}
+
+/* ── A17: 도구 라인 원문 전개 토글 — 축약 라인 옆 '전개' 버튼 + 펼치면 아래 원문 전문 ── */
+.tool-raw-toggle {
+  font-size: 10px;
+  padding: 0 4px;
+  color: var(--text-3);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.tool-raw-toggle:hover {
+  color: var(--signal-bright);
+  border-color: var(--border-strong);
+}
+.tool-raw-full {
+  margin-top: 2px;
+  padding: 4px 6px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+
+/* A4 — 레인 채팅 TodoWrite 접이식 진행 칩 */
+.todo-chip {
+  font-size: 11px;
+}
+.todo-chip-head {
+  padding: 1px 6px;
+  color: var(--presence);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+}
+.todo-chip-head:hover {
+  border-color: var(--border-strong);
+}
+.todo-chip-body {
+  margin-top: 4px;
+  padding: 4px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.todo-chip-item {
+  display: flex;
+  gap: 6px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.todo-chip-icon { flex-shrink: 0; }
+.todo-chip-completed { color: var(--st-done); text-decoration: line-through; opacity: 0.7; }
+.todo-chip-in_progress { color: var(--presence); }
+.todo-chip-pending { color: var(--text-2); }
+
+/* A6 — 레인 Edit/Write 접이식 diff 카드(todo-chip과 동일 뼈대). 헤더의 파일 경로는 길 수 있어
+   줄바꿈 허용, task-diff-body(자체 테두리·배경)를 그대로 얹으므로 todo-chip-body의 패딩만 뺀다. */
+.edit-diff-chip .todo-chip-head {
+  white-space: normal;
+  word-break: break-all;
+  text-align: left;
+}
+.edit-diff-chip .todo-chip-body {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+/* D15 되감기 — 편집 diff 카드의 '이 턴 편집 되돌리기' 버튼·인라인 확인 블록 */
+.edit-revert-btn {
+  margin-top: 4px;
+  padding: 2px 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 11px;
+  cursor: pointer;
+}
+.edit-revert-btn:hover {
+  border-color: var(--signal);
+  color: var(--signal-bright);
+}
+.edit-revert-btn.danger:hover {
+  border-color: var(--glitch);
+  color: var(--glitch);
+}
+.edit-revert-confirm {
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--surface);
+  font-size: 11px;
+}
+.edit-revert-confirm ul {
+  margin: 4px 0;
+  padding-left: 16px;
+  word-break: break-all;
+}
+.edit-revert-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
 }
 
 /* ── ↓ 새 메시지 점프 (chat-jump) — 바닥에서 벗어났을 때 chat-log 우하단 ── */
@@ -3406,6 +4583,24 @@ mark.chat-hl {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* C1 — 진행 중 task 타일: 제목(정적 meta 대체)·경과/턴/토큰·라이브 활동 한 줄 */
+.nt-task-title {
+  color: var(--text-2);
+}
+.nt-task-stats {
+  font-size: 10px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nt-activity {
+  font-size: 10px;
+  color: var(--signal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .nt-acts {
   display: flex;
   gap: 4px;
@@ -3421,4 +4616,172 @@ mark.chat-hl {
 }
 .nt-acts button:disabled {
   opacity: 0.35;
+}
+/* A4 — TodoWrite 진행률(n/m) 배지 */
+.nt-todo-progress {
+  font-size: 10px;
+  color: var(--presence);
+  align-self: center;
+}
+
+/* ── 온보딩(첫 실행 위저드) — modal-window 재사용, 컴팩트 세로 폭 ── */
+.modal-window:has(.onboarding) {
+  width: 560px;
+  height: auto;
+  max-height: 86vh;
+}
+.onboarding {
+  padding: 6px 8px 12px;
+  line-height: 1.6;
+  font-size: 13px;
+}
+.onboarding h3 {
+  color: var(--signal);
+  margin: 18px 0 6px;
+  font-size: 13px;
+}
+.onboarding code {
+  color: var(--signal-bright);
+}
+.onboarding input {
+  width: 200px;
+}
+.onboarding ul {
+  margin: 4px 0 0 18px;
+  padding: 0;
+}
+.onboarding-actions {
+  margin-top: 22px;
+  text-align: right;
+}
+.onboarding-actions .primary {
+  color: var(--signal-bright);
+  border-color: var(--signal);
+  padding: 8px 22px;
+}
+/* E2 — 로그인 터미널 열기(구독 OAuth) 액션 + 수동 실행 안내 */
+.onboarding-login-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 8px 0 4px;
+}
+.onboarding-login-actions .primary {
+  color: var(--signal-bright);
+  border-color: var(--signal);
+}
+.onboarding-err {
+  color: var(--glitch);
+}
+.onboarding-manual {
+  margin: 6px 0 2px;
+}
+.onboarding-manual summary {
+  cursor: pointer;
+}
+.onboarding-cmd {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 9px;
+  margin: 3px 0 8px;
+  color: var(--signal-bright);
+  font-family: var(--font);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+/* E5 — 온보딩 API 키 양갈래 입력 */
+.onboarding-apikey {
+  margin: 10px 0 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.onboarding-apikey-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 4px 0;
+}
+.onboarding-apikey-row input {
+  flex: 1;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   P2-T1 — 마크다운 블록 렌더(A1) + 코드블록 구문강조(A8)
+   ════════════════════════════════════════════════════════════ */
+
+/* ── A1: 블록 요소 — 헤딩/리스트/인용/수평선/표. msg-body(pre-wrap) 안에 끼워 넣히므로
+   여백은 좁게(채팅 로그 밀도 유지). ── */
+.msg-heading {
+  color: var(--signal-bright);
+  font-weight: 700;
+  margin: 4px 0 2px;
+  display: block;
+}
+h1.msg-heading { font-size: 1.3em; }
+h2.msg-heading { font-size: 1.2em; }
+h3.msg-heading { font-size: 1.1em; }
+.msg-hr {
+  border: none;
+  border-top: 1px solid var(--border-strong);
+  margin: 6px 0;
+}
+.msg-quote {
+  margin: 4px 0;
+  padding: 2px 8px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-2);
+}
+.msg-list {
+  margin: 2px 0;
+  padding-left: 20px;
+}
+.msg-list li {
+  margin: 1px 0;
+}
+.msg-table-wrap {
+  overflow-x: auto;
+  margin: 4px 0;
+}
+.msg-table {
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.msg-table th,
+.msg-table td {
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  text-align: left;
+  white-space: normal;
+}
+.msg-table th {
+  color: var(--signal);
+  background: var(--surface);
+}
+.msg-bold {
+  font-weight: 700;
+  color: var(--text);
+}
+.msg-italic {
+  font-style: italic;
+}
+.msg-bolditalic {
+  font-weight: 700;
+  font-style: italic;
+  color: var(--text);
+}
+
+/* ── A8: 코드블록 구문강조 — 키워드/문자열/주석 3분류. CRT 그린 톤 변수 그대로 재사용
+   (신규 팔레트 추가 없이 기존 시맨틱 변수로 통일: 키워드=presence, 문자열=phosphor, 주석=text-3). ── */
+.code-kw {
+  color: var(--presence);
+}
+.code-str {
+  color: var(--phosphor);
+}
+.code-cm {
+  color: var(--text-3);
+  font-style: italic;
 }

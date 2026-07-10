@@ -24,10 +24,12 @@ import {
   updateTask,
 } from './store'
 import { notifyUser } from './notify'
+import { runCodexNavi } from './codex'
+import { classifySystemDestructive } from './sysrisk'
 import { blocksSecretFile, blocksSecretPath, isTestFile, toolFilePath, SECRET_DENY_MESSAGE } from './safety'
 import { shouldCompact, contextOccupancyTokens } from './compactgate'
 import { summarizeNaviHandoff, handoffBlock, taskEventsToDialogue } from './handoff'
-import type { ExitReason, Task, TaskEvent } from '../shared/types'
+import type { ExitReason, Task, TaskEngine, TaskEvent } from '../shared/types'
 import { isTransientApiError, transientBackoffMs, MAX_TRANSIENT_RETRIES } from './retry'
 import { skillOptions } from './skills'
 import { capTaskImages, toImageBlocks } from './taskimages'
@@ -35,9 +37,11 @@ import { NAVI_SENDER_LEGEND } from './navisender'
 import { conventionsBlock } from './conventions'
 import { naviSkillsBlock, isValidSkillName, readSkillBody } from './agentskills'
 import { thinkingOption, tierQueryOptions } from './agentopts'
-
-// 워크스페이스 루트 — 기본 C:\workspace, 환경변수 LAIN_WORKSPACE로 변경 가능. 위험명령 경로가둠(이 루트 밖 절대경로는 승인)에 쓰임.
-export const DEV_ROOT = process.env.LAIN_WORKSPACE || 'C:\\workspace'
+import { recordUsage } from './usage'
+import { parseTodoWriteInput, encodeTodoLine } from '../shared/todoline'
+import { shouldCheckpoint, formatCheckpoint } from './checkpoint'
+import { diffStat, commitCount } from './worktree'
+import { workspaceRoot } from './registry'
 
 
 // SDK result 메시지의 usage에서 총 토큰 합산(input+output+cache). 구독 모델용 표시(§비용대신).
@@ -50,6 +54,24 @@ export function sumUsageTokens(msg: unknown): number {
     (u.cache_creation_input_tokens ?? 0) +
     (u.cache_read_input_tokens ?? 0)
   )
+}
+
+// I4 — 라이프타임 토큰 누적(순수). SDK result.usage는 세션 cumulative라, 동일 세션 resume은 이전 값을
+// '교체'하고 새 세션은 '가산'해야 다중 세션(핸드오프·verify재시도) 작업의 예산이 정확히 발동한다.
+/** resume 여부로 이 세션의 baseline(=현재 세션 이전 세션들 누계)을 고른다.
+ *  resume 있음(동일 세션 이어가기) → 저장된 sessionBaseTokens 유지. resume 없음(신규/핸드오프 스왑 → 새 세션)
+ *  → 이전 tokensTotal을 baseline으로 승격(이전 세션 최종 누계가 이 세션 위로 가산되게). */
+export function sessionBaselineFor(
+  resuming: boolean,
+  sessionBaseTokens: number,
+  tokensTotal: number,
+): number {
+  return resuming ? (sessionBaseTokens || 0) : (tokensTotal || 0)
+}
+
+/** baseline + 이 세션 cumulative = 라이프타임 누적. 동일세션 재갱신은 baseline이 고정이라 '교체', 새 세션은 가산. */
+export function lifetimeTokensFor(sessionBaseline: number, sessionCumulative: number): number {
+  return sessionBaseline + sessionCumulative
 }
 
 // 위험 분류 (§9-4) — best-effort 정규식. 진짜 방어선은 worktree 격리 + 병합 승인.
@@ -147,6 +169,18 @@ interface PendingApproval {
 const pending = new Map<number, PendingApproval>()
 const abortControllers = new Map<string, AbortController>()
 
+// C1 — 무인 작업의 "승인/질문 대기 중"(D4 hold) task id 추적. 영속 상태·스키마 없음(인메모리 Set) —
+// 재부팅 시 비고, recoverTasks가 'working' 작업을 재개→도구 재시도→canUseTool이 다시 hold 진입하며
+// 재등록되므로 자연 복구된다. held 작업은 사람을 기다리는 중이라 compute 슬롯을 안 쓰므로 concurrencyCap
+// 카운트·유휴 게이트(hasActiveWork)에서 제외한다. set/clear는 waitApproval 진입/해제 단일 지점 + abort로,
+// 모든 대기 종료 경로(정상 응답/거절/abort)에서 확실히 clear된다(누수 시 영구 유휴정지 재발 — 안전 최우선).
+const awaitingApprovalIds = new Set<string>()
+
+/** 이 task가 지금 D4 hold(무인 승인/질문 대기)로 멈춰 있는가 — orchestrator/게이트가 읽는다. */
+export function isAwaitingApproval(taskId: string): boolean {
+  return awaitingApprovalIds.has(taskId)
+}
+
 export function resolveApproval(id: number, approved: boolean, answer?: string): void {
   resolveApprovalRow(id, approved ? 'approved' : 'rejected', answer)
   pending.get(id)?.resolve({ approved, answer })
@@ -156,6 +190,9 @@ export function resolveApproval(id: number, approved: boolean, answer?: string):
 export function abortNavi(taskId: string): void {
   abortControllers.get(taskId)?.abort()
   abortControllers.delete(taskId)
+  // C1 — abort로 대기가 끝나는 경로. waitApproval의 hold Promise는 abort 시 스스로 resolve하지 않으므로
+  // (canUseTool이 중단돼 wrapped resolve가 안 불림) 여기서 확실히 clear한다(누수 방지).
+  awaitingApprovalIds.delete(taskId)
 }
 
 /** §5.7 인터럽트 가능 여부 — 현재 Navi가 실행 중(abort 등록됨)인지 */
@@ -163,8 +200,15 @@ export function isNaviRunning(taskId: string): boolean {
   return abortControllers.has(taskId)
 }
 
-const APPROVAL_TIMEOUT_MS = 30 * 60_000 // 30분 무응답 → 거절
+// D4 — navichat(채팅 세션)·manager(레인 자신 승인)의 기본 무응답 데드라인. 사용자가 채팅에 실재하는
+// 포그라운드라 '무인 대기' 문제 대상이 아니므로 기존대로 만료 시 rejected 처리(30분 고정).
+const APPROVAL_TIMEOUT_MS = 30 * 60_000
 const TOOL_LOOP_BLOCK = 8 // 동일 도구 호출 반복 차단 임계 (§24 — 무한루프 방어, 정상 반복엔 안 걸릴 만큼 높게)
+
+// D4 — 분 단위 승인 대기 임계를 ms로. 0이면 0(재알림/데드라인 없음 = 무한 대기).
+export function approvalTimeoutMs(min: number): number {
+  return Math.max(0, Math.floor(min)) * 60_000
+}
 
 // ── no-progress 루프 가드 (i1) ─────────────────────────────────────────────
 // 정확일치 축(sha256(toolName+input))과 별개로, idempotent 읽기 도구에 한해
@@ -196,13 +240,16 @@ export function noProgressAction(identicalRepeats: number, threshold: number): L
 
 /** SDK 스트림의 user(tool_result) 메시지에서 tool_use_id→결과 텍스트 쌍을 뽑는다(순수).
  *  canUseTool 결정 시점엔 결과를 모르므로, 직전 호출의 toolUseID와 상관시켜 결과 해시를 누적한다.
- *  content가 문자열/블록배열 어느 쪽이든, tool_result 블록만 골라 평탄화한다. */
-export function extractToolResults(userMsg: unknown): Array<{ toolUseId: string; result: string }> {
+ *  content가 문자열/블록배열 어느 쪽이든, tool_result 블록만 골라 평탄화한다.
+ *  isError: 블록의 is_error 플래그(A7 — 관리자 스트림 도구 실패 표시가 이 필드로 성공/실패를 가른다). */
+export function extractToolResults(
+  userMsg: unknown,
+): Array<{ toolUseId: string; result: string; isError: boolean }> {
   const content = (userMsg as { message?: { content?: unknown } })?.message?.content
   if (!Array.isArray(content)) return []
-  const out: Array<{ toolUseId: string; result: string }> = []
+  const out: Array<{ toolUseId: string; result: string; isError: boolean }> = []
   for (const block of content) {
-    const b = block as { type?: string; tool_use_id?: string; content?: unknown }
+    const b = block as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }
     if (b?.type !== 'tool_result' || !b.tool_use_id) continue
     let text = ''
     if (typeof b.content === 'string') text = b.content
@@ -214,7 +261,7 @@ export function extractToolResults(userMsg: unknown): Array<{ toolUseId: string;
         })
         .join('')
     else if (b.content != null) text = JSON.stringify(b.content)
-    out.push({ toolUseId: b.tool_use_id, result: text })
+    out.push({ toolUseId: b.tool_use_id, result: text, isError: !!b.is_error })
   }
   return out
 }
@@ -241,16 +288,46 @@ function logExit(
   emit({ taskId, kind: 'exit', text, exitReason: reason } as unknown as TaskEvent)
 }
 
-export function waitApproval(id: number): Promise<ApprovalResult> {
+// D4 — 승인 대기 옵션. 기본(옵션 없음)은 기존 동작: APPROVAL_TIMEOUT_MS 후 자동 거절(navichat/manager).
+// 무인 백그라운드 작업(orchestrator task)만 hold=true로 넘겨 "만료 시 거절하지 않고 재알림 1회 후 무한 대기"로
+// 바꾼다. 세션·worktree는 대기 중에도 그대로 살아있어(Promise만 미해결) 사용자가 응답하면 그 지점부터 이어진다.
+export interface WaitApprovalOpts {
+  hold?: boolean // true=만료해도 거절하지 않고 무한 대기(무인 작업). 재알림은 onRemind로 1회.
+  timeoutMs?: number // hold일 때 재알림까지의 대기(ms). 0이면 재알림 없이 곧장 무한 대기.
+  onRemind?: () => void // 만료 시각에 1회 호출(재알림 — PC 토스트/텔레그램). hold 전용.
+  taskId?: string // C1 — hold 대기 진입/해제 시 awaitingApprovalIds set/clear(무인 작업 슬롯 점유 제외용).
+}
+
+export function waitApproval(id: number, opts: WaitApprovalOpts = {}): Promise<ApprovalResult> {
+  // C1 — hold(무인 대기) 진입 시 이 task를 'awaiting-approval'로 표시. 슬롯·유휴 게이트에서 제외된다.
+  // clear는 아래 wrapped resolve(정상 응답/거절)와 abortNavi(abort)에서 — 모든 종료 경로 커버(누수 방지).
+  if (opts.hold && opts.taskId) awaitingApprovalIds.add(opts.taskId)
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      resolveApprovalRow(id, 'rejected')
-      pending.delete(id)
-      resolve({ approved: false })
-    }, APPROVAL_TIMEOUT_MS)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    if (opts.hold) {
+      // 무인 작업 — 만료해도 거절 금지. timeoutMs가 양수면 그 시점에 재알림 1회만 보내고, 이후 추가 타이머
+      // 없이 무한 대기(반복 알림 금지 — 스팸/복잡도 회피). 사용자가 응답할 때만 아래 resolve로 깨어난다.
+      if (opts.timeoutMs && opts.timeoutMs > 0) {
+        timer = setTimeout(() => {
+          try {
+            opts.onRemind?.()
+          } catch {
+            /* 재알림 실패는 무시 — 대기 자체엔 영향 없음 */
+          }
+        }, opts.timeoutMs)
+      }
+    } else {
+      // 기존 동작(포그라운드) — 데드라인 만료 시 자동 거절.
+      timer = setTimeout(() => {
+        resolveApprovalRow(id, 'rejected')
+        pending.delete(id)
+        resolve({ approved: false })
+      }, APPROVAL_TIMEOUT_MS)
+    }
     pending.set(id, {
       resolve: (v) => {
-        clearTimeout(timer)
+        if (timer) clearTimeout(timer)
+        if (opts.taskId) awaitingApprovalIds.delete(opts.taskId) // C1 — 정상 응답/거절로 대기 종료
         resolve(v)
       },
     })
@@ -326,7 +403,7 @@ ${task.content}
 \`\`\``
 }
 
-function parseReport(text: string): NaviReport | null {
+export function parseReport(text: string): NaviReport | null {
   const m = text.match(/```json\s*([\s\S]*?)```/)
   if (!m) return null
   try {
@@ -353,6 +430,20 @@ export interface RunNaviOpts {
   fromInterrupt?: boolean
 }
 
+/** 외부 러너를 쓰는 엔진의 실행 함수 시그니처 — runNavi와 같은 NaviReport 계약(abort는 signal로). */
+type ExternalNaviRunner = (
+  task: Task,
+  emit: (ev: TaskEvent) => void,
+  opts: RunNaviOpts,
+  signal: AbortSignal,
+) => Promise<NaviReport>
+
+// D12 — 엔진별 외부 러너 레지스트리. claude는 runNavi 인라인 본체(등록 안 함=fall-through), codex만 위임.
+// 제3 엔진(예: gemini)을 붙이려면 여기 엔트리 1개 + engines.ts capability 1개 + types 유니언·start_task enum만.
+const ENGINE_RUNNERS: Partial<Record<TaskEngine, ExternalNaviRunner>> = {
+  codex: runCodexNavi,
+}
+
 /** Navi 실행 — 완료 시 보고 반환. 이벤트는 emit + task_events에 영속. */
 export async function runNavi(
   task: Task,
@@ -364,10 +455,30 @@ export async function runNavi(
     emit({ taskId: task.id, kind, text, speaker } as TaskEvent)
   }
 
+  // D12 — 엔진 dispatch. claude 본체는 이 함수 인라인(아래 그대로)이고, 외부 러너를 쓰는 엔진만
+  // ENGINE_RUNNERS에 등록한다(현재 codex). 하드코딩 `=== 'codex'` 대신 레지스트리 조회로 위임 —
+  // 제3 엔진은 여기 엔트리 1개만 추가하면 된다. abort는 엔진 무관하게 여기서 등록(abortNavi/인터럽트 공용).
+  const externalRunner = ENGINE_RUNNERS[task.engine ?? 'claude']
+  if (externalRunner) {
+    const cac = new AbortController()
+    abortControllers.set(task.id, cac)
+    try {
+      return await externalRunner(task, emit, opts, cac.signal)
+    } finally {
+      abortControllers.delete(task.id)
+    }
+  }
+
   const ac = new AbortController()
   abortControllers.set(task.id, ac)
   let lastText = ''
   let aborted = false
+  // D6 체크포인트 상태(이 run 동안만) — SDK는 turns/tokens를 result(세션 종료)에만 준다. 세션 중엔
+  // assistant 메시지를 세어 turnsSoFar를 근사하고, 마지막 체크포인트 시점의 턴·벽시계를 보관해 트리거를 판정한다.
+  const cpProject = getProject(task.projectId)
+  let turnsSoFar = 0
+  let lastCheckpointTurn = 0
+  let lastCheckpointMs = Date.now()
   // i9 — 흩어진 종료 신호를 한 변수로 모아 스트림 종료 후 1회 addTaskEvent('exit')로 적재(glass-box).
   // canUseTool/스트림 어디서든 기록하고, 마지막에 result subtype/abort로 보강·확정한다.
   // exitReason은 공유계약(types.ExitReason 6종)만 쓰고, 세부 사유는 denyDetail에 사람이 읽을 텍스트로 남긴다.
@@ -494,6 +605,17 @@ export async function runNavi(
     }
   }
 
+  // I4 — 라이프타임 토큰 누적 baseline 확정(resume 여부가 이제 최종이라 여기서 정한다).
+  //  - resume 있음(동일 세션 이어가기): 저장된 baseline(session_base_tokens)을 그대로 쓴다. 이 세션의 result는
+  //    세션 cumulative를 보고하므로 tokens_total = baseline + cumulative가 되어 동일세션 재갱신은 '교체'다(중복 없음).
+  //  - resume 없음(신규 작업 또는 핸드오프 스왑 → 새 세션): 이전 세션들 누계(현재 tokens_total)를 새 baseline으로
+  //    승격해 이 세션 몫이 그 위에 '가산'되게 한다. 신규 작업이면 tokens_total=0이라 baseline=0.
+  //    (핸드오프 스왑은 위 블록이 naviSessionId를 비웠지만 task 스냅샷의 tokens_total은 call 시점 값=이전 세션 최종 누계.)
+  const sessionBaseline = sessionBaselineFor(!!resume, task.sessionBaseTokens ?? 0, task.tokensTotal ?? 0)
+  if (!resume && sessionBaseline !== (task.sessionBaseTokens ?? 0)) {
+    updateTask(task.id, { sessionBaseTokens: sessionBaseline })
+  }
+
   // 프롬프트 3분기: ①진짜 resume(세션에 규칙·히스토리 있음) ②핸드오프 스왑(새 세션 — 규칙 재공급 + 핸드오프)
   // ③신규 작업. 스왑은 resume이 끊겼지만 opts.resumePrompt는 살아있어 '이어가기'로 이어붙인다.
   // naviPrompt(task, false) — 스왑은 같은 작업의 연속이라 교훈 inject_count를 다시 올리지 않는다(적합도 신호 보존).
@@ -555,7 +677,19 @@ export async function runNavi(
         canUseTool: async (toolName, input, { toolUseID }) => {
           const cmd = String((input as any)?.command ?? '')
           const desc = String((input as any)?.description ?? '')
-          log('tool', `${toolName}: ${desc || cmd.slice(0, 120) || JSON.stringify(input).slice(0, 120)}`)
+
+          // A4 — TodoWrite는 구조화된 kind='todo' 이벤트로만 표시하고 일반 'tool' 회색 라인은 스킵한다.
+          // (그러지 않으면 raw JSON이 로그에 노출되고 'todo' 위젯과 이중 표시됨 — manager.ts와 동일 정책.)
+          // task.todos 스냅샷은 누적이 아니라 최신이 진실이라 매번 통째 교체.
+          if (toolName === 'TodoWrite') {
+            const todos = parseTodoWriteInput(input)
+            if (todos) {
+              log('todo', encodeTodoLine(todos))
+              updateTask(task.id, { todos })
+            }
+          } else {
+            log('tool', `${toolName}: ${desc || cmd.slice(0, 120) || JSON.stringify(input).slice(0, 120)}`)
+          }
 
           // §24 Phase2 — 도구-루프 가드(정확일치 축): 같은 (도구+인자) 호출을 임계 횟수 반복하면 차단.
           const sig = crypto.createHash('sha256').update(`${toolName} ${JSON.stringify(input ?? {})}`).digest('hex')
@@ -637,11 +771,39 @@ export async function runNavi(
             return { behavior: 'deny', message: SECRET_DENY_MESSAGE }
           }
 
-          // 경로 가둠 (§9-2): 워크스페이스 루트(C:\workspace) 밖 절대경로가 명령에 보이면 승인 대상
-          const outside = /[A-Za-z]:\\/.test(cmd) && !cmd.toUpperCase().includes(DEV_ROOT.toUpperCase())
+          // 경로 가둠 (§9-2): 워크스페이스 루트 밖 절대경로가 명령에 보이면 승인 대상. 루트는 E6 설정
+          // (UI/env)을 반영하는 유효값 — 사용자가 지정한 워크스페이스가 신뢰 구역이 되게(env만이던 시절 확장).
+          const root = workspaceRoot()
+          const outside = /[A-Za-z]:\\/.test(cmd) && !cmd.toUpperCase().includes(root.toUpperCase())
           const risky = RISKY.find((r) => r.re.test(cmd))
 
           if (toolName === 'Bash' || toolName === 'PowerShell') {
+            // 시스템/PC 파괴(sysrisk.ts) — bypass·autonomous 자율 진행 예외 없이 항상 사람 승인.
+            const sys = classifySystemDestructive(cmd)
+            if (sys) {
+              const approvalId = insertApproval(task.id, 'system', cmd)
+              log('status', `승인 대기 [system:${sys}]: ${cmd.slice(0, 160)}`)
+              emit({ taskId: task.id, kind: 'status', text: `approval:${approvalId}` })
+              notifyUser('lain — 시스템 명령 승인 필요', `[${sys}] ${cmd.slice(0, 120)}`)
+              // D4 — 무인 작업 승인은 만료해도 거절하지 않는다(세션·worktree 보존). 임계 도달 시 재알림 1회.
+              const sysRes = await waitApproval(approvalId, {
+                hold: true,
+                taskId: task.id, // C1 — hold 동안 슬롯·유휴 게이트에서 제외
+                timeoutMs: approvalTimeoutMs(getSettings().approvalTimeoutMin),
+                onRemind: () => {
+                  log('status', `승인 재알림 [system:${sys}] — 아직 무응답(거절 아님, 계속 대기)`)
+                  notifyUser('lain — 승인 대기 중', `[${sys}] ${task.projectId}: 아직 응답이 없다 (${cmd.slice(0, 80)})`)
+                },
+              })
+              log('status', sysRes.approved ? `승인됨: ${cmd.slice(0, 80)}` : `거절됨: ${cmd.slice(0, 80)}`)
+              if (!sysRes.approved) {
+                return {
+                  behavior: 'deny',
+                  message: '사용자가 이 시스템 명령을 거절했다. 다른 방법으로 진행하거나 blocked로 보고해라.',
+                }
+              }
+              return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
+            }
             if (risky || outside) {
               const kind = risky?.kind ?? 'outside_dev'
               // §21.5 divergence 2축 정책 (autonomous 전용): 안전 default가 있고(①)
@@ -664,7 +826,16 @@ export async function runNavi(
               log('status', `승인 대기 [${kind}]: ${cmd.slice(0, 160)}`)
               emit({ taskId: task.id, kind: 'status', text: `approval:${approvalId}` })
               notifyUser('lain — 승인 필요', `[${kind}] ${cmd.slice(0, 120)}`)
-              const res = await waitApproval(approvalId)
+              // D4 — 무인 작업 승인은 만료해도 거절하지 않는다(세션·worktree 보존). 임계 도달 시 재알림 1회.
+              const res = await waitApproval(approvalId, {
+                hold: true,
+                taskId: task.id, // C1 — hold 동안 슬롯·유휴 게이트에서 제외
+                timeoutMs: approvalTimeoutMs(getSettings().approvalTimeoutMin),
+                onRemind: () => {
+                  log('status', `승인 재알림 [${kind}] — 아직 무응답(거절 아님, 계속 대기)`)
+                  notifyUser('lain — 승인 대기 중', `[${kind}] ${task.projectId}: 아직 응답이 없다 (${cmd.slice(0, 80)})`)
+                },
+              })
               log('status', res.approved ? `승인됨: ${cmd.slice(0, 80)}` : `거절됨: ${cmd.slice(0, 80)}`)
               if (!res.approved) {
                 return {
@@ -674,6 +845,36 @@ export async function runNavi(
               }
             }
           }
+
+          // D9 — plan 모드 배선: permissionMode==='plan'일 때만 ExitPlanMode를 승인 게이트로 건다.
+          // 계획 전문을 승인 카드로 띄우고(기존 승인 큐 재사용 — PC 카드·텔레그램 버튼 자동), 사람이
+          // 승인해야 실행이 이어진다. hold:true라 무인 백그라운드 작업답게 무한 대기(D4 타임아웃 보류 상속).
+          // 그 외 모드에선 ExitPlanMode가 올 일이 거의 없으나, 와도 흐름을 막지 않게 그대로 allow 통과.
+          if (toolName === 'ExitPlanMode' && task.permissionMode === 'plan') {
+            const plan = String((input as { plan?: unknown })?.plan ?? '(계획 본문 없음)')
+            const approvalId = insertApproval(task.id, 'plan', plan)
+            log('status', `계획 승인 대기 [plan]: ${plan.slice(0, 160)}`)
+            emit({ taskId: task.id, kind: 'status', text: `approval:${approvalId}` })
+            notifyUser('lain — 계획 승인 필요', plan.slice(0, 120))
+            // D4 — 무인 작업 승인은 만료해도 거절하지 않는다(세션·worktree 보존). 임계 도달 시 재알림 1회.
+            const res = await waitApproval(approvalId, {
+              hold: true,
+              taskId: task.id, // C1 — hold 동안 슬롯·유휴 게이트에서 제외
+              timeoutMs: approvalTimeoutMs(getSettings().approvalTimeoutMin),
+              onRemind: () => {
+                log('status', `승인 재알림 [plan] — 아직 무응답(거절 아님, 계속 대기)`)
+                notifyUser('lain — 계획 승인 대기 중', `${task.projectId}: 아직 응답이 없다`)
+              },
+            })
+            log('status', res.approved ? `계획 승인됨` : `계획 거절됨`)
+            if (!res.approved) {
+              return {
+                behavior: 'deny',
+                message: '사용자가 계획을 거부했다. 계획을 수정하거나 다른 접근을 제안해라.',
+              }
+            }
+          }
+
           return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
         },
       },
@@ -690,6 +891,29 @@ export async function runNavi(
         if (text) {
           lastText = text
           log('text', text, 'worker')
+        }
+        // D6 — assistant 메시지 1건 ≈ 턴 1(SDK가 세션 중엔 num_turns를 안 줘서 이걸로 근사).
+        // N턴 또는 M분 경과 시 결정론 체크포인트 1회(git diffStat·커밋 수). LLM 호출 없음.
+        turnsSoFar++
+        if (
+          cpProject &&
+          shouldCheckpoint({
+            turnsSoFar,
+            lastCheckpointTurn,
+            elapsedMs: Date.now() - lastCheckpointMs,
+          })
+        ) {
+          try {
+            const stat = diffStat(cpProject, task.id)
+            const line = formatCheckpoint(turnsSoFar, commitCount(cpProject, task.id), stat)
+            log('checkpoint', line)
+            // 다이제스트가 세션 종료 전에도 최신 진행을 반영하도록 기존 필드만 갱신(스키마 무변경).
+            updateTask(task.id, { turns: turnsSoFar, diffStat: stat })
+          } catch {
+            /* git 실패는 무해 — 체크포인트만 건너뛰고 작업은 계속 */
+          }
+          lastCheckpointTurn = turnsSoFar
+          lastCheckpointMs = Date.now()
         }
       } else if (msg.type === 'user') {
         // i1 no-progress 축의 결과 채널: tool_result를 직전 canUseTool(toolUseID→sig)와 상관시켜
@@ -712,8 +936,16 @@ export async function runNavi(
         const cost = 'total_cost_usd' in msg ? (msg.total_cost_usd ?? 0) : 0
         const turns = 'num_turns' in msg ? (msg.num_turns ?? 0) : 0
         const tokens = sumUsageTokens(msg)
+        // I4 — 라이프타임 누적: tokens(세션 cumulative)는 표시용으로 유지하고, tokens_total은
+        // baseline(이전 세션들 누계) + 이 세션 cumulative로 갱신한다. 동일 세션 result가 반복돼도
+        // 세션 cumulative가 baseline 위에 얹히므로 '교체'라 중복 계수되지 않고, 새 세션은 baseline이 이미
+        // 이전 세션 누계로 승격돼 있어 '가산'된다. 예산 판정(finishWork)은 tokens_total을 기준으로 본다.
+        const tokensTotal = lifetimeTokensFor(sessionBaseline, tokens)
         // 점유(input+캐시, output 제외)는 다음 재개 경계의 핸드오프 감지용 — 누적합 tokens와 별개.
-        updateTask(task.id, { costUsd: cost, tokens, turns, contextTokens: contextOccupancyTokens(msg) })
+        updateTask(task.id, { costUsd: cost, tokens, tokensTotal, turns, contextTokens: contextOccupancyTokens(msg) })
+        // D7 — 전역 사용량 롤링 카운터에 이번 세션 소비 토큰을 적재(인메모리·결정론, LLM 없음).
+        // 근접 시 신규 스폰 억제·judge 티어 강등의 단일 출처(usage.ts). off여도 적재는 무해(합만 함).
+        recordUsage(tokens)
         log('status', `세션 종료: ${msg.subtype} (${turns}턴, ${tokens.toLocaleString()} tok)`)
         // i9 — result subtype을 exitReason으로 분류. canUseTool에서 이미 막힌 사유
         // (tool_loop·secret_denied·spec_gaming_blocked)가 latch돼 있으면 그게 사인이므로 유지.

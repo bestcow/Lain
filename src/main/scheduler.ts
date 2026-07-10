@@ -18,6 +18,7 @@ import {
   getSettings,
   lastChatActivityAt,
   lessonsForCuration,
+  flagLesson,
   listApprovals,
   listDueRoutines,
   listProjects,
@@ -25,9 +26,10 @@ import {
   markRoutineRan,
   setSetting,
 } from './store'
-import { tierQueryOptions } from './agentopts'
+import { judgeQueryOptions } from './agentopts'
 import { buildDigest, sendToManager, setStartupBriefing } from './manager'
 import { notifyUser } from './notify'
+import { shouldAutoStartTask, startTask, hasActiveWork, drainQueue } from './orchestrator'
 import type { ChatEvent, TestState } from '../shared/types'
 
 let timer: ReturnType<typeof setInterval> | null = null
@@ -188,10 +190,11 @@ export function isIdleAt(
   return nowMs - last >= Math.max(1, idleMin) * 60_000
 }
 
-/** store 상태 기반 idle 판정 — isIdleAt 순수 코어 위 얇은 래퍼. */
+/** store 상태 기반 idle 판정 — isIdleAt 순수 코어 위 얇은 래퍼.
+ *  C1 — held(무인 승인/질문 대기)만 있는 working은 유휴로 본다(hasActiveWork). held 하나가 야간 브리핑을
+ *  무기한 정지시키던 교착 방어. */
 function isIdle(idleMin: number): boolean {
-  const hasWorking = listTasks().some((t) => t.state === 'working')
-  return isIdleAt(lastChatActivityAt(), hasWorking, Date.now(), idleMin)
+  return isIdleAt(lastChatActivityAt(), hasActiveWork(), Date.now(), idleMin)
 }
 
 // 다이제스트 변화 시 1회 판단 — 같은 상태에 반복 호출하지 않는다 (해시 가드)
@@ -234,7 +237,7 @@ JSON 한 블록만 출력:
         cwd: AGENT_CWD,
         allowedTools: [],
         maxTurns: 2,
-        ...tierQueryOptions(getSettings().judgeModel, getSettings()), // §9b — 짧은 판정류(local 라우팅 포함)
+        ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
         abortController: ac,
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
@@ -273,7 +276,7 @@ const CURATOR_HASH_KEY = 'lesson_curator_last_hash'
 // L0의 두 번째 LLM 예외 — autoPriority와 동일 격리: opt-in·해시가드(변화 없으면 skip)·60s abort·실패 무해.
 // 보수적: agent·비핀 후보만, 그룹당 2건 이상, 한 틱 최대 3병합, 전부 soft-archive(하드삭제 없음).
 async function consolidateLessons(): Promise<void> {
-  if (listTasks().some((t) => t.state === 'working')) return // 작업 중엔 idle 아님 — 미룬다
+  if (hasActiveWork()) return // 작업 중엔 idle 아님 — 미룬다 (C1: held만 있으면 활성 아님 → 큐레이터 허용)
   const candidates = lessonsForCuration(40)
   if (candidates.length < 4) return // 너무 적으면 병합 의미 없음
   const sig = (ls: typeof candidates) =>
@@ -296,6 +299,7 @@ async function consolidateLessons(): Promise<void> {
 **같은 project**의 **같은 작업 클래스**(빌드·테스트·배포·도구 사용 등) 안에서, 한쪽이 다른 쪽의 하위집합이거나 같은 함정을 가리키는 교훈 군만 umbrella 후보다.
 규칙:
 - 정말 중복·하위집합·같은 함정일 때만 통합한다. 작업 클래스가 다르거나 무관한 교훈은 **절대** 합치지 마라.
+- **모순 감지**: 교훈들이 서로 모순되면(한쪽이 다른 쪽을 정정·부정) 절대 한 umbrella로 합치지 마라 — 모순 내용을 병합하면 이미 정정된 틀린 주장이 umbrella 안에서 되살아난다. 더 최신 교훈이 사용자 정정으로 옛 교훈을 명백히 무효화할 때만 옛 교훈 번호를 retires에 넣어라(보관 처리됨). 불확실하면 합치지도 retire하지도 마라.
 - umbrella는 합쳐지는 모든 교훈의 핵심을 잃지 않게 구체적으로 써라. 각 그룹은 2건 이상. 합칠 게 없으면 merges는 빈 배열.
 - use=0이거나 last가 오래됨은 **폐기 근거가 아니다**(미사용 폐기는 lifecycle이 결정론으로 담당한다). 효과성 신호는 어느 교훈을 umbrella의 본문 기준으로 삼을지 참고용으로만 써라.
 
@@ -305,13 +309,13 @@ ${list}
 
 JSON 한 블록만 출력:
 \`\`\`json
-{"merges": [{"archive_ids": [번호…], "umbrella": {"project_id": "<합쳐지는 교훈들의 project>", "scope": "project|global", "trigger": "<적용 힌트>", "lesson": "<통합 교훈>"}}]}
+{"merges": [{"archive_ids": [번호…], "umbrella": {"project_id": "<합쳐지는 교훈들의 project>", "scope": "project|global", "trigger": "<적용 힌트>", "lesson": "<통합 교훈>"}}], "retires": [정정으로 무효화된 옛 교훈 번호…]}
 \`\`\``,
       options: {
         cwd: AGENT_CWD,
         allowedTools: [],
         maxTurns: 2,
-        ...tierQueryOptions(getSettings().judgeModel, getSettings()), // §9b — 짧은 판정류(local 라우팅 포함)
+        ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
         abortController: ac,
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN,
@@ -352,11 +356,21 @@ JSON 한 블록만 출력:
         mergeCount++
       }
     }
-    if (mergeCount > 0) {
-      const text = `[교훈 정비] ${mergeCount}개 그룹·${archivedTotal}건을 통합했다(§24 curator) — 중복 교훈을 합쳐 다음 작업 주입을 정조준한다.`
+    // 모순 정정 retire — 최신 정정이 무효화한 옛 교훈을 보관(병합 대신). flagLesson이 핀/user/이미보관을 재검증.
+    const retireIds: number[] = (Array.isArray(obj.retires) ? obj.retires : [])
+      .map(Number)
+      .filter((id: number) => candidateIds.has(id))
+      .slice(0, 5) // 한 틱 최대 5건 — 판정 폭주 방어
+    let retiredCount = 0
+    for (const id of retireIds) if (flagLesson(id)) retiredCount++
+    if (mergeCount > 0 || retiredCount > 0) {
+      const parts: string[] = []
+      if (mergeCount > 0) parts.push(`${mergeCount}개 그룹·${archivedTotal}건 통합`)
+      if (retiredCount > 0) parts.push(`정정으로 무효화된 교훈 ${retiredCount}건 보관`)
+      const text = `[교훈 정비] ${parts.join(', ')}(§24 curator) — 다음 작업 주입을 정조준한다.`
       addMessage('manager', 'assistant', text)
       emitChat({ kind: 'assistant', text })
-      // 병합으로 후보가 바뀌었으니 새 상태 해시로 갱신 — umbrella를 즉시 재병합하는 churn 방지.
+      // 병합·보관으로 후보가 바뀌었으니 새 상태 해시로 갱신 — umbrella를 즉시 재병합하는 churn 방지.
       setSetting(CURATOR_HASH_KEY, sig(lessonsForCuration(40)))
     }
   } catch {
@@ -371,6 +385,10 @@ export async function runScanOnce(): Promise<void> {
   if (running) return // 겹침 방지 — 이전 스캔이 길어지면 이번 틱은 건너뜀
   running = true
   try {
+    // D1/D7 — 주기적 자가 드레인: cap 슬롯이 이벤트 없이 빈 경우(working→blocked/승인대기 전이, P4-1 #3)나
+    // 사용량 가드가 창 소진으로 풀린 경우(P4-4 #2), 이벤트성 드레인 트리거(finish/cancel/resolve)가 없어도
+    // 대기 큐가 자동으로 열린 자리를 채우게 한다. drainQueue는 cap 여유·사용량 가드를 자체 판정하므로 무해.
+    drainQueue()
     const before = new Map(
       listProjects()
         .filter((p) => p.enabled)
@@ -378,10 +396,32 @@ export async function runScanOnce(): Promise<void> {
     )
     const targets = listProjects().filter((p) => p.enabled)
     await Promise.all(targets.map((p) => collectStatus(p)))
+    const autoStartEnabled = getSettings().autoStartTaskMd
     for (const p of listProjects().filter((x) => x.enabled)) {
       // muted(숨김) 내비는 선제 알림도 억제 — 수집은 위에서 정상 수행됨.
       if (!before.get(p.id) && p.status?.hasTaskMd && !p.muted) {
-        notifyUser('lain — TASK.md 발견', `${p.id}: ▶로 작업을 시작할 수 있다`)
+        // D5 — opt-in 자동 착수. 3중 게이트(설정 ON·autonomous 마커·verify_cmd)를 통과해야만 착수하고,
+        // 그 외엔 기존과 동일하게 알림만(수동 ▶). 통과해도 elicitation 게이트·승인 큐·spec-gaming
+        // 방어(§21)는 startTask→clarifyAndLaunch 경로 그대로라 안전장치를 우회하지 않는다.
+        const mdPath = path.join(p.path, 'TASK.md')
+        let content = ''
+        try {
+          content = fs.readFileSync(mdPath, 'utf8')
+        } catch {
+          /* 스캔·읽기 사이 파일이 사라졌으면 자동착수 스킵(알림만) */
+        }
+        if (content && shouldAutoStartTask(content, autoStartEnabled, !!p.verifyCmd)) {
+          logGate(`auto-start — ${p.id}: TASK.md autonomous 마커 + verify_cmd 확인, 자동 착수`)
+          notifyUser('lain — TASK.md 자동 착수', `${p.id}: autonomous 작업을 자동으로 시작한다`)
+          void startTask(p.id).then((r) => {
+            if (r.error) {
+              logGate(`auto-start 실패 — ${p.id}: ${r.error}`)
+              notifyUser('lain — 자동 착수 실패', `${p.id}: ${r.error}`)
+            }
+          })
+        } else {
+          notifyUser('lain — TASK.md 발견', `${p.id}: ▶로 작업을 시작할 수 있다`)
+        }
       }
     }
     onUpdated()
@@ -407,7 +447,7 @@ export async function runScanOnce(): Promise<void> {
 // i16 — listDueRoutines로 만기 루틴을 읽어 Lain에게 prompt를 보낸다(결정론 디스패치, 판단은 manager).
 // 작업 중(working)이면 미룬다(consolidate 패턴). markRoutineRan은 디스패치 '직전'에 호출해 중복 실행 차단.
 function dispatchDueRoutines(): void {
-  if (listTasks().some((t) => t.state === 'working')) return // 작업 중엔 끼어들지 않음
+  if (hasActiveWork()) return // 작업 중엔 끼어들지 않음 (C1: held만 있으면 활성 아님 → 루틴 디스패치 허용)
   for (const r of listDueRoutines()) {
     markRoutineRan(r.id) // next_run_at 재계산·중복 방지 (디스패치 직전)
     logGate(`routine dispatch — ${r.id} "${r.title}" (${r.cron})`)

@@ -31,10 +31,12 @@ const api: LainApi = {
   pushProject: (id) => ipcRenderer.invoke('projects:push', id),
   refreshStatus: (id) => ipcRenderer.invoke('status:refresh', id ?? null),
   runVerify: (id) => ipcRenderer.invoke('verify:run', id),
+  listFiles: (projectId) => ipcRenderer.invoke('files:list', projectId),
   sendChat: (text, attachments, conversationId) =>
     ipcRenderer.invoke('chat:send', text, attachments, conversationId),
   stopChat: () => ipcRenderer.invoke('chat:stop'),
   resetManager: () => ipcRenderer.invoke('chat:reset'),
+  compactNow: (conversationId) => ipcRenderer.invoke('chat:compact', conversationId),
   chatHistory: () => ipcRenderer.invoke('chat:history'),
   onProjectsUpdated: (cb) => subscribe<ProjectView[]>('projects:updated', cb),
   onChatEvent: (cb) => subscribe<ChatEvent>('chat:event', cb),
@@ -43,9 +45,12 @@ const api: LainApi = {
   appStartedAt: () => ipcRenderer.invoke('app:startedAt'),
   // Phase 1: tasks
   listTasks: () => ipcRenderer.invoke('tasks:list'),
+  dailyUsage: (windowDays) => ipcRenderer.invoke('usage:daily', windowDays),
+  recentActivity: (limit) => ipcRenderer.invoke('activity:recent', limit),
   startTask: (projectId) => ipcRenderer.invoke('tasks:start', projectId),
   answerClarify: (taskId, answers) => ipcRenderer.invoke('tasks:answer', taskId, answers),
   resolveReview: (taskId, action) => ipcRenderer.invoke('tasks:resolveReview', taskId, action),
+  revertMerge: (taskId) => ipcRenderer.invoke('tasks:revertMerge', taskId),
   cancelTask: (taskId) => ipcRenderer.invoke('tasks:cancel', taskId),
   resumeTask: (taskId) => ipcRenderer.invoke('tasks:resume', taskId),
   setTaskPermissionMode: (taskId, mode) =>
@@ -55,19 +60,44 @@ const api: LainApi = {
     ipcRenderer.invoke('tasks:setDisallowedTools', taskId, tools),
   setTaskImages: (taskId, images) => ipcRenderer.invoke('tasks:setImages', taskId, images),
   setTaskFastMode: (taskId, on) => ipcRenderer.invoke('tasks:setFastMode', taskId, on),
+  setTaskModel: (taskId, model) => ipcRenderer.invoke('tasks:setModel', taskId, model),
+  rerunTask: (taskId) => ipcRenderer.invoke('tasks:rerun', taskId),
   taskEvents: (taskId) => ipcRenderer.invoke('tasks:events', taskId),
   taskDiff: (taskId) => ipcRenderer.invoke('tasks:diff', taskId),
   listApprovals: () => ipcRenderer.invoke('approvals:list'),
   resolveApproval: (id, approved, answer) =>
     ipcRenderer.invoke('approvals:resolve', id, approved, answer),
   answerQuestion: (questionId, answer) => ipcRenderer.invoke('question:answer', questionId, answer),
+  pendingQuestions: () => ipcRenderer.invoke('question:pending'),
   onTasksUpdated: (cb) => subscribe<Task[]>('tasks:updated', cb),
   onTaskEvent: (cb) => subscribe<TaskEvent>('task:event', cb),
   onApprovalsUpdated: (cb) => subscribe<Approval[]>('approvals:updated', cb),
   // 설정
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (patch) => ipcRenderer.invoke('settings:set', patch),
+  onboardingStatus: () => ipcRenderer.invoke('onboarding:status'),
+  onboardingLogin: () => ipcRenderer.invoke('onboarding:login'),
+  workspaceInfo: () => ipcRenderer.invoke('workspace:info'),
+  openDataFolder: () => ipcRenderer.invoke('data:openFolder'),
+  backupData: () => ipcRenderer.invoke('data:backup'),
   onSettingsUpdated: (cb) => subscribe<LainSettings>('settings:updated', cb),
+  onQuip: (cb) => subscribe<{ text: string }>('quip:show', cb),
+  // D15 되감기
+  editTurnCheckpoints: (turnId) => ipcRenderer.invoke('edits:turnCheckpoints', turnId),
+  revertEditTurn: (turnId) => ipcRenderer.invoke('edits:revertTurn', turnId),
+  // D13 크로스레포 그룹
+  taskGroupInfo: (groupId) => ipcRenderer.invoke('groups:info', groupId),
+  resolveGroup: (groupId, action) => ipcRenderer.invoke('groups:resolve', groupId, action),
+  // 플래너
+  plannerList: () => ipcRenderer.invoke('planner:list'),
+  plannerUpsertItem: (input) => ipcRenderer.invoke('planner:upsertItem', input),
+  plannerDeleteItem: (id) => ipcRenderer.invoke('planner:deleteItem', id),
+  plannerSetDone: (id, done) => ipcRenderer.invoke('planner:setDone', id, done),
+  plannerUpsertTag: (input) => ipcRenderer.invoke('planner:upsertTag', input),
+  plannerDeleteTag: (id) => ipcRenderer.invoke('planner:deleteTag', id),
+  plannerUpsertSection: (input) => ipcRenderer.invoke('planner:upsertSection', input),
+  plannerDeleteSection: (id) => ipcRenderer.invoke('planner:deleteSection', id),
+  onPlannerUpdated: (cb) => subscribe<null>('planner:updated', cb),
   // 자동 업데이트
   getUpdateStatus: () => ipcRenderer.invoke('update:status'),
   checkForUpdate: () => ipcRenderer.invoke('update:check'),
@@ -95,18 +125,29 @@ const api: LainApi = {
   // 다중 세션
   listConversations: (target) => ipcRenderer.invoke('conversations:list', target),
   createConversation: (target) => ipcRenderer.invoke('conversations:create', target),
-  conversationMessages: (conversationId) =>
-    ipcRenderer.invoke('conversations:messages', conversationId),
+  conversationMessages: (conversationId, limit, beforeId) =>
+    ipcRenderer.invoke('conversations:messages', conversationId, limit, beforeId),
   getActiveConversation: (target) => ipcRenderer.invoke('conversations:getActive', target),
   setActiveConversation: (target, conversationId) =>
     ipcRenderer.invoke('conversations:setActive', target, conversationId),
   deleteConversation: (id) => ipcRenderer.invoke('conversations:delete', id),
+  conversationMessageCount: (id) => ipcRenderer.invoke('conversations:messageCount', id),
   renameConversation: (id, title) => ipcRenderer.invoke('conversations:rename', id, title),
   // 채팅 우클릭 메뉴
   copyText: (text) => ipcRenderer.send('clipboard:write', text),
   setChapter: (messageId, title) => ipcRenderer.invoke('chapter:set', messageId, title),
+  exportConversationMarkdown: (conversationId) =>
+    ipcRenderer.invoke('conversations:exportMarkdown', conversationId),
+  // 채팅 텍스트 링크화(A3)
+  openExternalUrl: (url) => ipcRenderer.invoke('shell:openExternal', url),
+  revealPath: (path) => ipcRenderer.invoke('shell:revealPath', path),
+  // A15 — Ctrl+F '전체 기간' DB 전문검색 + 히트 주변 구간 로드(점프)
+  searchChatHistory: (query, limit) => ipcRenderer.invoke('chat:searchHistory', query, limit),
+  messagesAround: (messageId, before, after) =>
+    ipcRenderer.invoke('chat:messagesAround', messageId, before, after),
   // §22 자기개선
   listLessons: () => ipcRenderer.invoke('lessons:list'),
+  lessonsAbsorbedInto: (umbrellaId) => ipcRenderer.invoke('lessons:absorbedInto', umbrellaId),
   flagLesson: (id) => ipcRenderer.invoke('lesson:flag', id),
   unflagLesson: (id) => ipcRenderer.invoke('lesson:unflag', id),
   archiveLesson: (id) => ipcRenderer.invoke('lesson:archive', id),
@@ -135,6 +176,7 @@ const api: LainApi = {
   // §23 평가 하네스
   runBench: (conditions) => ipcRenderer.invoke('bench:run', conditions),
   onBenchProgress: (cb) => subscribe<string>('bench:progress', cb),
+  listBenchRuns: () => ipcRenderer.invoke('bench:list'),
   // 창 제어 (frameless — OS 타이틀바를 헤더에 통합)
   windowMinimize: () => ipcRenderer.invoke('window:minimize'),
   windowMaximizeToggle: () => ipcRenderer.invoke('window:maximizeToggle'),

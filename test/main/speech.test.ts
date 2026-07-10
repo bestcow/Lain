@@ -29,7 +29,19 @@ describe('spokenText — TTS로 읽을 텍스트', () => {
   it('태그 없는 짧은 응답은 그대로 읽는다', () => {
     expect(spokenText('처리하실 사항은 없습니다.')).toBe('처리하실 사항은 없습니다.')
   })
-  it('태그 없는 긴 본문은 읽지 않는다(전문 낭독 방지)', () => {
-    expect(spokenText('가'.repeat(300))).toBe('')
+  it('태그 없는 긴 본문은 첫 문장만 읽는다(완전 무음 방지, B7-1)', () => {
+    const r = spokenText('가'.repeat(300))
+    expect(r).not.toBe('')
+    expect(r.length).toBeLessThanOrEqual(100)
+  })
+  it('첫 문장이 마침표로 끝나면 그 문장까지만 읽는다', () => {
+    expect(spokenText('첫 문장입니다. ' + '나'.repeat(200))).toBe('첫 문장입니다.')
+  })
+  it('첫 문장 구분자가 줄바꿈이면 그 줄까지만 읽는다', () => {
+    expect(spokenText('첫 줄\n' + '다'.repeat(200))).toBe('첫 줄')
+  })
+  it('종결부호도 줄바꿈도 없는 장문은 100자로 컷한다', () => {
+    const r = spokenText('가'.repeat(300))
+    expect(r).toBe('가'.repeat(100))
   })
 })

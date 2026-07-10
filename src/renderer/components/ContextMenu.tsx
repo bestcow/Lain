@@ -42,10 +42,30 @@ export function ContextMenu({
     })
   }, [x, y, openUp])
 
-  // 바깥 클릭·Esc·스크롤·창 이동 → 닫기
+  // 열리면 첫 항목에 포커스 — Tab 없이도 바로 ↑↓로 탐색 가능하게.
+  useEffect(() => {
+    ref.current?.querySelector<HTMLButtonElement>('.ctx-item:not(:disabled)')?.focus()
+  }, [])
+
+  // 바깥 클릭·Esc·스크롤·창 이동 → 닫기. ↑↓는 메뉴 항목 간 포커스 이동(우클릭 메뉴 키보드 완결).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') {
+        onClose()
+        return
+      }
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+      const el = ref.current
+      if (!el) return
+      const opts = Array.from(el.querySelectorAll<HTMLButtonElement>('.ctx-item:not(:disabled)'))
+      if (opts.length === 0) return
+      e.preventDefault()
+      const cur = opts.indexOf(document.activeElement as HTMLButtonElement)
+      const next =
+        e.key === 'ArrowDown'
+          ? opts[(cur + 1) % opts.length]
+          : opts[(cur - 1 + opts.length) % opts.length]
+      next.focus()
     }
     window.addEventListener('mousedown', onClose)
     window.addEventListener('scroll', onClose, true)

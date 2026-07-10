@@ -72,13 +72,17 @@ export type TtsBackendConfig = {
   gptSovitsRefAudio: string
   gptSovitsRefText: string
   gptSovitsRefLang: string
+  gptSovitsSpeed?: number // 말 속도(speed_factor) 0.5~2.0, 기본 1.0
   discordTtsVoice?: string
 }
-export type TtsResult = { audio: Buffer; mime: 'audio/wav' | 'audio/mpeg' }
+// fallback: true면 설정한 로컬 엔진(gpt-sovits/supertonic)이 실패해 edge 목소리로 대체됐다는 뜻
+// (B7-2) — 호출측(렌더러)이 '설정 표시=실제 일치' 위배를 사용자에게 통보할 수 있게 반환에 싣는다.
+export type TtsResult = { audio: Buffer; mime: 'audio/wav' | 'audio/mpeg'; fallback?: boolean }
 export async function synthesizeBackend(text: string, cfg: TtsBackendConfig): Promise<TtsResult> {
-  const edge = async (): Promise<TtsResult> => ({
+  const edge = async (fallback?: boolean): Promise<TtsResult> => ({
     audio: await synthesize(text, cfg.discordTtsVoice || undefined),
     mime: 'audio/mpeg',
+    ...(fallback ? { fallback: true } : {}),
   })
   try {
     if (cfg.ttsBackend === 'gpt-sovits' && cfg.gptSovitsRefAudio) {
@@ -88,6 +92,7 @@ export async function synthesizeBackend(text: string, cfg: TtsBackendConfig): Pr
           refAudio: cfg.gptSovitsRefAudio,
           refText: cfg.gptSovitsRefText,
           refLang: cfg.gptSovitsRefLang,
+          speed: cfg.gptSovitsSpeed, // 미설정이면 synthesizeGptSovits가 1.0
         }),
         mime: 'audio/wav',
       }
@@ -103,7 +108,8 @@ export async function synthesizeBackend(text: string, cfg: TtsBackendConfig): Pr
       }
     }
   } catch {
-    // 로컬 엔진(gpt-sovits/supertonic) 실패 → edge 폴백. 아래 공통 edge 경로로 떨어진다.
+    // 로컬 엔진(gpt-sovits/supertonic) 실패 → edge 폴백. 설정이 애초에 edge면 폴백이 아니다(정상 경로).
+    return edge(true)
   }
   return edge()
 }

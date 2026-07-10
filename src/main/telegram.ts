@@ -22,17 +22,31 @@ import {
   listLessons,
   searchChatHistory,
   ensureActiveConversation,
+  listPlanItems,
+  listPlanSections,
+  setPlanItemDone,
+  snoozePlanItem,
 } from './store'
 import { resolveApproval } from './worker'
 import { startTask, answerClarify, resolveReview, cancelTask } from './orchestrator'
 import { sendToNavi, sendToAllNavis } from './navichat'
-import { sendToManager, buildDigest } from './manager'
+import {
+  sendToManager,
+  buildDigest,
+  bindManagerQuestionMirror,
+  getPendingQuestion,
+  answerUserQuestion,
+} from './manager'
+import { encodeQuestionCallback, parseQuestionCallback, type PendingQuestion } from './questionbus'
 import { buildLearnPrompt } from './learnprompt'
 import { scanProjects } from './registry'
 import { collectStatus, runVerify } from './collectors'
 import { setNotifyHook } from './notify'
 import { generateBriefing } from './briefing'
-import type { TelegramStatus } from '../shared/types'
+import { onPlanReminder } from './planner'
+import { occurrencesInRange, fmtLocal } from '../shared/planmath'
+import type { TelegramStatus, FileAttachment } from '../shared/types'
+import { isSupportedImageMime, pickLargestPhoto, checkAttachmentSize } from './telegram-attach'
 
 const LOG = path.join(DATA_DIR, 'telegram.log')
 function tlog(m: string): void {
@@ -73,6 +87,13 @@ let briefedThisRun = false
 // 답장(reply)으로 답을 받을 봇 메시지 → 무엇에 대한 답인지
 type AskCtx = { kind: 'approval'; id: number } | { kind: 'clarify'; taskId: string }
 const askByMsg = new Map<number, AskCtx>()
+// B5 — 폰에 민 인라인 질문 카드: questionId → 텔레그램 message_id(답변/타임아웃 시 그 카드를 editMessageText로 정리).
+const questionCardMsg = new Map<string, number>()
+// B5(I-tg) — send() 왕복 중 이미 답변된 질문의 결과 텍스트를 임시 보관. resolve가 카드 등록 전에 오면
+// 여기 적어두고, push가 mid를 등록한 뒤 즉시 정리한다(고아 카드 방지). push의 finally에서 항상 비운다.
+// pushingQuestions로 '실제 push 진행 중'일 때만 기록해, 미푸시·이중 resolve에서 마커가 누수되지 않게 게이팅.
+const questionResolveWhilePushing = new Map<string, string>()
+const pushingQuestions = new Set<string>()
 
 /** 상시 노출 Reply Keyboard — Lain은 단일 총괄 세션이라 세션 전환/생성 버튼은 없다. 현황만. */
 const REPLY_KEYBOARD = {
@@ -251,6 +272,55 @@ function onNotify(title: string, body: string): void {
   void send(`${title}\n${body}`)
 }
 
+// ── B5: ask_user 인라인 질문 크로스서피스 — 기존 승인 푸시(inline_keyboard + callback_data)를 재사용해
+//    Lain의 선택형 질문을 폰에도 띄우고, 폰 버튼 응답을 waitForUserAnswer로 되돌린다. ──
+// 보기 텍스트가 길거나 많아도 텔레그램 callback_data 64바이트 제한을 넘지 않게 인덱스만 인코딩(q|<questionId>|<index>).
+async function pushQuestionToTelegram(q: PendingQuestion): Promise<void> {
+  if (!getSettings().telegramChatId) return
+  pushingQuestions.add(q.questionId) // send() 왕복 동안 '진행 중' 표시 — resolve가 이 창에 오면 마커로 넘긴다.
+  try {
+    const label = q.multi ? '❓ (복수 선택 — PC에서 답하거나 버튼으로 하나씩)' : '❓ 질문'
+    const rows = q.options.map((opt, i) => [{
+      // 버튼 라벨은 보기 원문(절단), callback_data는 인덱스만(위조·길이 안전).
+      text: opt.length > 60 ? `${opt.slice(0, 57)}…` : opt,
+      callback_data: encodeQuestionCallback(q.questionId, i),
+    }])
+    const mid = await send(`${label}\n\n${q.question}`, { inline_keyboard: rows })
+    if (mid) {
+      questionCardMsg.set(q.questionId, mid)
+      // 레이스: send() 왕복 중 PC가 먼저 답하면 resolveQuestionOnTelegram이 mid 미등록으로 스킵했다 —
+      // 이제 mid가 생겼으니 그 결과로 카드를 즉시 정리(고아 카드 잔존 방지).
+      const early = questionResolveWhilePushing.get(q.questionId)
+      if (early !== undefined) resolveQuestionOnTelegram(q.questionId, early)
+    }
+  } catch (e) {
+    tlog(`push question fail: ${(e as Error).message}`)
+  } finally {
+    // 성공·실패·미전송 무관하게 마커를 비운다(push가 mid를 못 얻은 경우엔 정리할 카드가 애초에 없다).
+    pushingQuestions.delete(q.questionId)
+    questionResolveWhilePushing.delete(q.questionId)
+  }
+}
+
+// 답변/타임아웃 시 폰 카드를 결과로 갱신(중복 응답 방지·상태 가시화). PC·폰 어디서 답해도 여기로 온다.
+function resolveQuestionOnTelegram(questionId: string, answerText: string): void {
+  const mid = questionCardMsg.get(questionId)
+  questionCardMsg.delete(questionId)
+  const chatId = getSettings().telegramChatId
+  if (!chatId) return
+  if (mid === undefined) {
+    // 카드가 아직 등록 전(push의 send() 왕복 중)일 수 있다 — 그때만 마커에 남겨 push 완료 후 정리하게 한다.
+    // push 진행 중이 아니면(미푸시·이미 정리됨) 정리할 카드가 없으니 무시(마커 누수 방지).
+    if (pushingQuestions.has(questionId)) questionResolveWhilePushing.set(questionId, answerText)
+    return
+  }
+  void api('editMessageText', {
+    chat_id: chatId,
+    message_id: mid,
+    text: `❓ 질문 — ${answerText}`,
+  }).catch(() => {})
+}
+
 // ── 미해결 액션 reconcile (DB에서 유도 → 버튼과 함께 푸시) ──
 async function reconcile(): Promise<void> {
   if (!getSettings().telegramChatId) return
@@ -412,6 +482,16 @@ async function handleCallback(cb: any): Promise<void> {
   const ack = (text?: string) =>
     api('answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {})
   try {
+    // B5 — ask_user 인라인 질문 응답(q|<questionId>|<index>). 위조·구형은 parse가 null → 무시.
+    const q = parseQuestionCallback(data)
+    if (q) {
+      const pending = getPendingQuestion(q.questionId) // 존재하지 않으면(이미 답함·만료·위조) 무시
+      const opt = pending?.options[q.index]
+      if (!pending || opt === undefined) return void ack('이미 처리됨')
+      answerUserQuestion(q.questionId, [opt]) // 대기 중 Lain 턴을 깨운다(단일 resolve 가드는 questionbus)
+      resolveQuestionOnTelegram(q.questionId, opt)
+      return void ack(`선택: ${opt.slice(0, 40)}`)
+    }
     if (/^a\d+[yn]$/.test(data)) {
       const yes = data.endsWith('y')
       const id = Number(data.slice(1, -1))
@@ -423,6 +503,18 @@ async function handleCallback(cb: any): Promise<void> {
       })
       await ack(yes ? '승인됨' : '거절됨')
       await editDone(cb, yes ? '✅ 승인됨' : '❌ 거절됨')
+    } else if (/^p\d+[ds]$/.test(data)) {
+      const id = Number(data.slice(1, -1))
+      if (data.endsWith('d')) {
+        setPlanItemDone(id, true)
+        await ack('완료')
+        await editDone(cb, '✅ 완료')
+      } else {
+        const until = fmtLocal(new Date(Date.now() + 10 * 60_000))
+        snoozePlanItem(id, until)
+        await ack('+10분')
+        await editDone(cb, `⏰ ${until.slice(11)}에 다시`)
+      }
     } else if (data.startsWith('r|')) {
       const [, act, taskId] = data.split('|')
       const action = act === 'merge' ? 'merge' : act === 'keep' ? 'keep-branch' : 'discard'
@@ -538,11 +630,58 @@ async function handleVoice(m: any): Promise<void> {
   }
 }
 
+// ── 인바운드: 사진·문서 첨부 (B14) ── PC의 FileAttachment 파이프라인(manager.ts)에 그대로 태운다.
+// 이미지(image/*, Anthropic 4종)만 지원 — 그 외 문서는 안내 회신으로 무반응 증발을 없앤다(과확장은 YAGNI).
+async function handleAttachment(m: any): Promise<void> {
+  const isPhoto = Array.isArray(m.photo) && m.photo.length > 0
+  const doc = m.document
+  // photo는 항상 image/jpeg(텔레그램이 재인코딩), document는 원본 mime을 클라이언트가 보낸 그대로 신뢰.
+  const mimeType: string = isPhoto ? 'image/jpeg' : (doc?.mime_type ?? '')
+  if (!isSupportedImageMime(mimeType)) {
+    return void send(`⚠ 지원하지 않는 파일 형식이다 (${mimeType || '알 수 없음'}) — 이미지(jpg/png/gif/webp)만 첨부 가능`)
+  }
+
+  const fileObj = isPhoto ? pickLargestPhoto(m.photo) : doc
+  if (!fileObj) return void send('⚠ 첨부 파일을 읽을 수 없다')
+  const sizeErr = checkAttachmentSize(fileObj.file_size)
+  if (sizeErr) return void send(`⚠ ${sizeErr}`)
+
+  await send('📎 첨부 처리 중…')
+  try {
+    // 1. Telegram 파일 경로 취득 (handleVoice와 동일 경로 재사용)
+    const fileInfo = await api('getFile', { file_id: fileObj.file_id })
+    const filePath: string = fileInfo.file_path
+
+    // 2. 다운로드 (토큰은 URL에만 — 로그 비노출 §9-6)
+    const token = getSettings().telegramBotToken
+    const fileRes = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`)
+    if (!fileRes.ok) throw new Error(`download ${fileRes.status}`)
+    const buf = Buffer.from(await fileRes.arrayBuffer())
+
+    // 3. base64 FileAttachment로 변환 — manager.ts sendToManager의 이미지 계약과 동일 형태.
+    const name = doc?.file_name ?? filePath.split('/').pop() ?? 'photo.jpg'
+    const attachment: FileAttachment = {
+      name,
+      mimeType,
+      data: buf.toString('base64'),
+      isImage: true,
+    }
+
+    const caption: string = (m.caption ?? '').trim() || '이 이미지 봐줘'
+    const conv = tgActiveConv()
+    await routeToManager(caption, conv, undefined, [attachment])
+  } catch (e) {
+    tlog(`handleAttachment fail: ${(e as Error).message}`)
+    void send(`⚠ 첨부 처리 오류: ${(e as Error).message.slice(0, 200)}`)
+  }
+}
+
 // ── 인바운드: 메시지 ──
 async function handleMessage(m: any): Promise<void> {
   const text: string = (m.text ?? '').trim()
   if (!text) {
-    if (m.voice ?? m.audio) await handleVoice(m)
+    if (m.voice ?? m.audio) return void (await handleVoice(m))
+    if ((Array.isArray(m.photo) && m.photo.length > 0) || m.document) return void (await handleAttachment(m))
     return
   }
 
@@ -598,7 +737,12 @@ async function handleMessage(m: any): Promise<void> {
   return routeToManager(text, conv)
 }
 
-async function routeToManager(text: string, conversationId: string, modelText?: string): Promise<void> {
+async function routeToManager(
+  text: string,
+  conversationId: string,
+  modelText?: string,
+  attachments: FileAttachment[] = [],
+): Promise<void> {
   // emit은 텔레그램 봇 회신 전용. PC 렌더러 반영은 manager의 rendererMirror가 conversationId 태깅해 처리(중복 아님).
   // origin='telegram' → 폰에서 친 메시지도 PC의 해당 세션·목록에 라이브로 뜬다(§20.3 동기화).
   // 응답중 표시: 텔레그램 typing은 ~5초만 유지 → 4초마다 재전송, 첫 회신 도착 또는 finally에서 정지.
@@ -628,7 +772,7 @@ async function routeToManager(text: string, conversationId: string, modelText?: 
         }
       },
       false,
-      [],
+      attachments,
       0,
       conversationId,
       'telegram',
@@ -668,6 +812,7 @@ Lain은 하나의 총괄 세션이다 (폰·PC가 같은 대화 공유). 나뉜 
 /status  현황 다이제스트
 /tasks   진행 중 작업
 /projects  프로젝트 목록
+/plan  오늘·이번 주 일정 + 체크리스트
 /go <프로젝트id> [작업내용]  작업 시작 (작업내용 없으면 TASK.md)
 /cancel <taskId>  작업 취소
 /verify <프로젝트id>  검증 실행
@@ -720,6 +865,8 @@ async function handleCommand(text: string): Promise<void> {
     case '/lessons':
     case '/l':
       return void send(lessonsText())
+    case '/plan':
+      return void send(planText())
     case '/search':
     case '/find': {
       if (!arg) return void send('형식: /search <키워드> — 레인과의 지난 대화 전문 검색')
@@ -838,6 +985,32 @@ function lessonsText(): string {
   })
   const more = all.length > top.length ? `\n… 외 ${all.length - top.length}건` : ''
   return `📚 학습 ${all.length}건 (사용 중 · 재사용순)\n\n${lines.join('\n')}${more}`
+}
+
+// /plan — 오늘~+7일 일정(반복 전개, 시각순) + 섹션별 미완료 todo. 결정론 즉답(레인 경유 없음).
+function planText(): string {
+  const items = listPlanItems().filter((i) => !i.done)
+  const now = new Date()
+  const from = fmtLocal(new Date(now.getFullYear(), now.getMonth(), now.getDate()))
+  const to = fmtLocal(new Date(now.getTime() + 7 * 86_400_000))
+  const evs = items
+    .flatMap((i) => occurrencesInRange(i, from, to).map((o) => ({ i, o })))
+    .sort((a, b) => a.o.localeCompare(b.o))
+    .map(({ i, o }) => `${o.replace('T', ' ')} ${i.title}${i.recur !== 'none' ? ' ↻' : ''}`)
+  const secs = new Map(listPlanSections().map((s) => [s.id, s.name]))
+  const todos = items.filter((i) => i.kind === 'todo')
+  const bySection = new Map<string, string[]>()
+  for (const t of todos) {
+    const name = t.sectionId ? secs.get(t.sectionId) ?? '기타' : '기타'
+    const list = bySection.get(name) ?? []
+    list.push(`☐ ${t.title}${t.startAt ? ` (마감 ${t.startAt.slice(0, 10)})` : ''}`)
+    bySection.set(name, list)
+  }
+  if (evs.length === 0 && bySection.size === 0) return '일정·할 일 없음'
+  const parts: string[] = []
+  if (evs.length) parts.push(`📅 일정\n${evs.join('\n')}`)
+  for (const [name, list] of bySection) parts.push(`📋 ${name}\n${list.join('\n')}`)
+  return parts.join('\n\n')
 }
 
 function stateGlyph(state: string): string {
@@ -999,6 +1172,7 @@ async function registerCommands(): Promise<void> {
         { command: 'status',    description: '현황 다이제스트' },
         { command: 'tasks',     description: '진행 중 작업 목록' },
         { command: 'projects',  description: '프로젝트 목록' },
+        { command: 'plan',      description: '오늘·이번 주 일정 + 체크리스트' },
         { command: 'approvals', description: '미해결 승인·결재 다시 보기' },
         { command: 'go',        description: '작업 시작: <프로젝트id> [작업내용]' },
         { command: 'cancel',    description: '작업 취소: <taskId>' },
@@ -1020,6 +1194,19 @@ export async function startTelegram(): Promise<void> {
   const s = getSettings()
   if (!s.telegramEnabled || !s.telegramBotToken) return
   setNotifyHook(onNotify)
+  // B5 — Lain의 인라인 질문(ask_user·편집/계획 승인)을 폰에도 미러하고, 답변/타임아웃 시 폰 카드를 정리한다.
+  bindManagerQuestionMirror(
+    (q) => void pushQuestionToTelegram(q),
+    (questionId, answerText) => resolveQuestionOnTelegram(questionId, answerText),
+  )
+  onPlanReminder((item, occur) => {
+    void send(`⏰ ${occur.slice(11)} ${item.title}${item.body ? `\n${item.body.slice(0, 200)}` : ''}`, {
+      inline_keyboard: [[
+        { text: '✓ 완료', callback_data: `p${item.id}d` },
+        { text: '+10분', callback_data: `p${item.id}s` },
+      ]],
+    })
+  })
   const gen = ++genId
   running = true
   authFailed = false // 새 시도 — 이전 인증 실패 리셋
@@ -1092,6 +1279,7 @@ export function stopTelegram(): void {
     healthTimer = null
   }
   setNotifyHook(null)
+  onPlanReminder(null)
   sentApprovals.clear()
   sentReview.clear()
   sentBlocked.clear()

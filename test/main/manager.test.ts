@@ -28,8 +28,8 @@ vi.mock('../../src/main/store', async (importOriginal) => {
   }
 })
 
-import { sendToManager, buildDigest, fastChatVerdict } from '../../src/main/manager'
-import type { ProjectView } from '../../src/shared/types'
+import { sendToManager, buildDigest, fastChatVerdict, summarizeToolError } from '../../src/main/manager'
+import type { ProjectView, Task } from '../../src/shared/types'
 
 // 빠른 대화 레인(②③) 판정 — 경량 응답이 답인지 vs 본체 승격인지.
 describe('fastChatVerdict — 빠른 대화 답/승격 판정', () => {
@@ -90,5 +90,59 @@ describe('buildDigest — muted [숨김] 태그', () => {
     expect(digest).toContain('visible | 상태 미수집')
     expect(digest).toContain('tucked [숨김] | 상태 미수집')
     expect(digest).not.toContain('visible [숨김]')
+  })
+
+  // D6 — 진행 중(working) 작업이 있으면 그 turns·diffStat로 '진행중: …' 조각을 붙인다.
+  const mkTask = (projectId: string, state: string, turns: number, diffStat: string | null) =>
+    ({ id: `t-${projectId}`, projectId, state, turns, diffStat }) as unknown as Task
+
+  it('working 작업의 진행 조각(진행중: N턴 · +X/-Y)을 프로젝트 줄에 붙인다', () => {
+    const digest = buildDigest(
+      [mkProject('visible', false)],
+      [mkTask('visible', 'working', 12, ' 2 files changed, 240 insertions(+), 31 deletions(-)')],
+    )
+    expect(digest).toContain('진행중: 12턴 · +240/-31')
+  })
+  it('working 작업이 없으면 진행 조각을 붙이지 않는다', () => {
+    const digest = buildDigest([mkProject('visible', false)], [mkTask('visible', 'done', 5, 'x')])
+    expect(digest).not.toContain('진행중')
+  })
+  it('diffStat이 비면 diff 없음(이상징후 힌트)', () => {
+    const digest = buildDigest([mkProject('visible', false)], [mkTask('visible', 'working', 3, null)])
+    expect(digest).toContain('진행중: 3턴 · diff 없음')
+  })
+  it('projectId당 첫 working 작업만(중복 방지)', () => {
+    const digest = buildDigest(
+      [mkProject('visible', false)],
+      [
+        mkTask('visible', 'working', 7, ' 1 file changed, 10 insertions(+)'),
+        mkTask('visible', 'working', 99, ' 1 file changed, 999 insertions(+)'),
+      ],
+    )
+    expect(digest).toContain('진행중: 7턴 · +10/-0')
+    expect(digest).not.toContain('99턴')
+  })
+})
+
+// A7 — 도구 실패(tool_result is_error) 요약. 채팅 한 줄(→ ✗ ...)에 실릴 텍스트라 개행 제거·길이 상한이 핵심.
+describe('summarizeToolError — 도구 실패 메시지 한 줄 축약', () => {
+  it('짧은 메시지는 그대로', () => {
+    expect(summarizeToolError('File not found: foo.txt')).toBe('File not found: foo.txt')
+  })
+  it('앞뒤 공백 트림', () => {
+    expect(summarizeToolError('  boom  ')).toBe('boom')
+  })
+  it('개행·연속 공백을 단일 공백으로 접어 한 줄 유지', () => {
+    expect(summarizeToolError('line1\nline2\n\n  line3')).toBe('line1 line2 line3')
+  })
+  it('200자 초과분은 잘라 말줄임(…)', () => {
+    const long = 'x'.repeat(250)
+    const out = summarizeToolError(long)
+    expect(out.endsWith('…')).toBe(true)
+    expect(out.length).toBe(201) // 200자 + '…'
+  })
+  it('빈 문자열/공백만 있으면 대체 문구', () => {
+    expect(summarizeToolError('')).toBe('(오류 메시지 없음)')
+    expect(summarizeToolError('   ')).toBe('(오류 메시지 없음)')
   })
 })

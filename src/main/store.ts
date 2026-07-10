@@ -31,15 +31,24 @@ import type {
   BenchTaskResult,
   Lesson,
   Routine,
+  PlanItem,
+  PlanItemInput,
+  PlanTag,
+  PlanSection,
   McpServer,
   McpServerInput,
   Task,
   TaskEvent,
   TaskState,
+  TaskEngine,
+  TaskUsageRow,
+  ActivityRaw,
   NaviMode,
   TaskPermissionMode,
   ThinkingLevel,
+  ChatHistoryHit,
 } from '../shared/types'
+import { MODEL_TIERS } from '../shared/models' // m6 — 티어 목록 단일출처(로컬 중복 제거)
 // 출력측 비밀 redaction + 교훈 인젝션 스캔 — 구현은 safety 소유자, store는 chokepoint에서 import-only.
 import { redactSecrets, scanLessonInjection } from './safety'
 // curatedPlugins 기본값(CC-FEATURES P1) — skills는 store를 import하지 않아 단방향(순환 없음).
@@ -163,6 +172,22 @@ export function initStore(): void {
       cost_usd          REAL NOT NULL DEFAULT 0,
       created_at        TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS task_groups (
+      id            TEXT PRIMARY KEY,                     -- D13 — 크로스레포 작업 그룹
+      title         TEXT NOT NULL,
+      spec          TEXT NOT NULL DEFAULT '',             -- child들에 공통 주입되는 공유 명세
+      resolve_state TEXT NOT NULL DEFAULT '',             -- ''=평시 | 'merging'=일괄 병합 진행 중(크래시 감지용, 재리뷰 #2)
+      created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS edit_checkpoints (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      turn_id         TEXT NOT NULL,                       -- D15 — 같은 턴의 편집 묶음(레인 sendToManager 라운드)
+      conversation_id TEXT NOT NULL,
+      file_path       TEXT NOT NULL,                       -- 편집 대상 절대경로
+      backup_path     TEXT,                                -- 편집 전 스냅샷 파일(DATA_DIR/checkpoints/...). NULL=편집 전 파일 없었음(복원=삭제)
+      tool            TEXT NOT NULL,                       -- Edit | Write
+      created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS routines (
       id           TEXT PRIMARY KEY,
       project_id   TEXT,                                  -- nullable. 특정 프로젝트 스코프(NULL=전역/Lain 차원 루틴)
@@ -186,6 +211,42 @@ export function initStore(): void {
       targets     TEXT NOT NULL DEFAULT 'manager,navi',   -- CSV 레벨 할당(cascade)
       enabled     INTEGER NOT NULL DEFAULT 1,
       created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS plan_items (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind               TEXT NOT NULL,              -- 'event' | 'todo'
+      title              TEXT NOT NULL,
+      body               TEXT NOT NULL DEFAULT '',   -- 메모·링크 (md)
+      start_at           TEXT,                       -- ISO. event 필수. todo는 선택(=마감일, 있으면 캘린더에 표시·리마인드 대상)
+      end_at             TEXT,                       -- ISO. NULL 허용(점 이벤트)
+      all_day            INTEGER NOT NULL DEFAULT 0,
+      recur              TEXT NOT NULL DEFAULT 'none', -- none | daily | weekly:<0-6> | monthly:<1-31>
+      tag_id             INTEGER,                    -- plan_tags FK (NULL=무태그)
+      section_id         INTEGER,                    -- plan_sections FK (todo 전용, NULL=기본)
+      done               INTEGER NOT NULL DEFAULT 0,
+      done_at            TEXT,
+      remind_offset_min  INTEGER,                    -- NULL=설정 기본값 사용. start_at 있는 항목(event·마감 todo)에 적용
+      remind_sent_at     TEXT,                       -- 마지막 리마인드 발송 시각(반복이면 발생 회차별 재무장)
+      snooze_until       TEXT,                       -- [+10분] 스누즈 — 이 시각 전엔 리마인드 억제
+      pinned             INTEGER NOT NULL DEFAULT 0,
+      sort_order         INTEGER NOT NULL DEFAULT 0,
+      origin             TEXT NOT NULL DEFAULT 'user', -- user | lain | telegram
+      archived           INTEGER NOT NULL DEFAULT 0, -- 보관(하드삭제 없음 — 성장 보존 관행)
+      -- localtime: staleTodos 등이 로컬 ISO와 문자열 비교 — UPDATE 경로(datetime('now','localtime'))와 일치 필수
+      created_at         TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+      updated_at         TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    );
+    CREATE TABLE IF NOT EXISTS plan_tags (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      name       TEXT NOT NULL UNIQUE,
+      color      TEXT NOT NULL,             -- #rrggbb
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS plan_sections (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      name       TEXT NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      collapsed  INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS agent_skills (
       name         TEXT PRIMARY KEY,                      -- ascii kebab([a-z0-9-]) — 폴더명 겸 도구 인자
@@ -233,6 +294,20 @@ export function initStore(): void {
     db.exec('ALTER TABLE tasks ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0')
   } catch {
     /* 이미 있음 */
+  }
+  // I4 — 라이프타임 누적 토큰(핸드오프·resume·verify재시도로 세션이 여러 개인 작업의 예산 판정 기준).
+  //  - tokens_total: 지금까지 모든 세션의 누계(= session_base_tokens + 현재 세션 cumulative).
+  //  - session_base_tokens: 현재 세션 이전 세션들의 누계(현재 세션 result가 세션 cumulative를 보고할 때
+  //    동일세션 재갱신은 교체·새 세션은 가산이 되도록 하는 baseline). 표시용 task.tokens(세션값)는 유지.
+  for (const col of [
+    'ALTER TABLE tasks ADD COLUMN tokens_total INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE tasks ADD COLUMN session_base_tokens INTEGER NOT NULL DEFAULT 0',
+  ]) {
+    try {
+      db.exec(col)
+    } catch {
+      /* 이미 있음 */
+    }
   }
   try {
     db.exec('ALTER TABLE bench_runs ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0')
@@ -361,6 +436,66 @@ export function initStore(): void {
     /* 이미 존재 */
   }
   try {
+    // 작업 실행 엔진 — claude(기본) | codex(OpenAI Codex CLI). worker만 해당.
+    db.exec("ALTER TABLE tasks ADD COLUMN engine TEXT NOT NULL DEFAULT 'claude'")
+  } catch {
+    /* 이미 존재 */
+  }
+  try {
+    // D3 — runNavi throw로 error 확정 전 자동 재시도한 횟수(영속·무한루프 방지). 재부팅 후에도 유지.
+    db.exec('ALTER TABLE tasks ADD COLUMN auto_retry_count INTEGER NOT NULL DEFAULT 0')
+  } catch {
+    /* 이미 존재 */
+  }
+  try {
+    // D10 — 작업별 모델 고정(빈 문자열=전역 naviModel 따름). 다음 실행/재개부터 적용.
+    db.exec("ALTER TABLE tasks ADD COLUMN model_override TEXT NOT NULL DEFAULT ''")
+  } catch {
+    /* 이미 존재 */
+  }
+  try {
+    // A4 — 최신 TodoWrite 스냅샷(JSON TodoItem[], 누적 아님). task_events에도 kind='todo'로
+    // 각 호출을 영속하지만(감사·리플레이), 이 컬럼은 "지금 상태"를 O(1)로 읽는 캐시 — NaviTile
+    // 진행률(n/m)이 listTasks() 브로드캐스트만으로 갱신되게 한다(새 조회 IPC 불필요).
+    db.exec('ALTER TABLE tasks ADD COLUMN todos TEXT')
+  } catch {
+    /* 이미 존재 */
+  }
+  try {
+    // D1 — 대기 큐(queued) 드레인 순서. 낮을수록 먼저, 기본 0. queued 아닌 상태에선 무의미(보존만).
+    db.exec('ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
+  } catch {
+    /* 이미 존재 */
+  }
+  try {
+    // D2 — 작업 간 의존성(선행 task id JSON 배열, '[]'=없음). 미충족이면 queued에 머물고 선행이
+    // 전부 done 되면 drainQueue가 자동 착수한다(레인 세션 기억과 무관한 L0 결정론).
+    db.exec("ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'")
+  } catch {
+    /* 이미 존재 */
+  }
+  try {
+    // 재리뷰 #2 — 그룹 일괄 병합 진행 플래그. resolveGroup이 병합 루프 진입 시 'merging'으로 영속하고
+    // 완료(성공·롤백 포함) 시 ''로 되돌린다. 크래시로 'merging'이 남으면 부팅 recoverGroups가 감지·통지.
+    db.exec("ALTER TABLE task_groups ADD COLUMN resolve_state TEXT NOT NULL DEFAULT ''")
+  } catch {
+    /* 이미 존재 */
+  }
+  for (const col of [
+    // D8 — ff 병합 성공 시 되돌릴 커밋 범위를 포착. base=병합 직전 main tip, head=병합 후 main tip.
+    // ff 병합엔 머지커밋이 없으므로 revert는 범위(base..head)의 각 커밋을 개별 revert(비파괴, 새 revert 커밋 생성).
+    // 둘 다 NULL이면 되돌릴 병합 없음(keep-branch/discard/미병합). setState/updateTask 매핑 반영.
+    'ALTER TABLE tasks ADD COLUMN merge_base_sha TEXT', // 병합 직전 main tip(되돌릴 범위 하한, exclusive)
+    'ALTER TABLE tasks ADD COLUMN merge_head_sha TEXT', // 병합 후 main tip=Navi 브랜치 tip(되돌릴 범위 상한, inclusive)
+    'ALTER TABLE tasks ADD COLUMN group_id TEXT', // D13 — 크로스레포 작업 그룹 소속(NULL=단독). 그룹은 all-or-nothing 결재(resolve_group)
+  ]) {
+    try {
+      db.exec(col)
+    } catch {
+      /* 이미 존재 */
+    }
+  }
+  try {
     // 내비 '제거'는 하드 삭제가 아니라 보드에서 숨김(데이터 보존) — id가 폴더 경로 결정론이라
     // 같은 폴더를 다시 추가하면 대화·교훈·작업·현황이 그대로 복원된다. 스캔이 되살리지 않게 플래그로 둔다.
     db.exec('ALTER TABLE projects ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
@@ -376,6 +511,15 @@ export function initStore(): void {
     db.exec('UPDATE projects SET enabled = 1 WHERE enabled = 0')
   } catch {
     /* 이미 있음 */
+  }
+  // 온보딩(첫 실행 위저드) 1회 플래그 — 기존 설치(프로젝트가 이미 등록됨)는 위저드를 건너뛴다.
+  try {
+    if (getSetting('onboarding_done') == null) {
+      const c = (db.prepare('SELECT COUNT(*) AS c FROM projects').get() as { c?: number })?.c ?? 0
+      if (c > 0) setSetting('onboarding_done', '1')
+    }
+  } catch {
+    /* 무시 — 실패해도 부팅은 계속 */
   }
   // 다중 세션 마이그레이션(1회) — 기존 대화(레거시 1세션)를 conversations 행으로 옮기고 메시지를 백필한다.
   // try/catch: DB가 비정상이어도 부팅(projects/tasks 로드)을 절대 깨지 않는다.
@@ -721,6 +865,30 @@ function repairIndexesIfCorrupt(): void {
 
 function logRecovery(m: string): void {
   appendCapped(path.join(DATA_DIR, 'recovery.log'), `${new Date().toISOString()} ${m}\n`)
+}
+
+// E8 — 데이터 백업 내보내기. WAL을 메인 파일로 합친 뒤(단일 파일 백업이 완전하도록) lain.sqlite를
+// 사용자가 고른 경로로 복사한다. 외부 의존 없음(node:sqlite 체크포인트 + fs 복사). busy(리더 경합으로
+// 병합 미완)면 그 사실을 반환해 호출측이 '잠시 후 다시'를 안내하게 한다 — 불완전 백업을 성공으로 위장 않음.
+export function backupDatabase(destPath: string): {
+  ok: boolean
+  bytes?: number
+  busy?: boolean
+  error?: string
+} {
+  try {
+    let busy = false
+    try {
+      const cp = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').all() as Array<{ busy?: number }>
+      busy = Boolean(cp[0]?.busy)
+    } catch {
+      busy = true // 체크포인트 실패 = 병합 미보장
+    }
+    fs.copyFileSync(path.join(DATA_DIR, 'lain.sqlite'), destPath)
+    return { ok: true, bytes: fs.statSync(destPath).size, busy }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  }
 }
 
 // 저널 도입 이전부터 DB에 있던 기존 대화·메시지를 1회 저널에 백필한다 — 지금 있는 기록도 진실원천에
@@ -1109,6 +1277,13 @@ function nowStamp(): string {
   return new Date().toISOString().slice(0, 19).replace('T', ' ')
 }
 
+// 사용자 시각 필드 표준 포맷 — 로컬 ISO 'YYYY-MM-DDTHH:mm' (다른 plan 시각 필드와 문자열 비교·정렬 일관성 유지).
+function nowLocalMinuteISO(): string {
+  const d = new Date()
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 export function addMessage(
   scope: ChatMessage['scope'],
   role: ChatMessage['role'],
@@ -1317,13 +1492,91 @@ export function deleteConversation(id: string): void {
   db.prepare('DELETE FROM conversations WHERE id = ?').run(id)
 }
 
-export function listConversationMessages(conversationId: string, limit = 200): ChatMessage[] {
+// ── D15 되감기 — 레인 직접 편집 체크포인트 메타(본문 스냅샷은 파일, 여기는 메타만) ──
+export interface EditCheckpointRow {
+  id: number
+  turnId: string
+  conversationId: string
+  filePath: string
+  backupPath: string | null // NULL = 편집 전 파일 없었음(복원 = 삭제)
+  tool: string
+  createdAt: string
+}
+
+function rowToEditCheckpoint(r: Record<string, unknown>): EditCheckpointRow {
+  return {
+    id: Number(r.id),
+    turnId: String(r.turn_id),
+    conversationId: String(r.conversation_id),
+    filePath: String(r.file_path),
+    backupPath: r.backup_path == null ? null : String(r.backup_path),
+    tool: String(r.tool),
+    createdAt: String(r.created_at),
+  }
+}
+
+export function insertEditCheckpoint(row: {
+  turnId: string
+  conversationId: string
+  filePath: string
+  backupPath: string | null
+  tool: string
+}): number {
+  const r = db
+    .prepare(
+      'INSERT INTO edit_checkpoints (turn_id, conversation_id, file_path, backup_path, tool) VALUES (?, ?, ?, ?, ?)',
+    )
+    .run(row.turnId, row.conversationId, row.filePath, row.backupPath, row.tool)
+  return Number(r.lastInsertRowid)
+}
+
+/** 턴의 체크포인트 전건 — id ASC(편집 순서). 파일별 '최초' 행이 편집 전(pre-turn) 상태다. */
+export function editCheckpointsForTurn(turnId: string): EditCheckpointRow[] {
+  return (
+    db.prepare('SELECT * FROM edit_checkpoints WHERE turn_id = ? ORDER BY id ASC').all(turnId) as Record<
+      string,
+      unknown
+    >[]
+  ).map(rowToEditCheckpoint)
+}
+
+/** 턴 목록(최신순) — 보존 정리(cleanupCheckpoints)가 나이·용량 기준으로 오래된 턴을 지울 때 쓴다. */
+export function listEditCheckpointTurns(): { turnId: string; lastAt: string }[] {
+  return (
+    db
+      .prepare(
+        'SELECT turn_id AS turnId, MAX(created_at) AS lastAt FROM edit_checkpoints GROUP BY turn_id ORDER BY lastAt DESC',
+      )
+      .all() as { turnId: string; lastAt: string }[]
+  ).map((r) => ({ turnId: String(r.turnId), lastAt: String(r.lastAt) }))
+}
+
+export function deleteEditCheckpointTurn(turnId: string): void {
+  db.prepare('DELETE FROM edit_checkpoints WHERE turn_id = ?').run(turnId)
+}
+
+/** 대화의 메시지 개수 — 삭제 확인창(B9)이 정확한 삭제량을 보이도록 deleteConversation과 동일하게
+ *  visible_from_id 워터마크 무관 전건 COUNT(listConversationMessages의 limit·워터마크 필터와 다름). */
+export function conversationMessageCount(id: string): number {
+  const r = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?').get(id) as {
+    n: number
+  }
+  return Number(r.n)
+}
+
+// A15 — beforeId(있으면 그 id보다 오래된 메시지부터, 위로 스크롤 페이징 커서)는 옵션이라 기존 호출부
+// (전체 이력 내보내기·초기 로드 등, beforeId 없음)는 그대로 동작한다.
+export function listConversationMessages(
+  conversationId: string,
+  limit = 200,
+  beforeId?: number,
+): ChatMessage[] {
   // 단일 세션 화면 정리 — visible_from_id 워터마크 이전 메시지는 숨긴다(DB엔 보존). 기본 0이라 무영향(Navi 포함).
   const rows = db
     .prepare(
-      'SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? AND id >= COALESCE((SELECT visible_from_id FROM conversations WHERE id = ?), 0) ORDER BY id DESC LIMIT ?) ORDER BY id ASC',
+      `SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? AND id >= COALESCE((SELECT visible_from_id FROM conversations WHERE id = ?), 0)${beforeId != null ? ' AND id < ?' : ''} ORDER BY id DESC LIMIT ?) ORDER BY id ASC`,
     )
-    .all(conversationId, conversationId, limit)
+    .all(...(beforeId != null ? [conversationId, conversationId, beforeId, limit] : [conversationId, conversationId, limit]))
   return rows.map(rowToChatMessage)
 }
 
@@ -1427,6 +1680,44 @@ export function listRecentCcEvents(limit = 20): CcEvent[] {
   }))
 }
 
+/** C6 — 전역 활동 피드 원시 행: task_events(의미있는 kind/status)+cc_events를 각각 최근 순으로 뽑아
+ *  하나의 배열로 넘긴다(시간 역순 병합·라벨링은 렌더러 mergeActivity가 담당 — 순수·검증 가능).
+ *  ⚠️ status는 낱낱이 노이즈라, 라이프사이클 신호(작업 생성/검토 대기)만 LIKE로 좁힌다. approval:* 등
+ *  시스템 신호와 도구/텍스트/todo 스냅샷은 애초에 제외(kind 필터). 읽기 전용 SELECT. */
+export function listRecentActivity(limit = 20): ActivityRaw[] {
+  const cap = Math.max(1, Math.min(200, Math.floor(limit)))
+  // 병합 후 상위 limit만 표시하므로 각 소스는 limit개씩만 당겨오면 충분(전량 스캔 방지).
+  const taskRows = db
+    .prepare(
+      `SELECT task_id, kind, content, created_at
+       FROM task_events
+       WHERE kind IN ('error','exit')
+          OR (kind = 'status' AND (content LIKE '작업 생성%' OR content LIKE '검토 대기%'))
+       ORDER BY id DESC LIMIT ?`,
+    )
+    .all(cap) as any[]
+  const ccRows = db
+    .prepare('SELECT project_id, event, created_at FROM cc_events ORDER BY id DESC LIMIT ?')
+    .all(cap) as any[]
+  const out: ActivityRaw[] = []
+  for (const r of taskRows)
+    out.push({
+      source: 'task',
+      at: r.created_at,
+      detail: r.kind,
+      text: r.content ?? null,
+      taskId: r.task_id ?? null,
+    })
+  for (const r of ccRows)
+    out.push({
+      source: 'cc',
+      at: r.created_at,
+      detail: r.event,
+      projectId: r.project_id ?? null,
+    })
+  return out
+}
+
 /** idle 판정 기준 — 마지막 채팅 활동 시각(ISO/datetime 문자열). messages의 MAX(created_at).
  *  메시지가 하나도 없으면 null. scheduler.isIdle이 now와 비교해 끼어듦 게이트로 쓴다.
  *  어깨너머(overlay) 자발 발화는 레인 스스로의 곁다리라 '사용자 활동'이 아니다 — idle 시계에서 제외해
@@ -1501,11 +1792,24 @@ function rowToTask(r: any): Task {
     verifyResult: r.verify_result,
     costUsd: r.cost_usd,
     tokens: r.tokens ?? 0,
+    tokensTotal: r.tokens_total ?? 0, // I4 — 라이프타임 누적(예산 판정 기준)
+    sessionBaseTokens: r.session_base_tokens ?? 0, // I4 — 현재 세션 이전 세션들의 누계(baseline)
     turns: r.turns,
     error: r.error,
+    autoRetryCount: r.auto_retry_count ?? 0,
     skills: r.skills ? JSON.parse(r.skills) : null,
     images: r.images ? JSON.parse(r.images) : [],
     fastMode: r.fast_mode === 1,
+    modelOverride: (MODEL_TIERS as readonly string[]).includes(r.model_override)
+      ? (r.model_override as ModelTier)
+      : '',
+    todos: r.todos ? JSON.parse(r.todos) : null,
+    engine: r.engine === 'codex' ? 'codex' : 'claude',
+    priority: r.priority ?? 0,
+    dependsOn: r.depends_on ? JSON.parse(r.depends_on) : [], // D2 — 선행 task id 배열
+    groupId: r.group_id ?? null, // D13 — 크로스레포 그룹 소속(NULL=단독)
+    mergeBaseSha: r.merge_base_sha ?? null, // D8 — 되돌릴 병합 범위 하한(exclusive). NULL=되돌릴 병합 없음
+    mergeHeadSha: r.merge_head_sha ?? null, // D8 — 되돌릴 병합 범위 상한(inclusive)
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }
@@ -1523,15 +1827,25 @@ export function insertTask(t: {
   disallowedTools?: string[]
   skills?: string[]
   fastMode?: boolean
+  modelOverride?: ModelTier | ''
+  engine?: TaskEngine
+  priority?: number // D1 — queued 드레인 순서(낮을수록 먼저, 기본 0)
+  dependsOn?: string[] // D2 — 선행 task id(전부 done 돼야 착수)
+  groupId?: string // D13 — 크로스레포 그룹 소속
 }): void {
   db.prepare(
-    'INSERT INTO tasks (id, project_id, title, state, content, mode, permission_mode, thinking_level, disallowed_tools, skills, fast_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO tasks (id, project_id, title, state, content, mode, permission_mode, thinking_level, disallowed_tools, skills, fast_mode, model_override, engine, priority, depends_on, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   ).run(t.id, t.projectId, t.title, t.state, t.content, t.mode ?? 'interactive',
         t.permissionMode ?? 'acceptEdits',
         t.thinkingLevel ?? 'default',
         JSON.stringify(t.disallowedTools ?? []),
         t.skills && t.skills.length ? JSON.stringify(t.skills) : null,
-        t.fastMode ? 1 : 0)
+        t.fastMode ? 1 : 0,
+        t.modelOverride ?? '',
+        t.engine === 'codex' ? 'codex' : 'claude',
+        t.priority ?? 0,
+        JSON.stringify(t.dependsOn ?? []),
+        t.groupId ?? null)
 }
 
 export function updateTask(id: string, patch: Partial<Task>): void {
@@ -1551,8 +1865,15 @@ export function updateTask(id: string, patch: Partial<Task>): void {
     verifyResult: 'verify_result',
     costUsd: 'cost_usd',
     tokens: 'tokens',
+    tokensTotal: 'tokens_total', // I4 — 라이프타임 누적
+    sessionBaseTokens: 'session_base_tokens', // I4 — 세션 baseline
     turns: 'turns',
     error: 'error',
+    autoRetryCount: 'auto_retry_count',
+    modelOverride: 'model_override',
+    priority: 'priority',
+    mergeBaseSha: 'merge_base_sha', // D8 — 병합 범위 하한(포착 시 저장, revert에 사용)
+    mergeHeadSha: 'merge_head_sha', // D8 — 병합 범위 상한
   }
   const sets: string[] = []
   const vals: (string | number | null)[] = []
@@ -1570,6 +1891,10 @@ export function updateTask(id: string, patch: Partial<Task>): void {
     sets.push('skills = ?')
     vals.push(patch.skills && patch.skills.length ? JSON.stringify(patch.skills) : null)
   }
+  if ('dependsOn' in patch) {
+    sets.push('depends_on = ?')
+    vals.push(JSON.stringify(patch.dependsOn ?? []))
+  }
   if ('disallowedTools' in patch) {
     sets.push('disallowed_tools = ?')
     vals.push(JSON.stringify(patch.disallowedTools ?? []))
@@ -1581,6 +1906,10 @@ export function updateTask(id: string, patch: Partial<Task>): void {
   if ('fastMode' in patch) {
     sets.push('fast_mode = ?')
     vals.push(patch.fastMode ? 1 : 0)
+  }
+  if ('todos' in patch) {
+    sets.push('todos = ?')
+    vals.push(patch.todos && patch.todos.length ? JSON.stringify(patch.todos) : null)
   }
   if (sets.length === 0) return
   sets.push("updated_at = datetime('now')")
@@ -1599,13 +1928,111 @@ export function listTasks(limit = 100): Task[] {
     .map(rowToTask)
 }
 
-export function activeTaskForProject(projectId: string): Task | null {
+/** C4 — 토큰 사용량 일별 집계용: 최근 windowDays일에 생성된 작업의 (projectId, tokens, cost, createdAt).
+ *  ⚠️ created_at은 datetime('now')=UTC라 로컬 날짜 버킷팅은 렌더러(summarizeUsage)가 한다 — 여기선
+ *  UTC 기준으로 넉넉히(창을 표시일수보다 하루 넓게) 원시 행만 넘긴다(로컬 경계 slop 흡수). 읽기 전용. */
+export function dailyTaskUsage(windowDays = 15): TaskUsageRow[] {
+  const days = Math.max(1, Math.min(400, Math.floor(windowDays)))
+  return (
+    db
+      .prepare(
+        `SELECT project_id, tokens, cost_usd, created_at
+         FROM tasks
+         WHERE created_at >= datetime('now', ?)
+         ORDER BY created_at DESC`,
+      )
+      .all(`-${days} days`) as any[]
+  ).map((r) => ({
+    projectId: r.project_id,
+    tokens: r.tokens ?? 0,
+    costUsd: r.cost_usd ?? 0,
+    createdAt: r.created_at,
+  }))
+}
+
+/** D14 — 프로젝트의 활성(queued 제외) 작업 수. projectParallelCap 게이트의 계수(activeTaskForProject와 동일 상태 필터). */
+export function activeTaskCountForProject(projectId: string): number {
   const r = db
     .prepare(
-      "SELECT * FROM tasks WHERE project_id = ? AND state NOT IN ('done','error','cancelled') ORDER BY created_at DESC LIMIT 1",
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state NOT IN ('done','error','cancelled','queued')",
+    )
+    .get(projectId) as { n: number }
+  return Number(r.n)
+}
+
+export function activeTaskForProject(projectId: string): Task | null {
+  // D1 — queued는 아직 착수 전(슬롯 대기)이라 '활성'이 아니다. 활성에 넣으면 드레인이
+  // 같은 프로젝트를 영원히 착수 못 한다(자기 자신을 활성으로 봐 (a) 게이트를 막음).
+  const r = db
+    .prepare(
+      "SELECT * FROM tasks WHERE project_id = ? AND state NOT IN ('done','error','cancelled','queued') ORDER BY created_at DESC LIMIT 1",
     )
     .get(projectId)
   return r ? rowToTask(r) : null
+}
+
+// ── D13 크로스레포 작업 그룹 ──
+export interface TaskGroup {
+  id: string
+  title: string
+  spec: string
+  resolveState: string // ''=평시 | 'merging'=일괄 병합 진행 중(재리뷰 #2 크래시 감지)
+  createdAt: string
+}
+
+export function insertTaskGroup(g: { id: string; title: string; spec: string }): void {
+  db.prepare('INSERT INTO task_groups (id, title, spec) VALUES (?, ?, ?)').run(g.id, g.title, g.spec)
+}
+
+function rowToTaskGroup(r: Record<string, unknown>): TaskGroup {
+  return {
+    id: String(r.id),
+    title: String(r.title),
+    spec: String(r.spec),
+    resolveState: String(r.resolve_state ?? ''),
+    createdAt: String(r.created_at),
+  }
+}
+
+export function getTaskGroup(id: string): TaskGroup | null {
+  const r = db.prepare('SELECT * FROM task_groups WHERE id = ?').get(id) as Record<string, unknown> | undefined
+  return r ? rowToTaskGroup(r) : null
+}
+
+/** 재리뷰 #2 — 그룹 일괄 병합 진행 플래그('merging' | ''). 크래시 감지의 영속 근거. */
+export function setGroupResolveState(id: string, state: '' | 'merging'): void {
+  db.prepare('UPDATE task_groups SET resolve_state = ? WHERE id = ?').run(state, id)
+}
+
+/** 재리뷰 #2 — 병합 도중 크래시로 'merging'이 남은 그룹 전건(부팅 recoverGroups 소비). */
+export function listResolvingGroups(): TaskGroup[] {
+  return (db.prepare("SELECT * FROM task_groups WHERE resolve_state != ''").all() as Record<string, unknown>[]).map(
+    rowToTaskGroup,
+  )
+}
+
+/** 그룹 소속 child task 전건(생성 순서). */
+export function tasksForGroup(groupId: string): Task[] {
+  return db
+    .prepare('SELECT * FROM tasks WHERE group_id = ? ORDER BY created_at ASC')
+    .all(groupId)
+    .map(rowToTask)
+}
+
+/** D1 — 대기 큐 조회. priority ASC(낮을수록 먼저), 동률이면 created_at ASC(먼저 들어온 것 먼저). */
+export function queuedTasks(): Task[] {
+  return db
+    .prepare("SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority ASC, created_at ASC")
+    .all()
+    .map(rowToTask)
+}
+
+/** D1 — 대기 작업의 드레인 우선순위 설정(reorder_queue 도구). queued 아닌 작업도 컬럼은 갱신되나 무의미. */
+export function setTaskPriority(taskId: string, priority: number): void {
+  db.prepare("UPDATE tasks SET priority = ?, updated_at = datetime('now') WHERE id = ?").run(
+    priority,
+    taskId,
+  )
 }
 
 export function insertApproval(taskId: string, kind: string, payload: string): number {
@@ -1877,9 +2304,50 @@ export function revertConsolidationBatch(batch: string): number {
   return restored
 }
 
+/** C7 — 병합 통합본(umbrella)에 흡수된 원본 교훈들(absorbed_into 역참조). 상세창 계보 표시용. 읽기 전용.
+ *  createdAt 오름차순(오래된 원본 먼저)으로 정렬 — 계보를 시간순으로 나열한다. */
+export function lessonsAbsorbedInto(umbrellaId: number): Lesson[] {
+  return db
+    .prepare('SELECT * FROM lessons WHERE absorbed_into = ? ORDER BY created_at ASC, id ASC')
+    .all(umbrellaId)
+    .map(rowToLesson)
+}
+
 /** §24 Phase3 patch-on-use — Navi가 '주입된 교훈이 틀렸다'고 신고하면 즉시 soft-archive(복구 가능).
  *  pinned·origin='user'는 보호. 신고 자체가 신호라 judge LLM 불필요(틀린 교훈 누적 §22.2 정면 차단).
  *  반환: 실제로 보관됐는지. */
+/** 사용자 정정發 철회 — 키워드로 비보관 교훈을 찾아 soft-archive하고, 잘못된 내용이 병합으로
+ *  살아남지 못하게 absorbed_into 우산(파생 통합본) 체인도 함께 보관한다(2026-07-05 사고: 잘못된
+ *  교훈을 보관해도 큐레이터 umbrella에 흡수된 사본이 active로 남아 재발). 사용자 명시 철회라
+ *  pinned·origin='user'도 대상 — 명시 의사가 불가침 표시보다 우선한다. 반환: 보관된 교훈 목록. */
+export function retractLessons(keyword: string): { id: number; lesson: string }[] {
+  const kw = `%${keyword.trim()}%`
+  const direct = db
+    .prepare(
+      `SELECT id, lesson, absorbed_into FROM lessons
+       WHERE status != 'archived' AND (lesson LIKE ? OR trigger LIKE ?)`,
+    )
+    .all(kw, kw) as { id: number; lesson: string; absorbed_into: number | null }[]
+  if (direct.length === 0) return []
+  const target = new Map<number, string>()
+  for (const r of direct) {
+    target.set(r.id, r.lesson)
+    // 우산 체인 위로 — 철회 대상이 이미 병합됐다면 통합본에도 같은 내용이 들어 있다.
+    let cur = r.absorbed_into
+    while (cur != null && !target.has(cur)) {
+      const u = db
+        .prepare('SELECT id, lesson, absorbed_into, status FROM lessons WHERE id = ?')
+        .get(cur) as { id: number; lesson: string; absorbed_into: number | null; status: string } | undefined
+      if (!u) break
+      if (u.status !== 'archived') target.set(u.id, u.lesson)
+      cur = u.absorbed_into
+    }
+  }
+  const stmt = db.prepare(`UPDATE lessons SET status = 'archived' WHERE id = ?`)
+  for (const id of target.keys()) stmt.run(id)
+  return [...target.entries()].map(([id, lesson]) => ({ id, lesson }))
+}
+
 export function flagLesson(id: number): boolean {
   const r = db
     .prepare(
@@ -1980,13 +2448,7 @@ export function deleteAllLessons(): void {
 }
 
 // ── 레인 세션 검색 (학습루프 T4) — 무한세션 압축으로 world_state 요약만 남는 갭을 원문 회수로 보완 ──
-export interface ChatHistoryHit {
-  id: number
-  conversationId: string | null
-  role: string
-  when: string
-  snippet: string
-}
+// ChatHistoryHit 타입은 shared/types.ts로 이전(A15 — preload/renderer도 같은 타입을 써야 해서 단일출처화).
 
 /** 순수 — 첫 매치 텀 주변으로 스니펫을 자른다(±width). 매치 없으면 선두부터. 공백 정규화. */
 export function makeSnippet(content: string, terms: string[], width = 90): string {
@@ -2292,6 +2754,203 @@ export function markRoutineRan(id: string, nowIso?: string): void {
   db.prepare('UPDATE routines SET last_run_at = ?, next_run_at = ? WHERE id = ?').run(now, next, id)
 }
 
+// ── 플래너 — plan_items/plan_tags/plan_sections (2026-07-05 설계) ──
+function rowToPlanItem(r: any): PlanItem {
+  return {
+    id: r.id,
+    kind: r.kind,
+    title: r.title,
+    body: r.body,
+    startAt: r.start_at ?? null,
+    endAt: r.end_at ?? null,
+    allDay: !!r.all_day,
+    recur: r.recur,
+    tagId: r.tag_id ?? null,
+    sectionId: r.section_id ?? null,
+    done: !!r.done,
+    doneAt: r.done_at ?? null,
+    remindOffsetMin: r.remind_offset_min ?? null,
+    remindSentAt: r.remind_sent_at ?? null,
+    snoozeUntil: r.snooze_until ?? null,
+    pinned: !!r.pinned,
+    sortOrder: r.sort_order,
+    origin: r.origin,
+    archived: !!r.archived,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+/** 정렬: kind, sort_order, id. includeArchived 기본 false(보관 항목 제외). */
+export function listPlanItems(includeArchived = false): PlanItem[] {
+  const sql = includeArchived
+    ? 'SELECT * FROM plan_items ORDER BY kind, sort_order, id'
+    : 'SELECT * FROM plan_items WHERE archived = 0 ORDER BY kind, sort_order, id'
+  return db.prepare(sql).all().map(rowToPlanItem)
+}
+
+/** id 있으면 UPDATE(+updated_at 갱신), 없으면 INSERT. 반환은 id. startAt 등 사용자 시각 필드는 저장값 그대로(변환 금지). */
+export function upsertPlanItem(input: PlanItemInput): number {
+  if (input.id != null) {
+    const cur = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(input.id) as any
+    if (!cur) throw new Error(`plan_items: id ${input.id} 없음`)
+    const merged = {
+      kind: input.kind ?? cur.kind,
+      title: input.title ?? cur.title,
+      body: input.body ?? cur.body,
+      start_at: input.startAt !== undefined ? input.startAt : cur.start_at,
+      end_at: input.endAt !== undefined ? input.endAt : cur.end_at,
+      all_day: input.allDay !== undefined ? (input.allDay ? 1 : 0) : cur.all_day,
+      recur: input.recur ?? cur.recur,
+      tag_id: input.tagId !== undefined ? input.tagId : cur.tag_id,
+      section_id: input.sectionId !== undefined ? input.sectionId : cur.section_id,
+      remind_offset_min: input.remindOffsetMin !== undefined ? input.remindOffsetMin : cur.remind_offset_min,
+      pinned: input.pinned !== undefined ? (input.pinned ? 1 : 0) : cur.pinned,
+      sort_order: input.sortOrder !== undefined ? input.sortOrder : cur.sort_order,
+      origin: input.origin ?? cur.origin,
+    }
+    db.prepare(
+      `UPDATE plan_items SET kind=?, title=?, body=?, start_at=?, end_at=?, all_day=?, recur=?,
+        tag_id=?, section_id=?, remind_offset_min=?, pinned=?, sort_order=?, origin=?,
+        updated_at = datetime('now', 'localtime')
+       WHERE id=?`,
+    ).run(
+      merged.kind,
+      merged.title,
+      merged.body,
+      merged.start_at,
+      merged.end_at,
+      merged.all_day,
+      merged.recur,
+      merged.tag_id,
+      merged.section_id,
+      merged.remind_offset_min,
+      merged.pinned,
+      merged.sort_order,
+      merged.origin,
+      input.id,
+    )
+    return input.id
+  }
+  const result = db
+    .prepare(
+      `INSERT INTO plan_items
+        (kind, title, body, start_at, end_at, all_day, recur, tag_id, section_id,
+         remind_offset_min, pinned, sort_order, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.kind,
+      input.title,
+      input.body ?? '',
+      input.startAt ?? null,
+      input.endAt ?? null,
+      input.allDay ? 1 : 0,
+      input.recur ?? 'none',
+      input.tagId ?? null,
+      input.sectionId ?? null,
+      input.remindOffsetMin ?? null,
+      input.pinned ? 1 : 0,
+      input.sortOrder ?? 0,
+      input.origin ?? 'user',
+    )
+  return Number(result.lastInsertRowid)
+}
+
+/** 완료 토글 — done_at 세팅/해제, updated_at 갱신. */
+export function setPlanItemDone(id: number, done: boolean): void {
+  db.prepare(
+    `UPDATE plan_items SET done = ?, done_at = ?, updated_at = datetime('now', 'localtime') WHERE id = ?`,
+  ).run(done ? 1 : 0, done ? nowLocalMinuteISO() : null, id)
+}
+
+/** 보관(하드삭제 없음 — 성장 보존 관행). */
+export function archivePlanItem(id: number): void {
+  db.prepare(
+    `UPDATE plan_items SET archived = 1, updated_at = datetime('now', 'localtime') WHERE id = ?`,
+  ).run(id)
+}
+
+/** 리마인드 발송 확정 — remind_sent_at=발생(occurrence) ISO, snooze_until 해제. */
+export function markPlanReminded(id: number, occurISO: string): void {
+  db.prepare(
+    `UPDATE plan_items SET remind_sent_at = ?, snooze_until = NULL, updated_at = datetime('now', 'localtime') WHERE id = ?`,
+  ).run(occurISO, id)
+}
+
+/** 스누즈 — snooze_until 세팅, remind_sent_at 해제(재무장). */
+export function snoozePlanItem(id: number, untilISO: string): void {
+  db.prepare(
+    `UPDATE plan_items SET snooze_until = ?, remind_sent_at = NULL, updated_at = datetime('now', 'localtime') WHERE id = ?`,
+  ).run(untilISO, id)
+}
+
+function rowToPlanTag(r: any): PlanTag {
+  return { id: r.id, name: r.name, color: r.color, sortOrder: r.sort_order }
+}
+
+export function listPlanTags(): PlanTag[] {
+  return db.prepare('SELECT * FROM plan_tags ORDER BY sort_order, id').all().map(rowToPlanTag)
+}
+
+export function upsertPlanTag(t: { id?: number; name: string; color: string; sortOrder?: number }): number {
+  if (t.id != null) {
+    db.prepare('UPDATE plan_tags SET name = ?, color = ?, sort_order = ? WHERE id = ?').run(
+      t.name,
+      t.color,
+      t.sortOrder ?? 0,
+      t.id,
+    )
+    return t.id
+  }
+  const result = db
+    .prepare('INSERT INTO plan_tags (name, color, sort_order) VALUES (?, ?, ?)')
+    .run(t.name, t.color, t.sortOrder ?? 0)
+  return Number(result.lastInsertRowid)
+}
+
+/** 삭제 시 참조하던 항목의 tag_id를 NULL로 정리(FK 끊김 방지). */
+export function deletePlanTag(id: number): void {
+  db.prepare('UPDATE plan_items SET tag_id = NULL WHERE tag_id = ?').run(id)
+  db.prepare('DELETE FROM plan_tags WHERE id = ?').run(id)
+}
+
+function rowToPlanSection(r: any): PlanSection {
+  return { id: r.id, name: r.name, sortOrder: r.sort_order, collapsed: !!r.collapsed }
+}
+
+export function listPlanSections(): PlanSection[] {
+  return db.prepare('SELECT * FROM plan_sections ORDER BY sort_order, id').all().map(rowToPlanSection)
+}
+
+export function upsertPlanSection(s: {
+  id?: number
+  name: string
+  sortOrder?: number
+  collapsed?: boolean
+}): number {
+  if (s.id != null) {
+    const cur = db.prepare('SELECT * FROM plan_sections WHERE id = ?').get(s.id) as any
+    db.prepare('UPDATE plan_sections SET name = ?, sort_order = ?, collapsed = ? WHERE id = ?').run(
+      s.name,
+      s.sortOrder ?? cur?.sort_order ?? 0,
+      s.collapsed !== undefined ? (s.collapsed ? 1 : 0) : (cur?.collapsed ?? 0),
+      s.id,
+    )
+    return s.id
+  }
+  const result = db
+    .prepare('INSERT INTO plan_sections (name, sort_order, collapsed) VALUES (?, ?, ?)')
+    .run(s.name, s.sortOrder ?? 0, s.collapsed ? 1 : 0)
+  return Number(result.lastInsertRowid)
+}
+
+/** 삭제 시 참조하던 항목의 section_id를 NULL로 정리(FK 끊김 방지). */
+export function deletePlanSection(id: number): void {
+  db.prepare('UPDATE plan_items SET section_id = NULL WHERE section_id = ?').run(id)
+  db.prepare('DELETE FROM plan_sections WHERE id = ?').run(id)
+}
+
 // ── 외부 MCP 서버 (CC-FEATURES P1) — Routine과 동형 CRUD. 시크릿(env/headers)은 로그 금지(§9-6) ──
 const MCP_RESERVED = new Set(['lain'])
 
@@ -2445,6 +3104,35 @@ export function insertBenchResult(runId: string, r: BenchTaskResult): void {
   )
 }
 
+/** C10 — 벤치 이력 조회. run_id별로 묶어 시간순(오래된 런 먼저) 반환.
+ *  집계(byCondition 등)는 하지 않고 원본 결과만 준다 — 집계는 bench.ts의 aggregate()가 담당(중복 방지). */
+export function listBenchRuns(): { runId: string; startedAt: string; results: BenchTaskResult[] }[] {
+  const rows = db
+    .prepare(
+      `SELECT run_id, bench_task, condition, success, verify_first_pass, turns, cost_usd, tokens, created_at
+       FROM bench_runs ORDER BY id ASC`,
+    )
+    .all() as any[]
+  const byRun = new Map<string, { runId: string; startedAt: string; results: BenchTaskResult[] }>()
+  for (const r of rows) {
+    let g = byRun.get(r.run_id)
+    if (!g) {
+      g = { runId: r.run_id, startedAt: r.created_at, results: [] }
+      byRun.set(r.run_id, g)
+    }
+    g.results.push({
+      benchTask: r.bench_task,
+      condition: r.condition,
+      success: !!r.success,
+      verifyFirstPass: !!r.verify_first_pass,
+      turns: r.turns,
+      costUsd: r.cost_usd,
+      tokens: r.tokens,
+    })
+  }
+  return [...byRun.values()]
+}
+
 export function getSetting(key: string): string | null {
   const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as any
   return r ? r.value : null
@@ -2483,8 +3171,6 @@ export function setSetting(key: string, value: string): void {
 
 // ── 타입드 설정 뷰 (§9b 티어링 매핑 + cap) — settings 테이블 위 헬퍼 ──
 
-const MODEL_TIERS = ['haiku', 'sonnet', 'opus', 'fable', 'local'] as const
-
 function asTier(v: string | null, fallback: ModelTier): ModelTier {
   return (MODEL_TIERS as readonly string[]).includes(v ?? '') ? (v as ModelTier) : fallback
 }
@@ -2503,10 +3189,15 @@ const DEFAULT_SENSITIVE_APPS = [
 export function getSettings(): LainSettings {
   return {
     concurrencyCap: Math.max(1, Number(getSetting('concurrency_cap') ?? '2') || 2),
+    // D14 — 프로젝트당 동시 활성 작업 상한(기본 1=종전 '프로젝트당 1개'). 2+는 같은 레포 병렬 opt-in.
+    projectParallelCap: Math.max(1, Math.min(4, Number(getSetting('project_parallel_cap') ?? '1') || 1)),
+    taskTokenBudget: Math.max(0, Number(getSetting('task_token_budget') ?? '0') || 0),
+    usageWindowTokenLimit: Math.max(0, Number(getSetting('usage_window_token_limit') ?? '0') || 0),
     naviModel: asTier(getSetting('worker_model'), 'sonnet'),
     managerModel: asTier(getSetting('manager_model'), 'sonnet'),
     judgeModel: asTier(getSetting('judge_model'), 'sonnet'),
     localBaseUrl: getSetting('local_base_url') ?? 'http://127.0.0.1:8080',
+    anthropicApiKey: getSetting('anthropic_api_key') ?? '',
     managerPermissionMode: (['default', 'acceptEdits', 'plan', 'bypass'] as readonly string[]).includes(
       getSetting('manager_permission_mode') ?? '',
     )
@@ -2549,16 +3240,65 @@ export function getSettings(): LainSettings {
     })(),
     monitorCooldownSec: Math.max(5, Number(getSetting('monitor_cooldown_sec') ?? '30') || 30),
     monitorPollMs: Math.max(500, Number(getSetting('monitor_poll_ms') ?? '1500') || 1500),
+    // 말수(quips+감시 선제발화 빈도) 0~4 — 0(묵언)이 유효값이라 `|| 기본` 폴백 금지, NaN만 방어.
+    chattiness: (() => {
+      const n = Number(getSetting('chattiness') ?? '2')
+      return Number.isFinite(n) ? Math.max(0, Math.min(4, Math.floor(n))) : 2
+    })(),
+    workspaceRoot: getSetting('workspace_root') ?? '',
+    scanDirs: (() => {
+      const raw = getSetting('scan_dirs')
+      if (raw == null) return []
+      try {
+        const v = JSON.parse(raw)
+        return Array.isArray(v) ? v.map(String).filter(Boolean) : []
+      } catch {
+        return []
+      }
+    })(),
     scanIntervalMin: Math.max(0, Number(getSetting('scan_interval_min') ?? '10') || 0),
     closeToTray: (getSetting('close_to_tray') ?? '1') === '1',
     autoStart: (getSetting('auto_start') ?? '0') === '1',
     autoPriority: (getSetting('auto_priority') ?? '0') === '1',
+    autoStartTaskMd: (getSetting('auto_start_task_md') ?? '0') === '1',
+    autoRebaseOnMerge: (getSetting('auto_rebase_on_merge') ?? '1') === '1', // D8 — 기본 on(자동 시도+안전 폴백)
     lessonCurator: (getSetting('lesson_curator') ?? '0') === '1',
     turnReviewEnabled: (getSetting('turn_review') ?? '1') === '1',
     verifyNudgeEnabled: (getSetting('verify_nudge') ?? '1') === '1',
     idleMin: Math.max(1, Number(getSetting('idle_min') ?? '3') || 3),
     routinesEnabled: (getSetting('routines_enabled') ?? '0') === '1',
     ccHooksEnabled: (getSetting('cc_hooks_enabled') ?? '0') === '1',
+    plannerShowEvents: (getSetting('planner_show_events') ?? '1') === '1',
+    plannerShowTodos: (getSetting('planner_show_todos') ?? '1') === '1',
+    plannerShowRoutines: (getSetting('planner_show_routines') ?? '1') === '1',
+    plannerShowTasks: (getSetting('planner_show_tasks') ?? '1') === '1',
+    plannerDefaultView: (['month', 'week', 'day'] as readonly string[]).includes(
+      getSetting('planner_default_view') ?? '',
+    )
+      ? (getSetting('planner_default_view') as 'month' | 'week' | 'day')
+      : 'month',
+    plannerWeekStart: getSetting('planner_week_start') === '0' ? 0 : 1,
+    plannerShowDone: (getSetting('planner_show_done') ?? '1') === '1',
+    plannerSidebarSide: getSetting('planner_sidebar_side') === 'left' ? 'left' : 'right',
+    plannerSidebarWidth: Math.max(
+      200,
+      Math.min(480, Number(getSetting('planner_sidebar_width') ?? '300') || 300),
+    ),
+    plannerDensity: getSetting('planner_density') === 'compact' ? 'compact' : 'cozy',
+    plannerRemindDefaultMin: (() => {
+      const n = Number(getSetting('planner_remind_default_min') ?? '10')
+      return Math.max(0, Math.min(1440, Number.isNaN(n) ? 10 : n))
+    })(),
+    plannerStaleDays: Math.max(1, Math.min(90, Number(getSetting('planner_stale_days') ?? '7') || 7)),
+    plannerNudge: (['off', 'daily', 'weekly'] as readonly string[]).includes(
+      getSetting('planner_nudge') ?? '',
+    )
+      ? (getSetting('planner_nudge') as 'off' | 'daily' | 'weekly')
+      : 'weekly',
+    plannerInBriefing: (getSetting('planner_in_briefing') ?? '1') === '1',
+    plannerOfferHelp: (getSetting('planner_offer_help') ?? '1') === '1',
+    plannerTelegramRemind: (getSetting('planner_telegram_remind') ?? '1') === '1',
+    onboardingDone: (getSetting('onboarding_done') ?? '0') === '1',
     telegramEnabled: (getSetting('telegram_enabled') ?? '0') === '1',
     telegramBotToken: getSetting('telegram_bot_token') ?? '',
     telegramChatId: getSetting('telegram_chat_id') ?? '',
@@ -2566,6 +3306,7 @@ export function getSettings(): LainSettings {
     contextCompactThreshold: Math.max(0, Number(getSetting('context_compact_threshold') ?? '400000') || 0),
     naviHandoffThreshold: Math.max(0, Number(getSetting('navi_handoff_threshold') ?? '150000') || 0),
     turnWatchdogMin: Math.max(0, Number(getSetting('turn_watchdog_min') ?? '10') || 0),
+    approvalTimeoutMin: Math.max(0, Number(getSetting('approval_timeout_min') ?? '30') || 0),
     skillsEnabled: (getSetting('skills_enabled') ?? '0') === '1',
     curatedPlugins: (() => {
       const raw = getSetting('curated_plugins')
@@ -2594,6 +3335,7 @@ export function getSettings(): LainSettings {
     gptSovitsRefAudio: getSetting('gpt_sovits_ref_audio') ?? '',
     gptSovitsRefText: getSetting('gpt_sovits_ref_text') ?? '',
     gptSovitsRefLang: getSetting('gpt_sovits_ref_lang') ?? 'ko',
+    gptSovitsSpeed: Math.max(0.5, Math.min(2.0, Number(getSetting('gpt_sovits_speed') ?? '1.15') || 1.15)),
     supertonicVoice: (() => {
       const v = getSetting('supertonic_voice')
       return v && (/^[FM][1-9]$/.test(v) || v === 'custom') ? v : 'F5'
@@ -2618,11 +3360,21 @@ export function getSettings(): LainSettings {
 export function saveSettings(patch: Partial<LainSettings>): LainSettings {
   if (patch.concurrencyCap !== undefined)
     setSetting('concurrency_cap', String(Math.max(1, Math.floor(patch.concurrencyCap) || 1)))
+  if (patch.projectParallelCap !== undefined)
+    setSetting(
+      'project_parallel_cap',
+      String(Math.max(1, Math.min(4, Math.floor(patch.projectParallelCap) || 1))),
+    )
+  if (patch.taskTokenBudget !== undefined)
+    setSetting('task_token_budget', String(Math.max(0, Math.floor(patch.taskTokenBudget) || 0)))
+  if (patch.usageWindowTokenLimit !== undefined)
+    setSetting('usage_window_token_limit', String(Math.max(0, Math.floor(patch.usageWindowTokenLimit) || 0)))
   if (patch.naviModel !== undefined) setSetting('worker_model', asTier(patch.naviModel, 'sonnet'))
   if (patch.managerModel !== undefined)
     setSetting('manager_model', asTier(patch.managerModel, 'sonnet'))
   if (patch.judgeModel !== undefined) setSetting('judge_model', asTier(patch.judgeModel, 'sonnet'))
   if (patch.localBaseUrl !== undefined) setSetting('local_base_url', patch.localBaseUrl.trim() || 'http://127.0.0.1:8080')
+  if (patch.anthropicApiKey !== undefined) setSetting('anthropic_api_key', patch.anthropicApiKey.trim())
   if (patch.managerPermissionMode !== undefined)
     setSetting('manager_permission_mode', patch.managerPermissionMode)
   if (patch.managerEffort !== undefined) setSetting('manager_effort', patch.managerEffort)
@@ -2645,14 +3397,29 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     setSetting('monitor_sensitive_apps', JSON.stringify(patch.monitorSensitiveApps.map(String)))
   if (patch.monitorCooldownSec !== undefined)
     setSetting('monitor_cooldown_sec', String(Math.max(5, Math.floor(patch.monitorCooldownSec) || 30)))
+  if (patch.chattiness !== undefined)
+    // 0(묵언)이 유효값 — `|| 기본` 클램프 금지, NaN만 기본 2로.
+    setSetting(
+      'chattiness',
+      String(
+        Number.isFinite(patch.chattiness) ? Math.max(0, Math.min(4, Math.floor(patch.chattiness))) : 2,
+      ),
+    )
   if (patch.monitorPollMs !== undefined)
     setSetting('monitor_poll_ms', String(Math.max(500, Math.floor(patch.monitorPollMs) || 1500)))
+  if (patch.workspaceRoot !== undefined) setSetting('workspace_root', patch.workspaceRoot.trim())
+  if (patch.scanDirs !== undefined)
+    setSetting('scan_dirs', JSON.stringify(patch.scanDirs.map((d) => String(d).trim()).filter(Boolean)))
   if (patch.scanIntervalMin !== undefined)
     setSetting('scan_interval_min', String(Math.max(0, Math.floor(patch.scanIntervalMin) || 0)))
   if (patch.closeToTray !== undefined) setSetting('close_to_tray', patch.closeToTray ? '1' : '0')
   if (patch.autoStart !== undefined) setSetting('auto_start', patch.autoStart ? '1' : '0')
   if (patch.autoPriority !== undefined)
     setSetting('auto_priority', patch.autoPriority ? '1' : '0')
+  if (patch.autoStartTaskMd !== undefined)
+    setSetting('auto_start_task_md', patch.autoStartTaskMd ? '1' : '0')
+  if (patch.autoRebaseOnMerge !== undefined)
+    setSetting('auto_rebase_on_merge', patch.autoRebaseOnMerge ? '1' : '0')
   if (patch.lessonCurator !== undefined)
     setSetting('lesson_curator', patch.lessonCurator ? '1' : '0')
   if (patch.turnReviewEnabled !== undefined)
@@ -2665,6 +3432,61 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     setSetting('routines_enabled', patch.routinesEnabled ? '1' : '0')
   if (patch.ccHooksEnabled !== undefined)
     setSetting('cc_hooks_enabled', patch.ccHooksEnabled ? '1' : '0')
+  if (patch.plannerShowEvents !== undefined)
+    setSetting('planner_show_events', patch.plannerShowEvents ? '1' : '0')
+  if (patch.plannerShowTodos !== undefined)
+    setSetting('planner_show_todos', patch.plannerShowTodos ? '1' : '0')
+  if (patch.plannerShowRoutines !== undefined)
+    setSetting('planner_show_routines', patch.plannerShowRoutines ? '1' : '0')
+  if (patch.plannerShowTasks !== undefined)
+    setSetting('planner_show_tasks', patch.plannerShowTasks ? '1' : '0')
+  if (patch.plannerDefaultView !== undefined)
+    setSetting(
+      'planner_default_view',
+      (['month', 'week', 'day'] as readonly string[]).includes(patch.plannerDefaultView)
+        ? patch.plannerDefaultView
+        : 'month',
+    )
+  if (patch.plannerWeekStart !== undefined)
+    setSetting('planner_week_start', patch.plannerWeekStart === 0 ? '0' : '1')
+  if (patch.plannerShowDone !== undefined)
+    setSetting('planner_show_done', patch.plannerShowDone ? '1' : '0')
+  if (patch.plannerSidebarSide !== undefined)
+    setSetting('planner_sidebar_side', patch.plannerSidebarSide === 'left' ? 'left' : 'right')
+  if (patch.plannerSidebarWidth !== undefined)
+    setSetting(
+      'planner_sidebar_width',
+      String(Math.max(200, Math.min(480, Math.floor(patch.plannerSidebarWidth) || 300))),
+    )
+  if (patch.plannerDensity !== undefined)
+    setSetting('planner_density', patch.plannerDensity === 'compact' ? 'compact' : 'cozy')
+  if (patch.plannerRemindDefaultMin !== undefined) {
+    const n = Math.floor(patch.plannerRemindDefaultMin)
+    setSetting(
+      'planner_remind_default_min',
+      String(Math.max(0, Math.min(1440, Number.isNaN(n) ? 10 : n))),
+    )
+  }
+  if (patch.plannerStaleDays !== undefined)
+    setSetting(
+      'planner_stale_days',
+      String(Math.max(1, Math.min(90, Math.floor(patch.plannerStaleDays) || 7))),
+    )
+  if (patch.plannerNudge !== undefined)
+    setSetting(
+      'planner_nudge',
+      (['off', 'daily', 'weekly'] as readonly string[]).includes(patch.plannerNudge)
+        ? patch.plannerNudge
+        : 'weekly',
+    )
+  if (patch.plannerInBriefing !== undefined)
+    setSetting('planner_in_briefing', patch.plannerInBriefing ? '1' : '0')
+  if (patch.plannerOfferHelp !== undefined)
+    setSetting('planner_offer_help', patch.plannerOfferHelp ? '1' : '0')
+  if (patch.plannerTelegramRemind !== undefined)
+    setSetting('planner_telegram_remind', patch.plannerTelegramRemind ? '1' : '0')
+  if (patch.onboardingDone !== undefined)
+    setSetting('onboarding_done', patch.onboardingDone ? '1' : '0')
   if (patch.curatedPlugins !== undefined)
     setSetting('curated_plugins', JSON.stringify(patch.curatedPlugins))
   if (patch.telegramEnabled !== undefined)
@@ -2687,6 +3509,8 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     )
   if (patch.turnWatchdogMin !== undefined)
     setSetting('turn_watchdog_min', String(Math.max(0, Math.floor(patch.turnWatchdogMin) || 0)))
+  if (patch.approvalTimeoutMin !== undefined)
+    setSetting('approval_timeout_min', String(Math.max(0, Math.floor(patch.approvalTimeoutMin) || 0)))
   if (patch.skillsEnabled !== undefined)
     setSetting('skills_enabled', patch.skillsEnabled ? '1' : '0')
   if (patch.discordEnabled !== undefined)
@@ -2715,6 +3539,8 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     setSetting('gpt_sovits_ref_text', patch.gptSovitsRefText.trim())
   if (patch.gptSovitsRefLang !== undefined)
     setSetting('gpt_sovits_ref_lang', patch.gptSovitsRefLang.trim() || 'ko')
+  if (patch.gptSovitsSpeed !== undefined)
+    setSetting('gpt_sovits_speed', String(Math.max(0.5, Math.min(2.0, patch.gptSovitsSpeed || 1.15))))
   if (patch.supertonicVoice !== undefined)
     setSetting(
       'supertonic_voice',

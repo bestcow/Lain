@@ -9,6 +9,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { getSettings } from './store'
+import { overlayCooldownScale } from './quips'
 import { DATA_DIR } from './paths'
 import { appendCapped } from './logfile'
 
@@ -127,7 +128,9 @@ function handleLine(raw: string): void {
   if (!reason) return
 
   const now = Date.now()
-  const cooldownMs = Math.max(5, s.monitorCooldownSec) * 1000
+  // 말수(chattiness) 배수 — 정책표 단일 출처(quips). 0(묵언)은 ∞라 반응 트리거가 아예 통과하지 못해
+  // 스크린샷 캡처·LLM 비용이 발생하지 않는다(manager.reactToObservation의 게이트와 이중 방어).
+  const cooldownMs = Math.max(5, s.monitorCooldownSec) * 1000 * overlayCooldownScale(s.chattiness)
   if (now - lastReactionAt < cooldownMs) return
   if (capturing) return // 직전 캡처가 아직 진행 중 — 이번 트리거는 건너뜀(중첩 방지)
   lastReactionAt = now
