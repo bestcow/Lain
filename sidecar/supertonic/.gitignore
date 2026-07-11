@@ -1,6 +1,0 @@
-# 런타임 다운로드 모델 캐시(약 398MB) — 첫 음성 사용 시 HF에서 받음. 레포에 안 넣음.
-cache/
-# 의존성·산출물(node_modules·*.log는 루트 .gitignore에도 있음)
-node_modules/
-*.part
-*_out.wav
