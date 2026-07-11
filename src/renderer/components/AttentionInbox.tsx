@@ -1,0 +1,365 @@
+// Attention Inbox — 너를 기다리는 것 전부를 한 곳에서 처리(승인·질문·결재).
+// 별도 백엔드 없음: App이 이미 들고 있는 approvals + tasks(blocked·review)를
+// 합쳐 보여주는 파생 뷰. 액션도 기존 IPC 재사용(resolveApproval·answerClarify·resolveReview).
+import { useEffect, useRef, useState } from 'react'
+import type { Approval, Task } from '../../shared/types'
+import { elapsedMinutes, fmtElapsed, longestWait, shouldRefocusInboxRow } from '../lib/chat'
+import { ConfirmWindow } from './ConfirmWindow'
+import { Icon } from './icons'
+
+// 행 단위 키보드: 입력칸(INPUT/TEXTAREA) 포커스 중이면 단축키 무시(답변 타이핑·IME 보호).
+function inField(e: React.KeyboardEvent): boolean {
+  const t = e.target as HTMLElement
+  return t.tagName === 'INPUT' || t.tagName === 'TEXTAREA'
+}
+
+// C5 — 대기 시간 배지. 임계(분) 초과면 강조색(ir-wait-over).
+const WAIT_THRESHOLD_MIN = 10
+function WaitBadge({ since }: { since: string }) {
+  const over = elapsedMinutes(since) >= WAIT_THRESHOLD_MIN
+  return (
+    <span className={`ir-wait${over ? ' ir-wait-over' : ''}`} title={`대기 시작: ${since}`}>
+      {fmtElapsed(since)}
+    </span>
+  )
+}
+
+interface Props {
+  approvals: Approval[]
+  tasks: Task[]
+  onOpenTask: (taskId: string) => void
+  onClose: () => void
+}
+
+const KIND_LABEL: Record<string, string> = {
+  push: 'push',
+  destructive: '파괴',
+  dep_change: '의존성',
+  network: '네트워크',
+  outside_dev: '외부경로',
+  system: '⚠ 시스템',
+  plan: '📋 계획',
+}
+
+// approval.taskId → 사람이 읽을 프로젝트 라벨 (Navi 직접채팅 승인은 chat:<projectId>)
+function projLabel(taskId: string, byId: Map<string, Task>): string {
+  const t = byId.get(taskId)
+  if (t) return t.projectId
+  if (taskId.startsWith('chat:')) return taskId.slice(5)
+  return taskId
+}
+
+// 위험 명령 승인 또는 ask_manager 질문(§5.2) — 둘 다 approvals 테이블에서 온다
+function ApprovalRow({
+  a,
+  task,
+  label,
+  onOpenTask,
+}: {
+  a: Approval
+  task: Task | undefined
+  label: string
+  onOpenTask: (taskId: string) => void
+}) {
+  const [text, setText] = useState('')
+  const auto = task?.mode === 'autonomous'
+  const proj = (
+    <div className="ir-proj">
+      {task ? (
+        <span className="ir-link" onClick={() => onOpenTask(a.taskId)} title="콘솔 열기">
+          {label}
+        </span>
+      ) : (
+        label
+      )}
+      {auto && <span className="ir-auto" title="autonomous escalate (§21.5)">⚡auto</span>}
+      <WaitBadge since={a.createdAt} />
+    </div>
+  )
+
+  if (a.kind === 'question') {
+    const send = () => {
+      if (!text.trim()) return
+      window.lain.resolveApproval(a.id, true, text.trim())
+      setText('')
+    }
+    return (
+      <div className="inbox-row ir-question">
+        <span className="ir-badge b-question">질문</span>
+        <div className="ir-mid">
+          {proj}
+          <div className="ir-cmd">{a.payload}</div>
+        </div>
+        <div className="ir-acts">
+          <input
+            className="ir-ans"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="답변 — Navi가 이 답으로 이어감"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.nativeEvent.isComposing) send()
+            }}
+          />
+          <button className="ib-ok" disabled={!text.trim()} onClick={send}>
+            <Icon name="send" size={14} />
+          </button>
+          <button className="ib-no" onClick={() => window.lain.resolveApproval(a.id, false)}>
+            거부
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      className={`inbox-row ir-${a.kind}`}
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (inField(e)) return
+        if ((e.key === 'y' || e.key === 'Y' || e.key === 'Enter') && !e.nativeEvent.isComposing) {
+          e.preventDefault()
+          window.lain.resolveApproval(a.id, true)
+        } else if (e.key === 'n' || e.key === 'N') {
+          e.preventDefault()
+          window.lain.resolveApproval(a.id, false)
+        }
+      }}
+    >
+      <span className={`ir-badge b-${a.kind}`}>{auto ? 'escalate' : (KIND_LABEL[a.kind] ?? a.kind)}</span>
+      <div className="ir-mid">
+        {proj}
+        <code className="ir-cmd">{a.payload}</code>
+      </div>
+      <div className="ir-acts">
+        <button className="ib-ok" onClick={() => window.lain.resolveApproval(a.id, true)}>
+          승인
+        </button>
+        <button className="ib-no" onClick={() => window.lain.resolveApproval(a.id, false)}>
+          거절
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// blocked 작업의 명확화 질문(§8) — answerClarify로 한 번에 답.
+// 질문이 여럿이면 질문별 칸으로 나눠 받고(답변 배열), 제출 시 Q1/Q2…로 결합해 보낸다.
+function ClarifyRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) => void }) {
+  const multi = t.questions.length > 1
+  const [answers, setAnswers] = useState<string[]>([])
+  // 질문 칸은 질문 수만큼 — 길이 맞춰 정규화(질문 변동 대비).
+  const slots = multi ? t.questions.length : 1
+  const get = (i: number) => answers[i] ?? ''
+  const setAt = (i: number, v: string) =>
+    setAnswers((prev) => {
+      const next = prev.slice()
+      next[i] = v
+      return next
+    })
+  const filled = Array.from({ length: slots }, (_, i) => get(i).trim())
+  const canSend = filled.some((a) => a)
+  const send = () => {
+    if (!canSend) return
+    // 단일 질문은 평문, 여러 질문은 Q1/Q2…로 결합(빈 칸은 건너뜀).
+    const combined = multi
+      ? t.questions
+          .map((_, i) => (filled[i] ? `Q${i + 1}: ${filled[i]}` : ''))
+          .filter(Boolean)
+          .join('\n')
+      : filled[0]
+    window.lain.answerClarify(t.id, combined)
+    setAnswers([])
+  }
+  return (
+    <div className="inbox-row ir-question">
+      <span className="ir-badge b-question">질문</span>
+      <div className="ir-mid">
+        <div className="ir-proj">
+          <span className="ir-link" onClick={() => onOpenTask(t.id)} title="콘솔 열기">
+            {t.projectId}
+          </span>{' '}
+          · {t.title}
+          <WaitBadge since={t.updatedAt} />
+        </div>
+        {multi ? (
+          t.questions.map((q, i) => (
+            <div key={i} className="ir-cmd">
+              <span className="dim">Q{i + 1}.</span> {q}
+              <input
+                className="ir-ans"
+                style={{ width: '100%', marginTop: 3, display: 'block' }}
+                value={get(i)}
+                onChange={(e) => setAt(i, e.target.value)}
+                placeholder={`Q${i + 1} 답변`}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.nativeEvent.isComposing) send()
+                }}
+              />
+            </div>
+          ))
+        ) : (
+          <div className="ir-cmd">{t.questions[0] || '(질문 대기)'}</div>
+        )}
+      </div>
+      <div className="ir-acts">
+        {!multi && (
+          <input
+            className="ir-ans"
+            value={get(0)}
+            onChange={(e) => setAt(0, e.target.value)}
+            placeholder="답변 (한 번에 모두)"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.nativeEvent.isComposing) send()
+            }}
+          />
+        )}
+        <button className="ib-ok" disabled={!canSend} onClick={send}>
+          <Icon name="send" size={14} />
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// review 도달 작업의 결재(§8-9) — 병합/브랜치/폐기
+function ReviewRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) => void }) {
+  const [confirmDiscard, setConfirmDiscard] = useState(false)
+  return (
+    <div
+      className="inbox-row ir-review"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (inField(e)) return
+        // 비가역 폐기(discard)는 키보드에서 제외(오발동 방지) — 마우스 전용, 그마저도 확인창 경유.
+        if ((e.key === 'm' || e.key === 'M' || e.key === 'Enter') && !e.nativeEvent.isComposing) {
+          e.preventDefault()
+          window.lain.resolveReview(t.id, 'merge')
+        } else if (e.key === 'b' || e.key === 'B') {
+          e.preventDefault()
+          window.lain.resolveReview(t.id, 'keep-branch')
+        }
+      }}
+    >
+      <span className="ir-badge b-review">결재</span>
+      <div className="ir-mid">
+        <div className="ir-proj">
+          <span className="ir-link" onClick={() => onOpenTask(t.id)} title="콘솔 열기">
+            {t.projectId}
+          </span>{' '}
+          · {t.title}
+          <WaitBadge since={t.updatedAt} />
+        </div>
+        <div className="ir-cmd">
+          {t.verifyResult && (
+            <span className={t.verifyResult === 'pass' ? 'ok' : 'warn'}>
+              verify {t.verifyResult.slice(0, 48)}
+            </span>
+          )}
+          {t.diffStat && <span className="dim"> · {t.diffStat.split('\n')[0]}</span>}
+        </div>
+      </div>
+      <div className="ir-acts">
+        <button className="ib-ok" onClick={() => window.lain.resolveReview(t.id, 'merge')}>
+          병합
+        </button>
+        <button onClick={() => window.lain.resolveReview(t.id, 'keep-branch')}>브랜치</button>
+        <button className="ib-no" onClick={() => setConfirmDiscard(true)}>
+          폐기
+        </button>
+      </div>
+      {confirmDiscard && (
+        <ConfirmWindow
+          title="작업 폐기"
+          message={
+            <>
+              <b>{t.title}</b>의 브랜치·변경사항을 폐기할까요? <b>되돌릴 수 없습니다.</b>
+            </>
+          }
+          note={t.diffStat ? <pre className="confirm-diffstat">{t.diffStat}</pre> : undefined}
+          confirmLabel="폐기"
+          onCancel={() => setConfirmDiscard(false)}
+          onConfirm={() => {
+            window.lain.resolveReview(t.id, 'discard')
+            setConfirmDiscard(false)
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+export function AttentionInbox({ approvals, tasks, onOpenTask, onClose }: Props) {
+  const byId = new Map(tasks.map((t) => [t.id, t]))
+  const blocked = tasks.filter((t) => t.state === 'blocked')
+  const review = tasks.filter((t) => t.state === 'review')
+  const total = approvals.length + blocked.length + review.length
+  const listRef = useRef<HTMLDivElement>(null)
+  const prevTotalRef = useRef(total)
+  const [, setNow] = useState(Date.now())
+  // C5 — 대기 배지는 시간이 흐르면서 값이 바뀌는데, approvals/tasks는 이벤트 기반 갱신(App.tsx)이라
+  // 변동 없인 리렌더가 없다 — TaskDrawer와 같은 30초 틱으로 배지를 계속 최신 유지.
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30000)
+    return () => clearInterval(id)
+  }, [])
+  // C5 — 헤더 칩 툴팁용 최장 대기(승인은 created_at, 작업 기반 행은 updated_at=상태전이 시각).
+  const longestWaitLabel = longestWait([
+    ...approvals.map((a) => a.createdAt),
+    ...blocked.map((t) => t.updatedAt),
+    ...review.map((t) => t.updatedAt),
+  ])
+
+  // 마운트/목록 변동 시 첫 행에 포커스 — 키보드 승인을 바로 받을 수 있게(처리로 행이 사라지면 재포커스).
+  // B3 — 답변 입력 중(activeElement가 입력요소)에 새 항목이 도착(개수 증가)해도 포커스를 강탈하지 않는다.
+  // 행이 처리돼 사라진 경우(개수 감소)에만 다음 행으로 넘어간다.
+  useEffect(() => {
+    const prevTotal = prevTotalRef.current
+    prevTotalRef.current = total
+    if (!shouldRefocusInboxRow(prevTotal, total, document.activeElement)) return
+    const first = listRef.current?.querySelector<HTMLElement>('.inbox-row[tabindex]')
+    first?.focus()
+  }, [total])
+
+  return (
+    <div className="drawer panel inbox-panel">
+      <div className="drawer-head">
+        <span className="drawer-title">[ wired://inbox — 대기 ]</span>
+        <span
+          className="dim"
+          title={longestWaitLabel ? `최장 대기: ${longestWaitLabel}` : undefined}
+        >
+          {total}건 · 승인 {approvals.length} · 질문 {blocked.length} · 결재 {review.length}
+        </span>
+        <button onClick={onClose}><Icon name="x-circle" size={18} /></button>
+      </div>
+      {/* B10 — 키보드 힌트: 행에 포커스(Tab/자동) 후 아래 키로 즉시 처리. 실제 구현(ApprovalRow·ReviewRow)과 일치. */}
+      {total > 0 && (
+        <div className="inbox-hint dim">
+          <kbd>y</kbd> 승인 · <kbd>n</kbd> 거절 · <kbd>m</kbd> 병합 · <kbd>b</kbd> 브랜치
+        </div>
+      )}
+      {total === 0 ? (
+        <div className="empty">큐 비었음 — lain 대기 ●</div>
+      ) : (
+        <div className="inbox-list" ref={listRef}>
+          {approvals.map((a) => (
+            <ApprovalRow
+              key={`a${a.id}`}
+              a={a}
+              task={byId.get(a.taskId)}
+              label={projLabel(a.taskId, byId)}
+              onOpenTask={onOpenTask}
+            />
+          ))}
+          {blocked.map((t) => (
+            <ClarifyRow key={`b${t.id}`} t={t} onOpenTask={onOpenTask} />
+          ))}
+          {review.map((t) => (
+            <ReviewRow key={`r${t.id}`} t={t} onOpenTask={onOpenTask} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}

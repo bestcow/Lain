@@ -1,0 +1,1 @@
+{ "name": "bench-header", "private": true, "scripts": { "test": "node check.cjs" } }
