@@ -98,6 +98,7 @@ import {
 import { encodeEditDiffLine } from '../shared/editdiff'
 import { buildLearnPrompt } from './learnprompt'
 import { applyCcHooks, refreshCcLinkIfEnabled } from './cchooks'
+import { applyAutoStart } from './autostart'
 import { syncOverlayMode, openMainWindow, resizeOverlay, setOverlayVisible } from './overlay-window'
 import { bindTitleRefresh } from './title'
 import {
@@ -718,8 +719,7 @@ export function registerIpc(): void {
     const s = saveSettings(patch)
     // Phase 3 부수효과: 스캔 타이머 재장전 + 로그인 자동 시작(트레이로) 반영
     if (patch.scanIntervalMin !== undefined) rearmScheduler()
-    if (patch.autoStart !== undefined)
-      app.setLoginItemSettings({ openAtLogin: s.autoStart, args: ['--hidden'] })
+    if (patch.autoStart !== undefined) applyAutoStart(s.autoStart)
     // §20.3 텔레그램 설정 변경 시 어댑터 재시작 (enabled/token/chatId 중 하나라도)
     if (
       patch.telegramEnabled !== undefined ||

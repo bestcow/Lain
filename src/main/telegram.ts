@@ -69,6 +69,10 @@ let lastError: string | null = null
 let healthTimer: ReturnType<typeof setInterval> | null = null
 let lastLoopTick = 0 // 폴 while 반복이 마지막으로 돈 시각(성공/재시도 무관) — 죽은 루프 판별용
 let dispatchInFlight = false // 메시지 처리(dispatch/reconcile) 중 — 긴 Lain 턴을 '죽은 루프'로 오판 안 하게
+let dispatchStartedAt = 0 // dispatch 구간 진입 시각 — 상한 초과(행 걸린 SDK 턴) 판정용
+// dispatch 행 판정 상한 — 정상 긴 턴(워치독 기본 10분)보다 넉넉히. 상한 없이는 행 걸린 턴 하나가
+// 폰 표면 전체(메시지·버튼·/cancel)를 앱 재시작까지 불통으로 만든다.
+const DISPATCH_STUCK_MS = 30 * 60_000
 let authFailed = false // 401(무효 토큰) — 무한 재시도·재기동 방지 플래그
 // 부트스트랩 대기 — 미허용 채팅이 마지막으로 보낸 chat id. telegramChatId 설정 시 null로 비움.
 let pendingChatId: string | null = null
@@ -1123,6 +1127,7 @@ async function poll(gen: number, signal: AbortSignal): Promise<void> {
       // 재기동으로 새 세대가 뜬 뒤 옛 세대가 dispatch를 마치며 새 세대의 플래그를 false로 덮어써
       // 정상 긴 턴을 오판 재기동시키는 경합을 막는다.
       dispatchInFlight = true
+      dispatchStartedAt = Date.now()
       try {
         for (const u of updates) {
           // 배치 처리 중 재기동(genId 변경)·정지되면 즉시 중단 — 옛 세대가 남은 배치를 계속
@@ -1250,7 +1255,16 @@ export async function startTelegram(): Promise<void> {
 function startHealthCheck(): void {
   if (healthTimer) clearInterval(healthTimer)
   healthTimer = setInterval(() => {
-    if (!running || authFailed || dispatchInFlight) return
+    if (!running || authFailed) return
+    if (dispatchInFlight) {
+      // 긴 Lain 턴은 정상 — 단 상한을 넘긴 dispatch는 행(영영 안 끝나는 턴)으로 판정하고 폴을 되살린다.
+      // 옛 세대의 stuck dispatch는 gen 검사로 스스로 무력화되므로 재기동해도 중복 처리가 없다.
+      if (dispatchStartedAt && Date.now() - dispatchStartedAt > DISPATCH_STUCK_MS) {
+        tlog(`health: dispatch가 ${Math.round(DISPATCH_STUCK_MS / 60000)}분+ 미종결 — 행 판정, 폴 재기동(상태 보존)`)
+        restartPoll()
+      }
+      return
+    }
     if (lastLoopTick && Date.now() - lastLoopTick > 70000) {
       tlog('health: 폴 루프가 70s+ 정지(getUpdates 먹통) 감지 — 폴 재기동(상태 보존)')
       restartPoll()
@@ -1266,6 +1280,7 @@ function restartPoll(): void {
   const gen = ++genId // 옛 루프 무효화
   controller = new AbortController()
   lastLoopTick = Date.now()
+  dispatchInFlight = false // 옛 세대의 stuck dispatch 플래그 해제 — 새 세대는 유휴로 시작(finally는 gen 가드로 못 덮음)
   void poll(gen, controller.signal).catch((e) => tlog(`poll loop crashed: ${(e as Error).message}`))
 }
 

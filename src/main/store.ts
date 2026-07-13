@@ -603,6 +603,12 @@ export function initStore(): void {
   } catch (e) {
     logRecovery(`저널 컴팩션 실패(무시): ${e}`)
   }
+  // bench 도중 크래시로 lessons가 bench 조건 상태로 남은 경우 — 백업 테이블에서 원본 자동 복원.
+  try {
+    if (restoreLessonsFromBenchSnapshot()) logRecovery('bench 잔여 스냅샷에서 lessons 복원')
+  } catch (e) {
+    logRecovery(`bench lessons 복원 실패(무시): ${e}`)
+  }
 }
 
 // ── 레인 세션 검색 (FTS5, 학습루프 T4) — messages 전문 인덱스 ──
@@ -1091,7 +1097,8 @@ export function closeStore(): void {
 // 손상 WAL/SHM을 백업·폐기해 메인 DB(마지막 체크포인트)로 복원한다(거의 무손실).
 // read-only 연결은 메인에 못 쓰므로 close해도 체크포인트가 없다 — rw로 열고 close하면 손상 WAL이
 // 메인에 합쳐져 메인까지 오염되므로(검증됨) 반드시 read-only 프로브 + 오픈 전 폐기로 처리한다.
-function recoverCorruptWalBeforeOpen(): void {
+// (export는 테스트 전용 — 부팅 경로에선 initStore만 부른다.)
+export function recoverCorruptWalBeforeOpen(): void {
   const dbPath = path.join(DATA_DIR, 'lain.sqlite')
   if (!fs.existsSync(dbPath) || !fs.existsSync(dbPath + '-wal')) return // 새 설치·WAL 없음 → 할 일 없음
   const log = logRecovery
@@ -2454,6 +2461,35 @@ export function searchHistory(projectId: string, queryText: string, limit = 8): 
 
 export function deleteAllLessons(): void {
   db.prepare('DELETE FROM lessons').run()
+}
+
+// ── bench 교훈 격리(스냅샷/복원) — runBench의 deleteAllLessons가 사용자 교훈을 영구 파괴하지 않게 ──
+// 백업은 같은 DB 안의 테이블이라 크래시에도 살아남고, 부팅 시 잔여 백업을 감지해 자동 복원한다(initStore).
+
+/** bench 시작 전 lessons 전체를 백업 테이블로 스냅샷. 이전 백업이 남아 있으면(크래시) 먼저 복원한다. */
+export function snapshotLessonsForBench(): void {
+  restoreLessonsFromBenchSnapshot() // 직전 bench가 크래시로 못 되돌린 경우 — 원본부터 복구
+  db.exec('DROP TABLE IF EXISTS lessons_bench_backup')
+  db.exec('CREATE TABLE lessons_bench_backup AS SELECT * FROM lessons')
+}
+
+/** bench 스냅샷이 있으면 lessons를 통째로 되돌리고 백업을 제거. 복원했으면 true. */
+export function restoreLessonsFromBenchSnapshot(): boolean {
+  const row = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='lessons_bench_backup'`)
+    .get()
+  if (!row) return false
+  db.exec('BEGIN')
+  try {
+    db.exec('DELETE FROM lessons')
+    db.exec('INSERT INTO lessons SELECT * FROM lessons_bench_backup')
+    db.exec('DROP TABLE lessons_bench_backup')
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+  return true
 }
 
 // ── 레인 세션 검색 (학습루프 T4) — 무한세션 압축으로 world_state 요약만 남는 갭을 원문 회수로 보완 ──

@@ -31,6 +31,7 @@ import { sendToNavi } from './navichat'
 import { startTask, answerClarify, recoverTasks, recoverGroups, cancelTask } from './orchestrator'
 import { gcWorktrees } from './worktree'
 import { setupTray, isQuitting } from './tray'
+import { applyAutoStart } from './autostart'
 import {
   createOverlayWindow,
   destroyOverlayWindow,
@@ -163,15 +164,24 @@ function createWindow(): void {
   })
   // §15b 복원력: 렌더러 프로세스가 죽으면(GPU 크래시 등) 로그 남기고 자동 reload.
   // Navi는 main 프로세스에서 돌므로 영향 없음 — UI만 살리면 된다.
+  // 반복 크래시엔 지수 백오프(1s→60s 상한) — 결정적 크래시(로드 즉시 사망)에서 reload→crash 무한
+  // 스핀으로 CPU를 태우지 않게. 리로드 후 5분 살아 있었으면 일시 장애로 보고 카운터 리셋.
+  let crashCount = 0
+  let lastCrashAt = 0
   win.webContents.on('render-process-gone', (_e, details) => {
     appendCapped(
       path.join(DATA_DIR, 'renderer-crash.log'),
       `${new Date().toISOString()} ${JSON.stringify(details)}\n`,
     )
     if (details.reason !== 'clean-exit' && details.reason !== 'killed') {
+      const now = Date.now()
+      if (now - lastCrashAt > 5 * 60_000) crashCount = 0
+      lastCrashAt = now
+      crashCount++
+      const delay = Math.min(1000 * 2 ** (crashCount - 1), 60_000)
       setTimeout(() => {
         if (!win.isDestroyed()) win.webContents.reload()
-      }, 1000)
+      }, delay)
     }
   })
 
@@ -369,8 +379,7 @@ app.whenReady().then(async () => {
   // 패키징 실행에서만 — dev는 electron.exe 경로라 로그인 항목 등록이 무의미. getSettings()가 손상 DB에서
   // throw해도 whenReady가 reject되지 않게 격리(이후 dev 훅·activate 등록이 죽지 않게).
   bootStep('loginItem', () => {
-    if (!process.env.ELECTRON_RENDERER_URL)
-      app.setLoginItemSettings({ openAtLogin: getSettings().autoStart, args: ['--hidden'] })
+    if (!process.env.ELECTRON_RENDERER_URL) applyAutoStart(getSettings().autoStart)
   })
 
   // 개발용: LAIN_TASK_TEST=<프로젝트 경로>면 그 폴더를 등록하고 TASK.md로 작업 시작 (E2E 검증)

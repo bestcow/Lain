@@ -112,6 +112,9 @@ const CALL_LABEL: Record<DiscordCallState, string> = {
 
 // 상주(트레이) 앱이라 채팅 배열이 무한히 쌓이면 메모리·렌더가 느려진다 — 최근 N개만 유지.
 const MAX_CHAT = 800
+// 스트리밍 델타 flush 간격 — 델타마다 setMessages하면 누적 전문 전체가 매번 마크다운 재파싱(O(n²))돼
+// 긴 코드 응답에서 렌더러가 수 초 멈춘다(간헐 크래시·빈화면의 유력 원인). 라이브 버블 갱신을 이 간격으로 묶는다.
+const STREAM_FLUSH_MS = 100
 // A15 — 대화 페이징 한 페이지 크기(conversations:messages 기본 limit과 동일). 응답이 이보다 적으면
 // 더 불러올 과거가 없다는 신호로 쓴다(hasMore 판정).
 const PAGE_SIZE = 200
@@ -178,6 +181,10 @@ export default function App() {
   // A9 — Navi 직통 채팅 스트리밍(레인 streamingRef 일반화) — naviId(projectId)별로 동시에 여러 Navi가
   // 응답할 수 있어 단일 ref가 아니라 맵. drillTarget으로 연 Navi만 화면에 반영(visible 가드는 이벤트 처리부).
   const naviStreamingRef = useRef<Map<string, { id: number; text: string }>>(new Map())
+  // 델타 스로틀 타이머 — 대기 중이면 새 델타는 ref 누적만 하고 flush는 타이머에 맡긴다(트레일링).
+  // flush 시점에 ref를 다시 읽으므로 확정(assistant/result/error)으로 비워진 버블은 자연히 no-op.
+  const streamFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const naviFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // 인라인 선택형/체크형 질문(ask_user) — Lain이 답을 기다리는 동안 채팅 하단에 카드로 뜬다. 동시 1개.
   const [pendingQuestion, setPendingQuestion] = useState<{
     id: string
@@ -510,8 +517,14 @@ export default function App() {
           const s = streamingRef.current
           if (s) {
             s.text += ev.text
-            const { id, text: full } = s
-            setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, content: full } : m)))
+            if (!streamFlushTimerRef.current)
+              streamFlushTimerRef.current = setTimeout(() => {
+                streamFlushTimerRef.current = null
+                const cur = streamingRef.current
+                if (!cur) return // 타이머 대기 중 확정/종료됨 — 늦은 flush 무시
+                const { id, text: full } = cur
+                setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, content: full } : m)))
+              }, STREAM_FLUSH_MS)
           } else {
             const id = nextLocalId--
             streamingRef.current = { id, text: ev.text }
@@ -662,8 +675,18 @@ export default function App() {
           const s = naviStreamingRef.current.get(ev.projectId)
           if (s) {
             s.text += ev.text
-            const { id, text: full } = s
-            setNaviMsgs((prev) => prev.map((m) => (m.id === id ? { ...m, content: full } : m)))
+            if (!naviFlushTimerRef.current)
+              naviFlushTimerRef.current = setTimeout(() => {
+                naviFlushTimerRef.current = null
+                const live = Array.from(naviStreamingRef.current.values())
+                if (!live.length) return // 전부 확정/종료됨 — 늦은 flush 무시
+                setNaviMsgs((prev) =>
+                  prev.map((m) => {
+                    const hit = live.find((x) => x.id === m.id)
+                    return hit ? { ...m, content: hit.text } : m
+                  }),
+                )
+              }, STREAM_FLUSH_MS)
           } else {
             const id = nextLocalId--
             naviStreamingRef.current.set(ev.projectId, { id, text: ev.text })

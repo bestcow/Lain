@@ -17,6 +17,8 @@ import {
   getTask,
   insertBenchResult,
   insertLesson,
+  snapshotLessonsForBench,
+  restoreLessonsFromBenchSnapshot,
   listTaskEvents,
 } from './store'
 import type { BenchSummary, BenchTaskResult } from '../shared/types'
@@ -225,20 +227,25 @@ export async function runBench(
   const tasks = loadBenchTasks(benchRoot)
   fs.mkdirSync(BENCH_TMP, { recursive: true })
   const results: BenchTaskResult[] = []
-  for (const cond of conditions) {
-    // 조건 간 교훈 격리 — no-lessons는 빈 상태에서 출발
-    deleteAllLessons()
-    for (const def of tasks) {
-      progress(`[${cond}] ${def.id} 실행 중...`)
-      const r = await runOne(def, cond, runId)
-      insertBenchResult(runId, r)
-      results.push(r)
-      progress(
-        `[${cond}] ${def.id}: ${r.success ? 'OK' : 'FAIL'} (1회통과 ${r.verifyFirstPass ? 'Y' : 'N'}, ${r.turns}턴)`,
-      )
+  // 사용자 교훈 보호 — 조건 격리는 스냅샷 안에서만. 중간에 throw/크래시해도 finally·부팅 복원으로 원본 보존.
+  snapshotLessonsForBench()
+  try {
+    for (const cond of conditions) {
+      // 조건 간 교훈 격리 — no-lessons는 빈 상태에서 출발
+      deleteAllLessons()
+      for (const def of tasks) {
+        progress(`[${cond}] ${def.id} 실행 중...`)
+        const r = await runOne(def, cond, runId)
+        insertBenchResult(runId, r)
+        results.push(r)
+        progress(
+          `[${cond}] ${def.id}: ${r.success ? 'OK' : 'FAIL'} (1회통과 ${r.verifyFirstPass ? 'Y' : 'N'}, ${r.turns}턴)`,
+        )
+      }
     }
+  } finally {
+    restoreLessonsFromBenchSnapshot()
   }
-  deleteAllLessons()
   const summary = aggregate(runId, results, startedAt)
   if (summary.regression) {
     progress(summary.regression)

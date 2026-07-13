@@ -109,6 +109,11 @@ interface Elicited {
   autoGradable: boolean
 }
 async function elicit(content: string): Promise<Elicited> {
+  // 판정 SDK 무응답(네트워크 정체 등)에 60초 abort — 없으면 task가 clarifying에 영구 고착되고
+  // 그 상태가 동시성 슬롯을 세므로 몇 개 쌓이면 큐 전체가 기아가 된다(scheduler judge와 동일 패턴).
+  // 타임아웃 = 기준 없이 진행(게이트가 진행을 막지 않게 — 기존 catch 폴백과 동일 경로).
+  const ac = new AbortController()
+  const killTimer = setTimeout(() => ac.abort(), 60_000)
   try {
     let last = ''
     const stream = query({
@@ -132,6 +137,7 @@ JSON 한 블록만 출력:
         allowedTools: [],
         maxTurns: 2,
         ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
+        abortController: ac,
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
       },
@@ -156,6 +162,8 @@ JSON 한 블록만 출력:
     }
   } catch {
     /* 판정 실패 → 기준 없이 진행 (게이트가 진행을 막지 않게) */
+  } finally {
+    clearTimeout(killTimer)
   }
   return { criteria: [], questions: [], autoGradable: false }
 }
@@ -590,7 +598,10 @@ export function recoverTasks(): number {
 function makeAskManager(taskId: string): (question: string) => Promise<string> {
   return async (question: string) => {
     const task = getTask(taskId)
-    // 1) 관리자가 답할 수 있으면 즉답
+    // 1) 관리자가 답할 수 있으면 즉답 — 판정 SDK 무응답에 60초 abort(없으면 ask_manager를 기다리는
+    // Navi가 영구 대기). 타임아웃 = 즉답 포기하고 사용자 에스컬레이션(기존 catch 폴백과 동일 경로).
+    const ac = new AbortController()
+    const killTimer = setTimeout(() => ac.abort(), 60_000)
     try {
       let last = ''
       const stream = query({
@@ -613,6 +624,7 @@ JSON 한 블록만 출력:
           allowedTools: [],
           maxTurns: 2,
           ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
+          abortController: ac,
           executable: 'node',
           pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
         },
@@ -636,6 +648,8 @@ JSON 한 블록만 출력:
       }
     } catch {
       /* 관리자 판정 실패 → 사용자로 */
+    } finally {
+      clearTimeout(killTimer)
     }
     // 2) 사용자 에스컬레이션 — question 카드
     const approvalId = insertApproval(taskId, 'question', question)
@@ -1029,6 +1043,9 @@ async function reflect(taskId: string): Promise<void> {
         .map((l) => `[L${l.id}] (${l.scope}) ${l.trigger ? l.trigger + ' → ' : ''}${l.lesson}`)
         .join('\n')}\n</injected-lessons>`
     : ''
+  // 판정 SDK 무응답에 60초 abort — 호출부가 fire-and-forget(.catch 로그)이라 throw해도 안전.
+  const reflectAbort = new AbortController()
+  const reflectKill = setTimeout(() => reflectAbort.abort(), 60_000)
   const stream = query({
     prompt: `너는 lain의 회고 담당이다. 방금 검증(테스트)을 통과한 작업에서, **이 프로젝트의 이후 작업에 재사용할 수 있는 교훈**을 0~2건 뽑아라.
 좋은 교훈 예: 프로젝트 컨벤션(파일명·디렉터리 구조·도구·명령), 검증을 통과시키는 데 필요했던 비자명한 단계, 이 repo 특유의 제약.
@@ -1063,18 +1080,23 @@ JSON 한 블록만:
       allowedTools: [],
       maxTurns: 2,
       ...judgeQueryOptions(), // §9b 판정류(local 라우팅 + D7 사용량 가드 강등)
+      abortController: reflectAbort,
       executable: 'node',
       pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
     },
   })
-  for await (const msg of stream) {
-    if (msg.type === 'assistant') {
-      const t = (msg.message?.content ?? [])
-        .filter((b: any) => b.type === 'text')
-        .map((b: any) => b.text)
-        .join('')
-      if (t) last = t
+  try {
+    for await (const msg of stream) {
+      if (msg.type === 'assistant') {
+        const t = (msg.message?.content ?? [])
+          .filter((b: any) => b.type === 'text')
+          .map((b: any) => b.text)
+          .join('')
+        if (t) last = t
+      }
     }
+  } finally {
+    clearTimeout(reflectKill)
   }
   const m = last.match(/```json\s*([\s\S]*?)```/)
   if (!m) {

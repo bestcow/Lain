@@ -13,6 +13,7 @@ import path from 'node:path'
 import { DATA_DIR } from './paths'
 import { getSettings, listProjects, listTasks, addCcEvent } from './store'
 import { notifyUser } from './notify'
+import { appendCapped } from './logfile'
 
 const LINK_DIR = path.join(DATA_DIR, 'cc-link') // 훅 산출물·이벤트 inbox 루트
 const HOOK_SCRIPT = path.join(LINK_DIR, 'lain-cc-hook.cjs')
@@ -184,15 +185,27 @@ function installHooks(): void {
   fs.writeFileSync(HOOK_SCRIPT, HOOK_SCRIPT_SOURCE, 'utf8')
   writeCcProjects()
   let cfg: Record<string, any> = {}
-  try {
-    const parsed = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'))
-    if (parsed && typeof parsed === 'object') cfg = parsed
-  } catch {
-    cfg = {} // 파일 없음/깨짐 → 새로 만든다(기존 보존 불가하나 깨진 파일이므로 수용)
+  if (fs.existsSync(SETTINGS_JSON)) {
+    // 파일이 존재하는데 읽기/파싱이 실패하면(일시 잠금 EBUSY/EPERM·다른 프로세스가 쓰는 도중) 설치를
+    // 건너뛴다 — cfg={}로 밀어 쓰면 사용자의 전역 설정(권한·env·타 훅) 전체가 날아간다. 다음 부팅/토글에서
+    // 재시도되므로 훅 설치가 한 번 늦는 쪽이 설정 파괴보다 낫다. 파일 없음(ENOENT)만 새로 만든다.
+    try {
+      const parsed = JSON.parse(fs.readFileSync(SETTINGS_JSON, 'utf8'))
+      if (parsed && typeof parsed === 'object') cfg = parsed
+    } catch (e) {
+      appendCapped(
+        path.join(LINK_DIR, 'cc-link.log'),
+        `${new Date().toISOString()} settings.json 읽기 실패 — 훅 설치 건너뜀(설정 보호): ${e}\n`,
+      )
+      return
+    }
   }
   cfg = mergeOurHooks(cfg, hookCommand())
   fs.mkdirSync(path.dirname(SETTINGS_JSON), { recursive: true })
-  fs.writeFileSync(SETTINGS_JSON, JSON.stringify(cfg, null, 2), 'utf8')
+  // 원자 쓰기 — 쓰는 도중 크래시로 settings.json이 반토막 나지 않게 임시파일 후 rename.
+  const tmp = SETTINGS_JSON + '.lain-tmp'
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8')
+  fs.renameSync(tmp, SETTINGS_JSON)
 }
 
 /** ~/.claude/settings.json에서 우리 훅만 제거(다른 훅·키 보존). 파일이 없으면 no-op. */

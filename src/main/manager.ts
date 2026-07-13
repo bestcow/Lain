@@ -2079,6 +2079,10 @@ export async function sendToManager(
     abandoned = true
     terminalSent = true
     busy = false
+    // hung 스트림을 실제로 끊는다 — abort 없이는 for-await가 다음 메시지를 영원히 기다려 finally
+    // (clearInterval·서브프로세스 정리)가 실행되지 않고 claude.exe·워치독 인터벌이 앱 종료까지 누수된다.
+    // turnSeq 가드: stale 클로저(행 걸려 finally를 못 탄 옛 턴)가 새 턴의 스트림을 끊는 것을 방지.
+    if (turnSeq === myTurn) currentAbort?.abort()
     // 강제 종료 경로(워치독 등 stopManager를 안 거치는 경로)에서도 대기 중 질문을 비운다 — pending·waiter·타이머가
     // 남으면 리로드 시 유령 카드가 되살아나고(B5 복원) 뒤늦은 응답이 abandoned된 턴을 재활성한다. stopManager는
     // 이미 clearAll을 부르므로 여기 추가로 워치독 강제종료까지 커버(clearAll은 멱등).

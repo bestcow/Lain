@@ -69,12 +69,20 @@ export function createOverlayWindow(): BrowserWindow {
     if (overlayWin === win) overlayWin = null
   })
   // 오버레이 렌더러가 죽으면(GPU 등) 빈 창으로 남지 않게 자동 reload (메인창과 동일 정책).
+  // 반복 크래시엔 지수 백오프(1s→60s 상한), 5분 생존 시 카운터 리셋 — 메인창과 동일.
+  let crashCount = 0
+  let lastCrashAt = 0
   win.webContents.on('render-process-gone', (_e, details) => {
     olog(`overlay render-process-gone: ${JSON.stringify(details)}`)
     if (details.reason !== 'clean-exit' && details.reason !== 'killed') {
+      const now = Date.now()
+      if (now - lastCrashAt > 5 * 60_000) crashCount = 0
+      lastCrashAt = now
+      crashCount++
+      const delay = Math.min(1000 * 2 ** (crashCount - 1), 60_000)
       setTimeout(() => {
         if (!win.isDestroyed()) win.webContents.reload()
-      }, 1000)
+      }, delay)
     }
   })
   if (process.env.ELECTRON_RENDERER_URL) {
