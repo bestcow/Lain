@@ -625,20 +625,6 @@ body {
   gap: 9px;
   min-width: 0;
 }
-/* P3 — 캐릭터 컴팩트화: 평소 축소, 발화(quip)·작업(managerBusy) 중엔 부각(.lain-char--active). */
-.side-col .lain-char {
-  transition: min-height 0.25s ease;
-}
-.side-col .lain-char .mgr-zoom {
-  transition: transform 0.25s ease;
-  transform-origin: bottom center;
-}
-.side-col .lain-char.lain-char--active {
-  min-height: 200px;
-}
-.side-col .lain-char.lain-char--active .mgr-zoom {
-  transform: scale(1.35);
-}
 .side-col .lain-meta .lain-id {
   flex-direction: row;
   flex-wrap: wrap;

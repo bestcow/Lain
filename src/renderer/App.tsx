@@ -164,9 +164,6 @@ export default function App() {
   // DB 재로드가 만드는 실제 tool 행과 중복되지 않는다. turnStartedAt은 경과 시간(n초) 표시의 기준(전송 시점).
   const [managerLiveTool, setManagerLiveTool] = useState<string | null>(null)
   const [managerTurnStartedAt, setManagerTurnStartedAt] = useState<number | null>(null)
-  // P3 — 캐릭터 컴팩트화: 평소엔 축소, 발화(quip)·작업(managerBusy) 중엔 부각(.lain-char--active).
-  const [charActive, setCharActive] = useState(false)
-  const charActiveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // PC 네이티브 음성 — 디스코드 없이 창에서 직접 말하기(PTT) + 답변 음성 재생(toggle)
   const [recording, setRecording] = useState(false)
   const [voiceOut, setVoiceOut] = useState(false)
@@ -307,18 +304,6 @@ export default function App() {
   useEffect(() => {
     void window.lain.getUpdateStatus().then(setUpd)
     return window.lain.onUpdateStatus(setUpd)
-  }, [])
-  // P3 — 캐릭터 컴팩트화: quip 수신 시 부각(6초 후 자동 해제, 재수신 시 타이머 리셋).
-  useEffect(() => {
-    const off = window.lain.onQuip(() => {
-      setCharActive(true)
-      if (charActiveTimer.current) clearTimeout(charActiveTimer.current)
-      charActiveTimer.current = setTimeout(() => setCharActive(false), 6000)
-    })
-    return () => {
-      off()
-      if (charActiveTimer.current) clearTimeout(charActiveTimer.current)
-    }
   }, [])
   // Ctrl+K/Ctrl+P 명령 팔레트
   const [paletteOpen, setPaletteOpen] = useState(false)
@@ -2755,7 +2740,7 @@ export default function App() {
           )}
           </div>
           {/* 레인 캐릭터 — 사이드바 하단 고정(지금처럼 아래쪽). 캐릭터가 곧 lain 본인. */}
-          <div className={'lain-char' + (charActive || managerBusy ? ' lain-char--active' : '')}>
+          <div className="lain-char">
             <LainBubble /> {/* 상호작용 대사(quips) 말풍선 — 절대배치, 클릭 통과 */}
             <div className="mgr-zoom">
               <ManagerSprite size={120} busy={managerBusy} />
