@@ -20,50 +20,58 @@ async function git(cwd: string, ...args: string[]): Promise<string | null> {
 
 /** git/TODO 현황 수집 → 저장. test_state는 건드리지 않음(verify 전용). */
 export async function collectStatus(p: Project): Promise<void> {
-  const patch: Partial<ProjectStatus> & { projectId: string } = { projectId: p.id }
-  patch.hasTaskMd = fs.existsSync(path.join(p.path, 'TASK.md'))
+  // 예외 격리(#12) — 호출부 4곳(index/ipc/scheduler/telegram)이 전부 Promise.all 일괄 수집이라
+  // 한 프로젝트의 예외(saveStatus DB 오류 등)가 새면 스캔 사이클 전체(자동착수·알림 포함)가 죽는다.
+  // 호출부 수정 대신 함수 안 한 곳에서 흡수한다(최소 침습 — git()은 이미 개별 catch로 null 폴백).
+  try {
+    const patch: Partial<ProjectStatus> & { projectId: string } = { projectId: p.id }
+    patch.hasTaskMd = fs.existsSync(path.join(p.path, 'TASK.md'))
 
-  if (p.isGit) {
-    patch.gitBranch = await git(p.path, 'rev-parse', '--abbrev-ref', 'HEAD')
+    if (p.isGit) {
+      patch.gitBranch = await git(p.path, 'rev-parse', '--abbrev-ref', 'HEAD')
 
-    const porcelain = await git(p.path, 'status', '--porcelain')
-    patch.dirtyFiles = porcelain ? porcelain.split('\n').filter(Boolean).length : 0
+      const porcelain = await git(p.path, 'status', '--porcelain')
+      patch.dirtyFiles = porcelain ? porcelain.split('\n').filter(Boolean).length : 0
 
-    const last = await git(p.path, 'log', '-1', '--format=%s%x00%cI')
-    if (last) {
-      const [subject, date] = last.split('\0')
-      patch.lastCommit = subject ?? null
-      patch.lastCommitAt = date ?? null
-    }
+      const last = await git(p.path, 'log', '-1', '--format=%s%x00%cI')
+      if (last) {
+        const [subject, date] = last.split('\0')
+        patch.lastCommit = subject ?? null
+        patch.lastCommitAt = date ?? null
+      }
 
-    // upstream 없으면 실패 → 0/0 유지
-    const counts = await git(p.path, 'rev-list', '--left-right', '--count', 'HEAD...@{upstream}')
-    if (counts) {
-      const [ahead, behind] = counts.split(/\s+/).map((n) => parseInt(n, 10))
-      patch.ahead = Number.isFinite(ahead) ? ahead : 0
-      patch.behind = Number.isFinite(behind) ? behind : 0
+      // upstream 없으면 실패 → 0/0 유지
+      const counts = await git(p.path, 'rev-list', '--left-right', '--count', 'HEAD...@{upstream}')
+      if (counts) {
+        const [ahead, behind] = counts.split(/\s+/).map((n) => parseInt(n, 10))
+        patch.ahead = Number.isFinite(ahead) ? ahead : 0
+        patch.behind = Number.isFinite(behind) ? behind : 0
+      } else {
+        patch.ahead = 0
+        patch.behind = 0
+      }
+
+      // git grep -c → "file:count" 줄들. 매치 없으면 exit 1 → null → 0
+      const grep = await git(p.path, 'grep', '-c', '-e', 'TODO', '-e', 'FIXME')
+      patch.todoCount = grep
+        ? grep.split('\n').reduce((sum, line) => {
+            const n = parseInt(line.slice(line.lastIndexOf(':') + 1), 10)
+            return sum + (Number.isFinite(n) ? n : 0)
+          }, 0)
+        : 0
     } else {
+      patch.gitBranch = null
+      patch.dirtyFiles = 0
       patch.ahead = 0
       patch.behind = 0
+      patch.todoCount = 0
     }
 
-    // git grep -c → "file:count" 줄들. 매치 없으면 exit 1 → null → 0
-    const grep = await git(p.path, 'grep', '-c', '-e', 'TODO', '-e', 'FIXME')
-    patch.todoCount = grep
-      ? grep.split('\n').reduce((sum, line) => {
-          const n = parseInt(line.slice(line.lastIndexOf(':') + 1), 10)
-          return sum + (Number.isFinite(n) ? n : 0)
-        }, 0)
-      : 0
-  } else {
-    patch.gitBranch = null
-    patch.dirtyFiles = 0
-    patch.ahead = 0
-    patch.behind = 0
-    patch.todoCount = 0
+    saveStatus(patch)
+  } catch (e) {
+    // 이 프로젝트만 이번 사이클 갱신 실패 — 다음 스캔이 자연 재시도한다.
+    console.error(`collectStatus(${p.id}) 실패:`, e)
   }
-
-  saveStatus(patch)
 }
 
 const TAIL_CHARS = 2000

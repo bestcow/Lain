@@ -50,6 +50,7 @@ import { generateBriefing } from './briefing'
 import type { TelegramStatus, FileAttachment, Task, TaskEvent } from '../shared/types'
 import { isSupportedImageMime, pickLargestPhoto, checkAttachmentSize } from './telegram-attach'
 import { nextBackoff, shouldAnnounceReconnect, buildReconnectMessage } from './telegrampoll'
+import { isTransientApiError, transientBackoffMs } from './retry'
 
 const LOG = path.join(DATA_DIR, 'telegram.log')
 function tlog(m: string): void {
@@ -217,8 +218,14 @@ async function api(
   const json: any = await res.json()
   if (!json.ok) {
     // 토큰 비노출. error_code를 붙여 호출부가 401(무효 토큰) 등을 구분 처리하게 한다.
-    const err = new Error(`${method}: ${json.description ?? res.status}`) as Error & { code?: number }
+    const err = new Error(`${method}: ${json.description ?? res.status}`) as Error & {
+      code?: number
+      retryAfter?: number
+    }
     err.code = json.error_code ?? res.status
+    // 429 대기 힌트(초) — 텔레그램이 parameters.retry_after로 알려준다. send() 재시도가 이만큼 대기.
+    const ra = (json.parameters as { retry_after?: number } | undefined)?.retry_after
+    if (typeof ra === 'number') err.retryAfter = ra
     throw err
   }
   return json.result
@@ -299,36 +306,54 @@ function splitAtCodeBoundary(text: string, limit: number): string[] {
   return parts
 }
 
-/** 허용 채팅으로 메시지 전송 — 텔레그램 가독성용 HTML 변환, 거부 시 평문 폴백. 반환=message_id. */
+// 송신 재시도 상한(#12) — 최종 실패(HTML→평문 폴백까지 실패) 후 transient/429일 때만 재송신.
+// 성공하면 즉시 반환하므로 이중 송신은 구조적으로 불가능(재시도는 실패 경로에서만 진입).
+const SEND_MAX_RETRIES = 2
+
+/** 허용 채팅으로 메시지 전송 — 텔레그램 가독성용 HTML 변환, 거부 시 평문 폴백. 반환=message_id.
+ *  최종 실패가 일시 장애(5xx·네트워크 blip)나 429(rate limit)면 백오프/retry_after 대기 후 1~2회 재송신 —
+ *  알림·승인 카드가 blip 한 번에 증발하지 않게 한다(#12). */
 async function send(text: string, replyMarkup?: unknown): Promise<number | null> {
   const chatId = getSettings().telegramChatId
   if (!chatId) return null
   // 음성 요약 태그(<<say: ...>>)는 폰 텍스트엔 노출하지 않는다(음성 전용 — 텔레그램은 텍스트 표시).
   const html = toTelegramHtml(extractSpeech(text).clean.slice(0, 3800))
-  try {
-    const msg = await api('sendMessage', {
-      chat_id: chatId,
-      text: html,
-      parse_mode: 'HTML',
-      reply_markup: replyMarkup,
-      disable_web_page_preview: true,
-    })
-    return msg?.message_id ?? null
-  } catch (e) {
-    // HTML 파싱 거부 등 → 평문으로 폴백(전달 보장)
-    tlog(`send html fail, fallback plain: ${(e as Error).message}`)
+  for (let attempt = 0; ; attempt++) {
     try {
       const msg = await api('sendMessage', {
         chat_id: chatId,
-        text: text.slice(0, 4000),
+        text: html,
+        parse_mode: 'HTML',
         reply_markup: replyMarkup,
         disable_web_page_preview: true,
       })
-      return msg?.message_id ?? null
-    } catch (e2) {
-      lastError = String((e2 as Error).message)
-      tlog(`send fail: ${lastError}`)
-      return null
+      return msg?.message_id ?? null // 성공 — 즉시 반환(재시도 루프 재진입 없음)
+    } catch (e) {
+      // HTML 파싱 거부 등 → 평문으로 폴백(전달 보장)
+      tlog(`send html fail, fallback plain: ${(e as Error).message}`)
+      try {
+        const msg = await api('sendMessage', {
+          chat_id: chatId,
+          text: text.slice(0, 4000),
+          reply_markup: replyMarkup,
+          disable_web_page_preview: true,
+        })
+        return msg?.message_id ?? null
+      } catch (e2) {
+        const err = e2 as Error & { code?: number; retryAfter?: number }
+        // 평문까지 실패 = 최종 실패. transient(5xx·소켓 blip)나 429면 대기 후 재송신 —
+        // 429는 텔레그램이 알려준 retry_after 초, 그 외는 지수 백오프. 그밖(400 등)은 재시도 무의미.
+        if (attempt < SEND_MAX_RETRIES && (err.code === 429 || isTransientApiError(err.message))) {
+          const waitMs =
+            err.code === 429 && err.retryAfter ? err.retryAfter * 1000 : transientBackoffMs(attempt)
+          tlog(`send retry ${attempt + 1}/${SEND_MAX_RETRIES} in ${waitMs}ms: ${err.message}`)
+          await new Promise((r) => setTimeout(r, waitMs))
+          continue
+        }
+        lastError = String(err.message)
+        tlog(`send fail: ${lastError}`)
+        return null
+      }
     }
   }
 }

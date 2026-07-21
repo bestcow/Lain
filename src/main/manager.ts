@@ -96,6 +96,7 @@ import {
 } from './agentskills'
 import { isCodeEdit, isVerifyRun, shouldNudge, VERIFY_NUDGE_NOTE } from './verifynudge'
 import { sumUsageTokens, waitApproval, extractToolResults, RISKY } from './worker'
+import { recordUsage } from './usage'
 import { classifySystemDestructive } from './sysrisk'
 import { notifyUser } from './notify'
 import { sendToNavi, sendToAllNavis } from './navichat'
@@ -2178,8 +2179,14 @@ export async function sendToManager(
   if (lainLessons.length) bumpLessonInject(lainLessons.map((l) => l.id))
   // 무한세션 — 압축된 월드모델이 있으면 주입(세션 리셋으로 사라진 누적 맥락 복원). 비면 미주입(lessons 동형).
   // 킬스위치 — threshold 0이면 주입도 안 함(트리거 게이트와 대칭 → '0 = 오늘과 100% 동일' 보장).
+  // #13 — 새 SDK 세션 첫 턴에만 주입(navichat handoffInject 동형 게이트): resume이 살아 있으면 세션
+  // 트랜스크립트에 이미 있으므로 재주입하지 않는다 — 매 턴 재주입은 사본이 턴 수만큼 쌓여 비용 중복·압축을
+  // 가속했다. 손실 없음: world_state 갱신은 performCompact뿐이고 압축은 항상 세션을 끊어(sdk_session='')
+  // 다음 턴이 새 세션 첫 턴이 되며, retryFresh(세션 소실)도 세션을 비워 재귀 턴에서 자연 재주입된다.
   const worldState =
-    getSettings().contextCompactThreshold > 0 ? getConversationWorldState(conversationId) : null
+    !resume && getSettings().contextCompactThreshold > 0
+      ? getConversationWorldState(conversationId)
+      : null
   const worldStateText = worldState
     ? `\n\n<world-state>\n압축된 누적 맥락(이전 대화 요약 — 방침·진행 스레드·열린 결정·최근 완료):\n${worldState}\n</world-state>`
     : ''
@@ -2563,6 +2570,9 @@ export async function sendToManager(
         if (turnFailedTools > 0) {
           addMessage('manager', 'tool', `⚠ 이번 턴 도구 실패 ${turnFailedTools}건`, conversationId)
         }
+        // D7(#7) — 전역 롤링 사용량(usage.ts)에 레인 턴 소비도 적재. 워커 세션(worker.ts)만 적재되던
+        // 커버리지 공백 보완 — 레인 세션은 워커 세션과 분리라 이중 적재가 아니다.
+        recordUsage(sumUsageTokens(msg))
         // A5 — 컨텍스트 게이지 배선: 조회 IPC 대신 이번 result 이벤트에 편승(추가 왕복 없음). threshold<=0
         // (압축 비활성)이면 게이지가 의미 없으므로 둘 다 생략 — 렌더러가 undefined면 게이지를 숨긴다.
         const gaugeThreshold = getSettings().contextCompactThreshold

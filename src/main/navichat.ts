@@ -35,6 +35,8 @@ import {
 import { preToolUseGuard, secretDeny, tierQueryOptions } from './agentopts'
 import { summarizeConversationTitle } from './title'
 import { RISKY, sumUsageTokens, waitApproval } from './worker'
+import { isTransientApiError, transientBackoffMs, MAX_TRANSIENT_RETRIES } from './retry'
+import { recordUsage } from './usage'
 import { workspaceRoot } from './registry'
 import { answerClarify, interruptTask } from './orchestrator'
 import { notifyUser } from './notify'
@@ -247,7 +249,9 @@ export async function sendToNavi(
   type TextBlock = { type: 'text'; text: string }
   const promptContent: (TextBlock | ImageBlock)[] = [{ type: 'text', text: body }]
   promptContent.push(...toImageBlocks(imageAttachments))
-  const promptParam =
+  // 팩토리로 — transient 재시도(#12)가 프롬프트를 다시 보내는데, 이미지 제너레이터는 1회 소비되면
+  // 비어 재사용할 수 없다(문자열은 재사용 무해). 시도마다 새로 만든다.
+  const makePrompt = () =>
     imageAttachments.length > 0
       ? (async function* () {
           yield {
@@ -281,138 +285,172 @@ export async function sendToNavi(
   })
 
   try {
-    const stream = query({
-      prompt: promptParam,
-      options: {
-        cwd: project.path,
-        resume,
-        permissionMode: 'acceptEdits',
-        maxTurns: 30,
-        // A9 — 토큰 스트리밍(manager.ts와 동일 선례): 텍스트 증분(stream_event)을 렌더러에 흘려
-        // 완성될 때까지 통짜로 나타나는 대신 라이브 버블로 이어붙게 한다. 확정·영속은 assistant 블록.
-        includePartialMessages: true,
-        ...tierQueryOptions(getSettings().naviModel, getSettings()), // §9b — Navi와 같은 티어(local 라우팅 포함)
-        ...skillOptions(null, getSettings().skillsEnabled, getSettings().curatedPlugins),
-        executable: 'node',
-        abortController: abort,
-        pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
-        // 사용자 등록 외부 MCP(navi 타깃, enabled만) — CC-FEATURES P1. Navi 직접 채팅도 같은 도구.
-        mcpServers: mcpServersFor('navi'),
-        stderr: (d: string) =>
-          appendCapped(
-            path.join(DATA_DIR, `workerchat-${projectId.replaceAll('/', '_')}-stderr.log`),
-            d,
-          ),
-        // 비밀 파일 데노리스트 (§24 Phase1) — Navi 채팅은 원본 프로젝트 경로(cwd)에서 돌아 노출면이 크다.
-        // canUseTool이 아니라 PreToolUse 훅에 둔다: auto-allow된 호출(기본 허용 Read, acceptEdits의
-        // Edit/Write)은 canUseTool을 아예 거치지 않아 차단이 발동하지 않았다(실측 — manager/worker 동형).
-        ...preToolUseGuard(secretDeny, (_toolName, d) => {
-          const text = `secret 차단: ${d.detail}`
-          addNaviMessage(projectId, 'tool', text, conversationId)
-          emit({ projectId, kind: 'tool', text })
-        }),
-        canUseTool: async (toolName, input) => {
-          const cmd = String((input as any)?.command ?? '')
-          // 시크릿 차단은 PreToolUse 훅이 이미 했다(모든 호출 경유). 여기 한 번 더 보는 것은
-          // 훅이 어떤 이유로 등록되지 않았을 때를 위한 이중 방어 — 순수 판정이라 비용 0(manager 동형).
-          const secret = secretDeny(toolName, input)
-          if (secret) {
-            return { behavior: 'deny', message: secret.message }
-          }
-          if (toolName === 'Bash' || toolName === 'PowerShell') {
-            // 시스템/PC 파괴(sysrisk.ts) — 항상 사람 승인(예외 없음).
-            const sys = classifySystemDestructive(cmd)
-            if (sys) {
-              const approvalId = insertApproval(chatTaskId(projectId), 'system', cmd)
-              const waitNote = `승인 대기 [system:${sys}]: ${cmd.slice(0, 160)}`
-              addNaviMessage(projectId, 'tool', waitNote)
-              emit({ projectId, kind: 'tool', text: waitNote })
-              notifyUser('lain — 시스템 명령 승인 필요', `[${sys}] ${cmd.slice(0, 120)}`)
-              const sysRes = await waitApproval(approvalId)
-              const sysNote = sysRes.approved ? '승인됨' : '거절됨'
-              addNaviMessage(projectId, 'tool', `${sysNote}: ${cmd.slice(0, 80)}`)
-              emit({ projectId, kind: 'tool', text: `${sysNote}: ${cmd.slice(0, 80)}` })
-              if (!sysRes.approved) {
-                return {
-                  behavior: 'deny',
-                  message: '사용자가 이 시스템 명령을 거절했다. 다른 방법으로 진행해라.',
+    // transient 자동 재시도(#12) — manager sendToManager의 transient && !assistantSeen && attempt<MAX
+    // 백오프 패턴 이식. ⚠️ 이 재시도 경로에선 SDK 세션을 폐기하지 않는다(아래 catch의 setConversationSdkSession('')
+    // 미경유) — 529 blip 한 번에 resume이 끊겨 대화 연속성이 사라지던 문제의 직접 수정. init으로 세션이
+    // 이미 저장됐으면 그 세션을 그대로 resume해 맥락을 보존한다. assistantSeen 뒤의 중단은 재시도하면
+    // 응답이 중복되므로 제외(manager와 동일 정책).
+    for (let transientAttempt = 0; ; transientAttempt++) {
+      try {
+        const stream = query({
+          prompt: makePrompt(),
+          options: {
+            cwd: project.path,
+            resume,
+            permissionMode: 'acceptEdits',
+            maxTurns: 30,
+            // A9 — 토큰 스트리밍(manager.ts와 동일 선례): 텍스트 증분(stream_event)을 렌더러에 흘려
+            // 완성될 때까지 통짜로 나타나는 대신 라이브 버블로 이어붙게 한다. 확정·영속은 assistant 블록.
+            includePartialMessages: true,
+            ...tierQueryOptions(getSettings().naviModel, getSettings()), // §9b — Navi와 같은 티어(local 라우팅 포함)
+            ...skillOptions(null, getSettings().skillsEnabled, getSettings().curatedPlugins),
+            executable: 'node',
+            abortController: abort,
+            pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
+            // 사용자 등록 외부 MCP(navi 타깃, enabled만) — CC-FEATURES P1. Navi 직접 채팅도 같은 도구.
+            mcpServers: mcpServersFor('navi'),
+            stderr: (d: string) =>
+              appendCapped(
+                path.join(DATA_DIR, `workerchat-${projectId.replaceAll('/', '_')}-stderr.log`),
+                d,
+              ),
+            // 비밀 파일 데노리스트 (§24 Phase1) — Navi 채팅은 원본 프로젝트 경로(cwd)에서 돌아 노출면이 크다.
+            // canUseTool이 아니라 PreToolUse 훅에 둔다: auto-allow된 호출(기본 허용 Read, acceptEdits의
+            // Edit/Write)은 canUseTool을 아예 거치지 않아 차단이 발동하지 않았다(실측 — manager/worker 동형).
+            ...preToolUseGuard(secretDeny, (_toolName, d) => {
+              const text = `secret 차단: ${d.detail}`
+              addNaviMessage(projectId, 'tool', text, conversationId)
+              emit({ projectId, kind: 'tool', text })
+            }),
+            canUseTool: async (toolName, input) => {
+              const cmd = String((input as any)?.command ?? '')
+              // 시크릿 차단은 PreToolUse 훅이 이미 했다(모든 호출 경유). 여기 한 번 더 보는 것은
+              // 훅이 어떤 이유로 등록되지 않았을 때를 위한 이중 방어 — 순수 판정이라 비용 0(manager 동형).
+              const secret = secretDeny(toolName, input)
+              if (secret) {
+                return { behavior: 'deny', message: secret.message }
+              }
+              if (toolName === 'Bash' || toolName === 'PowerShell') {
+                // 시스템/PC 파괴(sysrisk.ts) — 항상 사람 승인(예외 없음).
+                const sys = classifySystemDestructive(cmd)
+                if (sys) {
+                  const approvalId = insertApproval(chatTaskId(projectId), 'system', cmd)
+                  const waitNote = `승인 대기 [system:${sys}]: ${cmd.slice(0, 160)}`
+                  addNaviMessage(projectId, 'tool', waitNote)
+                  emit({ projectId, kind: 'tool', text: waitNote })
+                  notifyUser('lain — 시스템 명령 승인 필요', `[${sys}] ${cmd.slice(0, 120)}`)
+                  const sysRes = await waitApproval(approvalId)
+                  const sysNote = sysRes.approved ? '승인됨' : '거절됨'
+                  addNaviMessage(projectId, 'tool', `${sysNote}: ${cmd.slice(0, 80)}`)
+                  emit({ projectId, kind: 'tool', text: `${sysNote}: ${cmd.slice(0, 80)}` })
+                  if (!sysRes.approved) {
+                    return {
+                      behavior: 'deny',
+                      message: '사용자가 이 시스템 명령을 거절했다. 다른 방법으로 진행해라.',
+                    }
+                  }
+                  return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
+                }
+                const root = workspaceRoot() // E6 — 유효 워크스페이스 루트(UI/env) 반영
+                // A1 — 백슬래시 표기만 잡으면 `cat C:/...`(포워드슬래시)로 우회된다 → [\\/]로 확대.
+                const outside =
+                  /[A-Za-z]:[\\/]/.test(cmd) && !cmd.toUpperCase().includes(root.toUpperCase())
+                const risky = RISKY.find((r) => r.re.test(cmd))
+                if (risky || outside) {
+                  const kind = risky?.kind ?? 'outside_dev'
+                  const approvalId = insertApproval(chatTaskId(projectId), kind, cmd)
+                  addNaviMessage(projectId, 'tool', `승인 대기 [${kind}]: ${cmd.slice(0, 160)}`)
+                  emit({ projectId, kind: 'tool', text: `승인 대기 [${kind}]: ${cmd.slice(0, 160)}` })
+                  notifyUser('lain — 승인 필요', `[${kind}] ${cmd.slice(0, 120)}`)
+                  const res = await waitApproval(approvalId)
+                  const note = res.approved ? '승인됨' : '거절됨'
+                  addNaviMessage(projectId, 'tool', `${note}: ${cmd.slice(0, 80)}`)
+                  emit({ projectId, kind: 'tool', text: `${note}: ${cmd.slice(0, 80)}` })
+                  if (!res.approved) {
+                    return {
+                      behavior: 'deny',
+                      message: '사용자가 이 명령을 거절했다. 다른 방법으로 진행해라.',
+                    }
+                  }
                 }
               }
               return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
-            }
-            const root = workspaceRoot() // E6 — 유효 워크스페이스 루트(UI/env) 반영
-            // A1 — 백슬래시 표기만 잡으면 `cat C:/...`(포워드슬래시)로 우회된다 → [\\/]로 확대.
-            const outside =
-              /[A-Za-z]:[\\/]/.test(cmd) && !cmd.toUpperCase().includes(root.toUpperCase())
-            const risky = RISKY.find((r) => r.re.test(cmd))
-            if (risky || outside) {
-              const kind = risky?.kind ?? 'outside_dev'
-              const approvalId = insertApproval(chatTaskId(projectId), kind, cmd)
-              addNaviMessage(projectId, 'tool', `승인 대기 [${kind}]: ${cmd.slice(0, 160)}`)
-              emit({ projectId, kind: 'tool', text: `승인 대기 [${kind}]: ${cmd.slice(0, 160)}` })
-              notifyUser('lain — 승인 필요', `[${kind}] ${cmd.slice(0, 120)}`)
-              const res = await waitApproval(approvalId)
-              const note = res.approved ? '승인됨' : '거절됨'
-              addNaviMessage(projectId, 'tool', `${note}: ${cmd.slice(0, 80)}`)
-              emit({ projectId, kind: 'tool', text: `${note}: ${cmd.slice(0, 80)}` })
-              if (!res.approved) {
-                return {
-                  behavior: 'deny',
-                  message: '사용자가 이 명령을 거절했다. 다른 방법으로 진행해라.',
-                }
+            },
+          },
+        })
+
+        for await (const msg of stream) {
+          if (abandoned) break // 정지로 강제 종료됨 — 늦게 도착한 스트림은 더 처리하지 않는다
+          if (msg.type === 'system' && msg.subtype === 'init') {
+            setConversationSdkSession(conversationId, msg.session_id)
+          } else if (msg.type === 'stream_event') {
+            // A9 — 최상위 텍스트 증분만 라이브로 흘린다(서브에이전트 parent_tool_use_id≠null 제외).
+            // manager.ts와 동일 패턴: thinking_delta 등은 무시하고 text_delta만.
+            if (msg.parent_tool_use_id == null) {
+              const sev = msg.event as { type?: string; delta?: { type?: string; text?: string } }
+              if (sev?.type === 'content_block_delta' && sev.delta?.type === 'text_delta' && sev.delta.text) {
+                emit({ projectId, kind: 'assistant_delta', text: sev.delta.text })
               }
             }
+          } else if (msg.type === 'assistant') {
+            const content = msg.message?.content ?? []
+            const out = content
+              .filter((b: any) => b.type === 'text')
+              .map((b: any) => b.text)
+              .join('')
+            if (out) {
+              assistantSeen = true
+              addNaviMessage(projectId, 'assistant', out, conversationId)
+              emit({ projectId, kind: 'assistant', text: out })
+            }
+            // 도구 활동 라인 — 같은 content 배열의 tool_use 블록도 짧은 회색 라인으로 영속+emit.
+            for (const b of content as any[]) {
+              if (b?.type !== 'tool_use') continue
+              const { display, raw } = toolActivityLine(b)
+              // A17 — 원문(전체 경로·전체 명령)을 축약 뒤에 인코딩해 함께 영속(스키마 변경 없음).
+              const line = encodeToolLine(display, raw)
+              addNaviMessage(projectId, 'tool', line, conversationId)
+              emit({ projectId, kind: 'tool', text: line })
+            }
+          } else if (msg.type === 'result') {
+            resultSeen = true
+            if ('session_id' in msg && msg.session_id)
+              setConversationSdkSession(conversationId, msg.session_id)
+            setConversationContextTokens(conversationId, contextOccupancyTokens(msg)) // 다음 턴 핸드오프 감지용
+            // D7(#7) — 전역 롤링 사용량(usage.ts)에 Navi 직접 채팅 소비도 적재. 워커 세션(worker.ts)만
+            // 적재되던 커버리지 공백 보완 — 채팅 세션은 작업 세션과 분리라 이중 적재가 아니다.
+            recordUsage(sumUsageTokens(msg))
+            emit({
+              projectId,
+              kind: 'result',
+              costUsd: 'total_cost_usd' in msg ? (msg.total_cost_usd ?? null) : null,
+              tokens: sumUsageTokens(msg),
+              sessionId: 'session_id' in msg ? (msg.session_id ?? null) : null,
+            })
           }
-          return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
-        },
-      },
-    })
-
-    for await (const msg of stream) {
-      if (abandoned) break // 정지로 강제 종료됨 — 늦게 도착한 스트림은 더 처리하지 않는다
-      if (msg.type === 'system' && msg.subtype === 'init') {
-        setConversationSdkSession(conversationId, msg.session_id)
-      } else if (msg.type === 'stream_event') {
-        // A9 — 최상위 텍스트 증분만 라이브로 흘린다(서브에이전트 parent_tool_use_id≠null 제외).
-        // manager.ts와 동일 패턴: thinking_delta 등은 무시하고 text_delta만.
-        if (msg.parent_tool_use_id == null) {
-          const sev = msg.event as { type?: string; delta?: { type?: string; text?: string } }
-          if (sev?.type === 'content_block_delta' && sev.delta?.type === 'text_delta' && sev.delta.text) {
-            emit({ projectId, kind: 'assistant_delta', text: sev.delta.text })
-          }
         }
-      } else if (msg.type === 'assistant') {
-        const content = msg.message?.content ?? []
-        const out = content
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('')
-        if (out) {
-          assistantSeen = true
-          addNaviMessage(projectId, 'assistant', out, conversationId)
-          emit({ projectId, kind: 'assistant', text: out })
+        break // 스트림 정상 종료 — 재시도 루프 탈출
+      } catch (e) {
+        if (
+          !abandoned &&
+          !abort.signal.aborted &&
+          isTransientApiError(String(e)) &&
+          !assistantSeen &&
+          transientAttempt < MAX_TRANSIENT_RETRIES
+        ) {
+          resume = conversationSdkSession(conversationId) || undefined // 세션 보존 재시도(폐기 금지)
+          const waitMs = transientBackoffMs(transientAttempt)
+          emit({
+            projectId,
+            kind: 'tool',
+            text: `⏳ 상류/네트워크 일시 장애 — ${waitMs / 1000}s 후 자동 재시도 (${transientAttempt + 1}/${MAX_TRANSIENT_RETRIES})`,
+          })
+          await new Promise((r) => setTimeout(r, waitMs))
+          // 백오프 대기 중 정지됨 — forceStop이 이미 종료 처리(result emit·busy 해제). 재스폰 낭비 방지.
+          if (abandoned || abort.signal.aborted) return {}
+          continue
         }
-        // 도구 활동 라인 — 같은 content 배열의 tool_use 블록도 짧은 회색 라인으로 영속+emit.
-        for (const b of content as any[]) {
-          if (b?.type !== 'tool_use') continue
-          const { display, raw } = toolActivityLine(b)
-          // A17 — 원문(전체 경로·전체 명령)을 축약 뒤에 인코딩해 함께 영속(스키마 변경 없음).
-          const line = encodeToolLine(display, raw)
-          addNaviMessage(projectId, 'tool', line, conversationId)
-          emit({ projectId, kind: 'tool', text: line })
-        }
-      } else if (msg.type === 'result') {
-        resultSeen = true
-        if ('session_id' in msg && msg.session_id)
-          setConversationSdkSession(conversationId, msg.session_id)
-        setConversationContextTokens(conversationId, contextOccupancyTokens(msg)) // 다음 턴 핸드오프 감지용
-        emit({
-          projectId,
-          kind: 'result',
-          costUsd: 'total_cost_usd' in msg ? (msg.total_cost_usd ?? null) : null,
-          tokens: sumUsageTokens(msg),
-          sessionId: 'session_id' in msg ? (msg.session_id ?? null) : null,
-        })
+        throw e // 비일시·소진·정지 — 기존 catch(정지 처리·세션 폐기·error emit)로
       }
     }
     // 대화 제목 자동요약 — 이번 턴에 assistant 응답이 났고 아직 자동요약 전이면 1회 비동기 생성.
