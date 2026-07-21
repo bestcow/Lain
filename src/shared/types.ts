@@ -144,7 +144,8 @@ export interface Approval {
   taskId: string
   kind: string // push | destructive | dep_change | network | outside_dev | question | system(OS 파괴 — taskId 'lain'이면 매니저發) | plan(D9 — Navi plan 모드 계획 승인)
   payload: string // 명령 원문 또는 질문
-  state: 'pending' | 'approved' | 'rejected'
+  // auto = 자율 통과 기록(B1 — 대기 아님, 사후 검토 탭 대상) · auto_acked = 사후 검토에서 '확인' 처리됨
+  state: 'pending' | 'approved' | 'rejected' | 'auto' | 'auto_acked'
   createdAt: string
 }
 
@@ -588,6 +589,9 @@ export interface LainApi {
   taskDiff(taskId: string): Promise<string>
   listApprovals(): Promise<Approval[]>
   resolveApproval(id: number, approved: boolean, answer?: string): Promise<void>
+  // 사후 검토 탭(B1 소비) — 자율 통과(state='auto') 기록 최신순(확인된 행 제외) / '확인' 처리(auto_acked)
+  listAutoApprovals(): Promise<Approval[]>
+  ackAutoApproval(id: number): Promise<void>
   // 인라인 질문(ask_user) 답 제출 — 대기 중인 Lain 턴을 깨운다. answer는 선택된 보기 텍스트 배열.
   answerQuestion(questionId: string, answer: string[]): Promise<void>
   // B5 — 대기 중 인라인 질문 조회. 렌더러 마운트/리로드 시 재요청해 카드를 복원(main 인메모리 → 리로드 유실 방어).

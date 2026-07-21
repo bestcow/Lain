@@ -46,7 +46,7 @@ import type {
   ReviewDepth,
 } from '../shared/types'
 import { MODEL_TIERS } from '../shared/models' // m6 — 티어 목록 단일출처(로컬 중복 제거)
-import type { LoopStats } from '../shared/loopstats' // L6 — 루프 성적표 집계 결과 타입(main/renderer 공용 아님)
+import type { LoopStats, PromotionStats } from '../shared/loopstats' // L6·A3 — 루프 성적표/승격·강등 실적 집계 결과 타입(main/renderer 공용 아님)
 // 출력측 비밀 redaction + 학습 인젝션 스캔 — 구현은 safety 소유자, store는 chokepoint에서 import-only.
 import { redactSecrets, scanLessonInjection } from './safety'
 // curatedPlugins 기본값(CC-FEATURES P1) — skills는 store를 import하지 않아 단방향(순환 없음).
@@ -1912,10 +1912,13 @@ export function dailyTaskUsage(windowDays = 15): TaskUsageRow[] {
 
 /** L6(P6) — 루프 성적표: 최근 days일 작업의 done/error/cancelled·1회 통과(자동재시도·rework 없이 done)·재작업
  *  건수·상위 실패 사유를 집계한다(다이제스트 한 줄 + 주간 보고 문단용, 포맷은 shared/loopstats.ts). 읽기 전용.
+ *  A3 — projectId를 주면 그 프로젝트 작업만(WHERE project_id) 집계한다(프로젝트 단위 실적·승격/강등 제안 입력).
+ *  생략 시 전역 집계로 기존 동작 불변.
  *  ⚠️ created_at은 datetime('now')=UTC라 dailyTaskUsage(C4)와 동일하게 datetime('now', '-N days')로 비교
  *  (JS에서 ISO 문자열을 만들면 SQLite 저장 포맷과 어긋날 수 있음 — Task 9 확인된 관례). */
-export function loopStats(days = 7): LoopStats {
+export function loopStats(days = 7, projectId?: string): LoopStats {
   const win = Math.max(1, Math.min(400, Math.floor(days)))
+  const projFilter = projectId ? ' AND project_id = ?' : ''
   const row = db
     .prepare(
       `SELECT
@@ -1923,23 +1926,25 @@ export function loopStats(days = 7): LoopStats {
          SUM(state='done') done, SUM(state='error') error, SUM(state='cancelled') cancelled,
          SUM(state='done' AND COALESCE(ever_auto_retried,0)=0 AND COALESCE(rework_count,0)=0 AND COALESCE(audit_retried,0)=0) firstPass,
          SUM(COALESCE(rework_count,0)>0) reworked
-       FROM tasks WHERE created_at >= datetime('now', ?)`,
+       FROM tasks WHERE created_at >= datetime('now', ?)${projFilter}`,
     )
-    .get(`-${win} days`) as any
+    .get(...(projectId ? [`-${win} days`, projectId] : [`-${win} days`])) as any
   // 실패 사유 — kind='exit' content는 "<reason>" 또는 "<reason>: <detail>"(worker.ts logExit). detail은
   // 자유 텍스트라 원문 그대로 묶으면 조각나므로 콜론 앞 reason만 키로 묶는다(done은 실패가 아니라 제외).
+  // task_events엔 project_id가 없어 프로젝트 스코프는 tasks 서브쿼리로 건다.
+  const eventProjFilter = projectId ? ' AND task_id IN (SELECT id FROM tasks WHERE project_id = ?)' : ''
   const reasons = db
     .prepare(
       `SELECT
          CASE WHEN instr(content, ':') > 0 THEN substr(content, 1, instr(content, ':') - 1) ELSE content END k,
          COUNT(*) n
        FROM task_events
-       WHERE kind='exit' AND created_at >= datetime('now', ?)
+       WHERE kind='exit' AND created_at >= datetime('now', ?)${eventProjFilter}
        GROUP BY k
        HAVING k != 'done'
        ORDER BY n DESC LIMIT 3`,
     )
-    .all(`-${win} days`) as any[]
+    .all(...(projectId ? [`-${win} days`, projectId] : [`-${win} days`])) as any[]
   return {
     days: win,
     total: row.total ?? 0,
@@ -1949,6 +1954,55 @@ export function loopStats(days = 7): LoopStats {
     firstPass: row.firstPass ?? 0,
     reworked: row.reworked ?? 0,
     topFailReasons: reasons.map((r) => [r.k, r.n] as [string, number]),
+  }
+}
+
+/** A3(확신도 축) — 프로젝트 실적 기반 승격/강등 제안의 입력 집계(판정은 shared/loopstats.ts promotionAdvice).
+ *  연속 무수정 통과는 최근 종결(done/error/cancelled) 작업을 최신순으로 훑어 첫 비(非)1회통과에서 중단
+ *  (cancelled는 사람 사정의 중단이라 실적으로 치지 않음 — 끊지도 늘리지도 않음). 최근 rework/심사 미통과/
+ *  spec-gaming은 days 창으로 집계(created_at=UTC 관례는 loopStats와 동일). 읽기 전용. */
+export function promotionStats(projectId: string, days = 7): PromotionStats {
+  const win = Math.max(1, Math.min(400, Math.floor(days)))
+  // 스트릭 스캔 상한 50 — 승격 임계(PROMOTE_STREAK)를 훨씬 넘는 깊이라 충분하고 전량 스캔은 낭비.
+  // created_at은 초 단위라 같은 초 삽입의 순서가 불안정 — rowid 보조 정렬로 삽입 순서를 고정.
+  const recent = db
+    .prepare(
+      `SELECT state,
+              COALESCE(ever_auto_retried,0) auto_retried,
+              COALESCE(rework_count,0) rework,
+              COALESCE(audit_retried,0) audit
+       FROM tasks WHERE project_id = ? AND state IN ('done','error','cancelled')
+       ORDER BY created_at DESC, rowid DESC LIMIT 50`,
+    )
+    .all(projectId) as any[]
+  let streak = 0
+  for (const r of recent) {
+    if (r.state === 'cancelled') continue
+    if (r.state === 'done' && !r.auto_retried && !r.rework && !r.audit) streak++
+    else break
+  }
+  const agg = db
+    .prepare(
+      `SELECT SUM(COALESCE(rework_count,0)>0) reworked, SUM(COALESCE(audit_retried,0)=1) audited
+       FROM tasks WHERE project_id = ? AND created_at >= datetime('now', ?)`,
+    )
+    .get(projectId, `-${win} days`) as any
+  // spec-gaming 신호 — worker.ts recordDeny('spec-gaming 차단: …')·orchestrator.ts §24 사후검증
+  // ('spec-gaming 의심(§24): …') 둘 다 kind='status'에 'spec-gaming' 접두로 남는다(현재 유일한 영속 신호).
+  const sg = db
+    .prepare(
+      `SELECT COUNT(*) n FROM task_events
+       WHERE kind='status' AND content LIKE 'spec-gaming%' AND created_at >= datetime('now', ?)
+         AND task_id IN (SELECT id FROM tasks WHERE project_id = ?)`,
+    )
+    .get(`-${win} days`, projectId) as any
+  return {
+    projectId,
+    days: win,
+    consecutiveFirstPass: streak,
+    recentReworked: agg.reworked ?? 0,
+    recentAuditRetried: agg.audited ?? 0,
+    specGamingBlocked: (sg.n ?? 0) > 0,
   }
 }
 
@@ -2044,12 +2098,23 @@ export function insertApproval(taskId: string, kind: string, payload: string): n
   return Number(res.lastInsertRowid)
 }
 
+/** B1 — 자율 통과(autonomous/bypass) 사후 검토 기록. 대기가 아니라 state='auto'로 바로 적재한다.
+ *  pending 집계(listApprovals·pendingApprovals 배지·clearOrphanApprovals·rejectPendingApprovalsForTask·
+ *  텔레그램 reconcile)는 전부 state='pending' 한정 WHERE라 auto 행이 대기로 섞이지 않는다. */
+export function insertAutoApproval(taskId: string, kind: string, payload: string): number {
+  const res = db
+    .prepare("INSERT INTO approvals (task_id, kind, payload, state) VALUES (?, ?, ?, 'auto')")
+    .run(taskId, kind, payload)
+  return Number(res.lastInsertRowid)
+}
+
 export function resolveApprovalRow(
   id: number,
   state: 'approved' | 'rejected',
   answer?: string,
 ): void {
-  db.prepare('UPDATE approvals SET state = ?, answer = ? WHERE id = ?').run(
+  // pending 한정 — 사후 검토 기록(auto)·이미 결정된 행이 approved/rejected로 뒤집히는 것 방지.
+  db.prepare("UPDATE approvals SET state = ?, answer = ? WHERE id = ? AND state = 'pending'").run(
     state,
     answer ?? null,
     id,
@@ -2068,6 +2133,31 @@ export function listApprovals(): Approval[] {
       state: r.state,
       createdAt: r.created_at,
     }))
+}
+
+/** 사후 검토 탭(B1 소비) — 자율 통과(state='auto') 기록을 최신순으로. 확인(ack)된 행(auto_acked)은
+ *  제외해 "아직 안 본 것"만 남긴다. pending 뷰(listApprovals)와 완전 분리 — 배지·집계 불변. */
+export function listAutoApprovals(limit = 100): Approval[] {
+  return db
+    .prepare("SELECT * FROM approvals WHERE state = 'auto' ORDER BY id DESC LIMIT ?")
+    .all(Math.max(1, Math.min(500, Math.floor(limit))))
+    .map((r: any) => ({
+      id: r.id,
+      taskId: r.task_id,
+      kind: r.kind,
+      payload: r.payload,
+      state: r.state,
+      createdAt: r.created_at,
+    }))
+}
+
+/** 사후 검토 '확인' — auto 행만 auto_acked로 닫는다(WHERE state='auto' 한정이라 pending/approved 등
+ *  기존 상태 체계는 절대 안 건드린다 — 최소 침습). @returns 실제로 닫았으면 true */
+export function ackAutoApproval(id: number): boolean {
+  const r = db
+    .prepare("UPDATE approvals SET state = 'auto_acked' WHERE id = ? AND state = 'auto'")
+    .run(id)
+  return Number(r.changes) > 0
 }
 
 export function addTaskEvent(

@@ -72,6 +72,8 @@ import {
   startTask,
   classifyVerifyFailure,
   pickTaskMode,
+  decideReviewDepth,
+  AUTONOMOUS_MIN_DONE,
   nextAutoRetry,
   shouldAutoStartTask,
   shouldPauseForBudget,
@@ -100,10 +102,37 @@ describe('pickTaskMode — 작업 모드 결정(순수)', () => {
     expect(pickTaskMode('hi', 'autonomous', false, true)).toBe('autonomous')
     expect(pickTaskMode('hi', 'autonomous', false, false)).toBe('interactive')
   })
-  it('pref auto는 autoGradable && verifyCmd 둘 다일 때만 autonomous', () => {
-    expect(pickTaskMode('hi', 'auto', true, true)).toBe('autonomous')
-    expect(pickTaskMode('hi', 'auto', true, false)).toBe('interactive')
-    expect(pickTaskMode('hi', 'auto', false, true)).toBe('interactive')
+  it('pref auto는 autoGradable && verifyCmd && 완료 실적(done≥3) 셋 다일 때만 autonomous', () => {
+    expect(pickTaskMode('hi', 'auto', true, true, AUTONOMOUS_MIN_DONE)).toBe('autonomous')
+    expect(pickTaskMode('hi', 'auto', true, false, AUTONOMOUS_MIN_DONE)).toBe('interactive')
+    expect(pickTaskMode('hi', 'auto', false, true, AUTONOMOUS_MIN_DONE)).toBe('interactive')
+  })
+  it('실적 게이트 — done<3이면 auto 판정은 interactive(첫 작업 프로젝트 hands-off 방지)', () => {
+    expect(pickTaskMode('hi', 'auto', true, true, AUTONOMOUS_MIN_DONE - 1)).toBe('interactive')
+    expect(pickTaskMode('hi', 'auto', true, true, 0)).toBe('interactive')
+    expect(pickTaskMode('hi', 'auto', true, true)).toBe('interactive') // 생략 = 0(보수적 기본)
+  })
+  it('실적 게이트는 auto 자동판정 전용 — 마커·명시 pref(사용자 의사)는 그대로', () => {
+    expect(pickTaskMode('lain:autonomous', 'auto', true, true, 0)).toBe('autonomous')
+    expect(pickTaskMode('hi', 'autonomous', false, true, 0)).toBe('autonomous')
+  })
+})
+
+describe('decideReviewDepth — 확신도 소비: 심사 강도 상향(순수)', () => {
+  it('작업별 명시 값은 사고 신호가 있어도 그대로(사용자 존중)', () => {
+    expect(decideReviewDepth('standard', 'standard', true)).toBe('standard')
+    expect(decideReviewDepth('light', 'adversarial', true)).toBe('light')
+  })
+  it('기본값 standard + 최근 rework/심사 미통과 → adversarial 상향', () => {
+    expect(decideReviewDepth(undefined, 'standard', true)).toBe('adversarial')
+  })
+  it('사고 신호 없으면 기본값 그대로', () => {
+    expect(decideReviewDepth(undefined, 'standard', false)).toBe('standard')
+  })
+  it('상향만 한다 — light·adversarial 기본값은 불변(하향 자동화 금지)', () => {
+    expect(decideReviewDepth(undefined, 'light', true)).toBe('light')
+    expect(decideReviewDepth(undefined, 'adversarial', true)).toBe('adversarial')
+    expect(decideReviewDepth(undefined, 'adversarial', false)).toBe('adversarial')
   })
 })
 

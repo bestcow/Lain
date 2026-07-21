@@ -25,6 +25,7 @@ import {
   listTasks,
   loopStats,
   markRoutineRan,
+  promotionStats,
   setSetting,
 } from './store'
 import { judgeQueryOptions } from './agentopts'
@@ -34,7 +35,7 @@ import { buildDigest, pushManagerNotice, sendToManager, setStartupBriefing } fro
 import { notifyUser } from './notify'
 import { shouldAutoStartTask, startTask, hasActiveWork, drainQueue } from './orchestrator'
 import type { ChatEvent, TestState } from '../shared/types'
-import { formatLoopStatsReport, isoWeekOf } from '../shared/loopstats'
+import { formatLoopStatsReport, isoWeekOf, promotionAdvice } from '../shared/loopstats'
 
 let timer: ReturnType<typeof setInterval> | null = null
 let running = false
@@ -454,6 +455,15 @@ export async function runScanOnce(): Promise<void> {
       if (getSetting('loop_stats_week') !== week) {
         const rep = formatLoopStatsReport(loopStats(7))
         if (rep) pushManagerNotice(`[주간 루프 성적표]\n${rep}`)
+        // A3(확신도 축) — 프로젝트별 실적으로 승격/강등 '제안'만 성적표에 덧붙인다. 자동 적용 금지:
+        // 여기서도 어디서도 설정을 바꾸지 않는다(자율성은 실적으로 획득, 확정은 사람 몫).
+        const advices = listProjects()
+          .map((p) => promotionAdvice(promotionStats(p.id)))
+          .filter((a): a is string => !!a)
+        if (advices.length)
+          pushManagerNotice(
+            `[승격/강등 제안]\n${advices.join('\n')}\n(제안일 뿐 자동 적용되지 않는다 — 적용은 사람이 설정에서 확정한다)`,
+          )
         setSetting('loop_stats_week', week)
       }
     } catch {

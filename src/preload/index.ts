@@ -69,6 +69,8 @@ const api: LainApi = {
   listApprovals: () => ipcRenderer.invoke('approvals:list'),
   resolveApproval: (id, approved, answer) =>
     ipcRenderer.invoke('approvals:resolve', id, approved, answer),
+  listAutoApprovals: () => ipcRenderer.invoke('approvals:autoList'),
+  ackAutoApproval: (id) => ipcRenderer.invoke('approvals:autoAck', id),
   answerQuestion: (questionId, answer) => ipcRenderer.invoke('question:answer', questionId, answer),
   pendingQuestions: () => ipcRenderer.invoke('question:pending'),
   onTasksUpdated: (cb) => subscribe<Task[]>('tasks:updated', cb),

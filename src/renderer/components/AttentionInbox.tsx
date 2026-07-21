@@ -302,6 +302,50 @@ function ReviewRow({
   )
 }
 
+// 사후 검토(B1 소비) — 자율 통과(state='auto') 기록 행. '대기'가 아니라 이미 실행된 것의 확인이므로
+// 승인/거절 대신 '확인' 하나만 있다(확인=auto_acked로 닫혀 목록에서 빠짐). 무엇이(kind·payload) 언제
+// (createdAt) 어느 작업(taskId 링크)에서 자율 통과됐는지를 보인다.
+function AutoReviewRow({
+  a,
+  task,
+  label,
+  onOpenTask,
+  onAck,
+}: {
+  a: Approval
+  task: Task | undefined
+  label: string
+  onOpenTask: (taskId: string) => void
+  onAck: (id: number) => void
+}) {
+  return (
+    <div className={`inbox-row ir-${a.kind}`}>
+      <span className={`ir-badge b-${a.kind}`}>{KIND_LABEL[a.kind] ?? a.kind}</span>
+      <div className="ir-mid">
+        <div className="ir-proj">
+          {task ? (
+            <span className="ir-link" onClick={() => onOpenTask(a.taskId)} title="콘솔 열기">
+              {label}
+            </span>
+          ) : (
+            label
+          )}
+          <span className="ir-auto" title="자율 통과 (§21.5 autonomous/bypass)">⚡auto</span>
+          <span className="ir-wait" title={`자율 통과 시각: ${a.createdAt}`}>
+            {fmtElapsed(a.createdAt)}
+          </span>
+        </div>
+        <code className="ir-cmd">{a.payload}</code>
+      </div>
+      <div className="ir-acts">
+        <button className="ib-ok" title="확인 — 사후 검토 완료로 표시" onClick={() => onAck(a.id)}>
+          확인
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // C2 — 에러로 멈춘 작업. 인박스가 '너를 기다리는 것 전부'인데 error만 빠져 실패를 놓치면 '큐 비었음'으로 보였다.
 // 소음을 줄이려 수동 재개가 가능한(worktree·세션 생존) 것만 넣는다 — 액션도 기존 resumeTask 재사용.
 function ErrorRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) => void }) {
@@ -342,6 +386,24 @@ function AttentionInboxInner({ approvals, tasks, onOpenTask, onClose }: Props) {
   const [, setNow] = useState(Date.now())
   // 결재 결과(병합 실패 사유 등) — 행은 처리 즉시 사라지므로 패널에 한 줄로 남긴다. 다음 결재에 덮어쓴다.
   const [actionMsg, setActionMsg] = useState<string | null>(null)
+  // 사후 검토 뷰(B1 소비) — 자율 통과(state='auto') 기록. pending 뷰와 데이터가 완전 분리(브로드캐스트에
+  // 안 실림 — auto는 '기다리는 것'이 아니다)라 뷰 진입 시점에 당겨 읽는다. 배지·카운트(total)는 불변.
+  const [view, setView] = useState<'pending' | 'after'>('pending')
+  const [autoRows, setAutoRows] = useState<Approval[]>([])
+  useEffect(() => {
+    if (view !== 'after') return
+    let alive = true
+    void window.lain.listAutoApprovals().then((rows) => {
+      if (alive) setAutoRows(rows)
+    })
+    return () => {
+      alive = false
+    }
+  }, [view])
+  const ackAuto = (id: number) => {
+    void window.lain.ackAutoApproval(id)
+    setAutoRows((prev) => prev.filter((r) => r.id !== id)) // 낙관 갱신 — 확인은 로컬 DB UPDATE라 실패 여지가 작다
+  }
   // C5 — 대기 배지는 시간이 흐르면서 값이 바뀌는데, approvals/tasks는 이벤트 기반 갱신(App.tsx)이라
   // 변동 없인 리렌더가 없다 — TaskDrawer와 같은 30초 틱으로 배지를 계속 최신 유지.
   useEffect(() => {
@@ -370,7 +432,9 @@ function AttentionInboxInner({ approvals, tasks, onOpenTask, onClose }: Props) {
   return (
     <div className="drawer panel inbox-panel">
       <div className="drawer-head">
-        <span className="drawer-title">[ wired://inbox — 대기 ]</span>
+        <span className="drawer-title">
+          [ wired://inbox — {view === 'after' ? '사후 검토' : '대기'} ]
+        </span>
         <span
           className="dim"
           title={longestWaitLabel ? `최장 대기: ${longestWaitLabel}` : undefined}
@@ -378,17 +442,45 @@ function AttentionInboxInner({ approvals, tasks, onOpenTask, onClose }: Props) {
           {total}건 · 승인 {approvals.length} · 질문 {blocked.length} · 결재 {review.length}
           {errored.length > 0 ? ` · 에러 ${errored.length}` : ''}
         </span>
+        <button
+          className="dim"
+          title={
+            view === 'after'
+              ? '대기 목록으로'
+              : '자율 통과(autonomous/bypass) 기록 — 무엇이 자율로 실행됐는지 사후 확인'
+          }
+          onClick={() => setView(view === 'after' ? 'pending' : 'after')}
+        >
+          {view === 'after' ? '← 대기' : '사후 검토'}
+        </button>
         <button onClick={onClose}><Icon name="x-circle" size={18} /></button>
       </div>
       {/* B10 — 키보드 힌트: 행에 포커스(Tab/자동) 후 아래 키로 즉시 처리. 실제 구현(ApprovalRow·ReviewRow)과 일치. */}
-      {total > 0 && (
+      {view === 'pending' && total > 0 && (
         <div className="inbox-hint dim">
           <kbd>y</kbd> 승인 · <kbd>n</kbd> 거절 · <kbd>m</kbd> 병합 · <kbd>b</kbd> 브랜치
         </div>
       )}
       {/* 결재 결과 한 줄 — 병합 실패('rebase 후 verify 실패' 등)를 성공과 구분해 남긴다 */}
-      {actionMsg && <div className="inbox-hint warn">{actionMsg}</div>}
-      {total === 0 ? (
+      {view === 'pending' && actionMsg && <div className="inbox-hint warn">{actionMsg}</div>}
+      {view === 'after' ? (
+        autoRows.length === 0 ? (
+          <div className="empty">자율 통과 기록 없음 — 전부 확인됨 ●</div>
+        ) : (
+          <div className="inbox-list">
+            {autoRows.map((a) => (
+              <AutoReviewRow
+                key={`auto${a.id}`}
+                a={a}
+                task={byId.get(a.taskId)}
+                label={projLabel(a.taskId, byId)}
+                onOpenTask={onOpenTask}
+                onAck={ackAuto}
+              />
+            ))}
+          </div>
+        )
+      ) : total === 0 ? (
         <div className="empty">큐 비었음 — lain 대기 ●</div>
       ) : (
         <div className="inbox-list" ref={listRef}>

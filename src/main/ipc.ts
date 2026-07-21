@@ -11,6 +11,8 @@ import {
   listRecentActivity,
   updateTask,
   listApprovals,
+  listAutoApprovals,
+  ackAutoApproval,
   listTaskEvents,
   getSetting,
   getSettings,
@@ -1054,6 +1056,12 @@ export function registerIpc(): void {
   ipcMain.handle('approvals:resolve', (_e, id: number, approved: boolean, answer?: string) => {
     resolveApproval(id, approved, answer)
     broadcastApprovals()
+  })
+  // 사후 검토 탭(B1 소비) — auto 행은 대기가 아니라 broadcastApprovals(pending 한정)에 안 실린다.
+  // 렌더러가 뷰 진입/확인 시점에 당겨 읽는다(pull) — 기존 pending 승인 UI·배지 경로 불변.
+  ipcMain.handle('approvals:autoList', () => listAutoApprovals())
+  ipcMain.handle('approvals:autoAck', (_e, id: number) => {
+    ackAutoApproval(id)
   })
 
   // 인라인 질문(ask_user) 답 제출 — 대기 중인 Lain 턴을 깨운다.
