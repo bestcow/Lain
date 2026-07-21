@@ -41,7 +41,8 @@ if ((Test-Path $commitFile) -and -not $Force) {
   if ($installed) {
     # 이력 재작성(rebase·filter·.git 교체)을 하면 설치본이 기록한 커밋이 이 저장소에 없을 수 있다.
     # 그 경우 조상 판정 자체가 불가능하므로 git fatal로 죽지 않고 사유를 알려준다.
-    & git -C $root cat-file -e "$installed^{commit}" 2>$null
+    # (rev-parse --verify --quiet: 없으면 stderr 없이 exit 1 — PS 5.1은 네이티브 stderr를 종료 오류로 승격시킨다)
+    & git -C $root rev-parse --verify --quiet "$installed^{commit}" > $null
     if ($LASTEXITCODE -ne 0) {
       $iShort = $installed.Substring(0, [Math]::Min(8, $installed.Length))
       throw "deploy 거부: 설치본 커밋($iShort)이 이 저장소에 없음 — 이력이 재작성됐을 수 있다. 덮어써도 되는 게 확실하면 -Force."
