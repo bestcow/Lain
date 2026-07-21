@@ -59,8 +59,7 @@ export function tokenizeLinks(text: string): LinkToken[] {
 
   // URL 구간을 기준으로 텍스트를 [비URL, URL, 비URL, URL, ...] 순서로 순회하며
   // 비URL 구간에서 경로를 추가로 찾는다.
-  const pushTextAndPaths = (segment: string, baseOffset: number) => {
-    void baseOffset // 현재 구현은 절대 오프셋이 필요 없음(경로 매치가 segment 로컬) — 인터페이스 안정용 유지
+  const pushTextAndPaths = (segment: string) => {
     let last = 0
     PATH_RE.lastIndex = 0
     let pm: RegExpExecArray | null
@@ -88,14 +87,14 @@ export function tokenizeLinks(text: string): LinkToken[] {
   }
 
   for (const range of urlRanges) {
-    if (range.start > cursor) pushTextAndPaths(text.slice(cursor, range.start), cursor)
+    if (range.start > cursor) pushTextAndPaths(text.slice(cursor, range.start))
     const raw = text.slice(range.start, range.end)
     const { core, tail } = trimTrailingPunct(raw)
     if (core) out.push({ type: 'url', value: core })
     if (tail) out.push({ type: 'text', value: tail })
     cursor = range.end
   }
-  if (cursor < text.length) pushTextAndPaths(text.slice(cursor), cursor)
+  if (cursor < text.length) pushTextAndPaths(text.slice(cursor))
 
   return out
 }

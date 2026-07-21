@@ -36,7 +36,6 @@ beforeAll(() => {
     stack: '',
     verifyCmd: null,
     isGit: false,
-    enabled: true,
   } as any)
 })
 afterAll(() => {
@@ -75,7 +74,7 @@ describe('setTaskPriority', () => {
 describe('queuedTasks — priority ASC, created_at ASC', () => {
   it('state=queued만, priority 오름차순으로 반환한다', () => {
     // 격리: 이 describe가 심는 것만 검사하도록 고유 프로젝트 사용.
-    upsertProject({ id: 'p-q2', path: 'C:/tmp/p-q2', name: 'p-q2', stack: '', verifyCmd: null, isGit: false, enabled: true } as any)
+    upsertProject({ id: 'p-q2', path: 'C:/tmp/p-q2', name: 'p-q2', stack: '', verifyCmd: null, isGit: false } as any)
     insertTask({ id: 'qa', projectId: 'p-q2', title: 'a', state: 'queued', content: 'c', priority: 5 })
     insertTask({ id: 'qb', projectId: 'p-q2', title: 'b', state: 'queued', content: 'c', priority: -2 })
     insertTask({ id: 'qc', projectId: 'p-q2', title: 'c', state: 'queued', content: 'c', priority: 0 })
@@ -90,7 +89,7 @@ describe('queuedTasks — priority ASC, created_at ASC', () => {
   })
 
   it('priority 동률이면 created_at ASC(먼저 들어온 것 먼저)', () => {
-    upsertProject({ id: 'p-q3', path: 'C:/tmp/p-q3', name: 'p-q3', stack: '', verifyCmd: null, isGit: false, enabled: true } as any)
+    upsertProject({ id: 'p-q3', path: 'C:/tmp/p-q3', name: 'p-q3', stack: '', verifyCmd: null, isGit: false } as any)
     // created_at은 datetime('now')(초 단위)라 동일 초에 들어가면 정렬이 불안정할 수 있어 id를 rowid 대용으로 삽입 순서 검증만.
     insertTask({ id: 'first', projectId: 'p-q3', title: 'first', state: 'queued', content: 'c', priority: 1 })
     insertTask({ id: 'second', projectId: 'p-q3', title: 'second', state: 'queued', content: 'c', priority: 1 })
@@ -106,12 +105,12 @@ describe('queuedTasks — priority ASC, created_at ASC', () => {
 
 describe('activeTaskForProject — queued 제외', () => {
   it('queued 작업만 있으면 활성 없음(null)', () => {
-    upsertProject({ id: 'p-q4', path: 'C:/tmp/p-q4', name: 'p-q4', stack: '', verifyCmd: null, isGit: false, enabled: true } as any)
+    upsertProject({ id: 'p-q4', path: 'C:/tmp/p-q4', name: 'p-q4', stack: '', verifyCmd: null, isGit: false } as any)
     insertTask({ id: 'a1', projectId: 'p-q4', title: 't', state: 'queued', content: 'c' })
     expect(activeTaskForProject('p-q4')).toBeNull()
   })
   it('working 작업이 있으면 그건 활성으로 잡힌다(queued와 대비)', () => {
-    upsertProject({ id: 'p-q5', path: 'C:/tmp/p-q5', name: 'p-q5', stack: '', verifyCmd: null, isGit: false, enabled: true } as any)
+    upsertProject({ id: 'p-q5', path: 'C:/tmp/p-q5', name: 'p-q5', stack: '', verifyCmd: null, isGit: false } as any)
     insertTask({ id: 'a2', projectId: 'p-q5', title: 't', state: 'queued', content: 'c' })
     insertTask({ id: 'a3', projectId: 'p-q5', title: 't', state: 'working', content: 'c' })
     expect(activeTaskForProject('p-q5')!.id).toBe('a3')

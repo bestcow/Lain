@@ -8,7 +8,6 @@ import { naviStatus } from './StageView'
 interface Props {
   project: ProjectView
   task: Task | null
-  focused: boolean
   unread: boolean
   activity?: string | null // C1 — 이 Navi task의 마지막 라이브 활동 한 줄(decode된 display만). 없으면 미표시
   onFocus: (id: string) => void
@@ -21,7 +20,6 @@ interface Props {
 function NaviTileInner({
   project: p,
   task,
-  focused,
   unread,
   activity,
   onFocus,
@@ -32,13 +30,16 @@ function NaviTileInner({
 }: Props) {
   const st = naviStatus(p, task)
   const s = p.status
-  // C2 — 프로젝트 지표: 미푸시(↑)·behind(↓)·TODO 잔여. 0이면 표시 안 함(신호 대 소음).
+  // C2 — 프로젝트 지표: 대기 승인·미푸시(↑)·behind(↓)·TODO 잔여. 0이면 표시 안 함(신호 대 소음).
   const badges = [
+    s && (s.pendingApprovals ?? 0) > 0 ? `승인 ${s.pendingApprovals}` : null,
     s && s.ahead > 0 ? `↑${s.ahead}` : null,
     s && s.behind > 0 ? `↓${s.behind}` : null,
     s && s.todoCount > 0 ? `TODO ${s.todoCount}` : null,
   ].filter(Boolean)
-  const meta = [p.stack, s?.gitBranch, s ? `변경 ${s.dirtyFiles}` : null, ...badges]
+  // C1 — 마지막 Claude Code 활동 상대시간(있을 때만 표시).
+  const ccRel = s?.lastCcAt ? `CC ${fmtRelTime(s.lastCcAt)}` : null
+  const meta = [p.stack, s?.gitBranch, s ? `변경 ${s.dirtyFiles}` : null, ...badges, ccRel]
     .filter(Boolean)
     .join(' · ')
   // C1 — 진행 중 task가 있으면 meta 줄을 task.title(+경과·턴·토큰)로 교체. 없으면 위 정적 meta 유지.
@@ -54,7 +55,7 @@ function NaviTileInner({
     .join('\n')
   return (
     <div
-      className={`navi-tile ${st.cls} nt-${st.kind}${focused ? ' navi-tile-focused' : ''}`}
+      className={`navi-tile ${st.cls} nt-${st.kind}`}
       onClick={() => onFocus(p.id)}
       onContextMenu={onContextMenu ? (e) => onContextMenu(e, p) : undefined}
       title={tileTitle}
@@ -121,6 +122,14 @@ function NaviTileInner({
               task ? onOpenTask(task.id) : onStartTask(p.id)
             }}
             disabled={!task && !s?.hasTaskMd}
+            // TASK.md가 없으면 버튼이 회색으로 죽는데 이유를 어디서도 안 알려줬다 — 막다른 골목 방지.
+            title={
+              task
+                ? '작업 콘솔 열기'
+                : s?.hasTaskMd
+                  ? 'TASK.md의 지시로 작업 시작'
+                  : 'TASK.md가 없다 — 프로젝트 루트에 TASK.md를 만들거나, 레인에게 작업을 말하면 시작된다'
+            }
           >
             {task ? '콘솔' : '▶ 작업'}
           </button>
@@ -131,6 +140,6 @@ function NaviTileInner({
 }
 
 // B4 — 타일을 React.memo로. App이 키 입력·스트리밍 델타로 리렌더돼도, 해당 타일의 project·task·activity·
-// unread·focused와 콜백(모두 App에서 useCallback으로 안정화)이 안 바뀌면 그리드의 각 타일 재렌더를 스킵한다.
+// unread와 콜백(모두 App에서 useCallback으로 안정화)이 안 바뀌면 그리드의 각 타일 재렌더를 스킵한다.
 // 기본 얕은 비교로 충분 — project·task는 원본 배열의 객체 참조(tasks.find가 실제 항목 반환), 나머지는 프리미티브.
 export const NaviTile = memo(NaviTileInner)

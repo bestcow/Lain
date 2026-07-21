@@ -4,8 +4,8 @@ import path from 'node:path'
 import type { Project } from '../shared/types'
 import { upsertProject, getProject, getSettings, listProjects } from './store'
 
-export const DEFAULT_WORKSPACE_ROOT = 'C:\\workspace'
-export const DEFAULT_SCAN_DIRS = ['apps', 'games', 'tools']
+const DEFAULT_WORKSPACE_ROOT = 'C:\\workspace'
+const DEFAULT_SCAN_DIRS = ['apps', 'games', 'tools']
 
 // E6 — 워크스페이스 루트. 우선순위: 환경변수 LAIN_WORKSPACE > 앱 설정(workspaceRoot) > 기본값.
 // 예전엔 env 전용 모듈 상수였다(UI에서 못 바꿈). 이제 설정을 매 스캔 시 읽되 env는 오버라이드로 유지.
@@ -13,7 +13,7 @@ export function workspaceRoot(): string {
   return process.env.LAIN_WORKSPACE || getSettings().workspaceRoot.trim() || DEFAULT_WORKSPACE_ROOT
 }
 // 스캔할 하위 폴더. 우선순위: LAIN_SCAN_DIRS(';' 구분) > 앱 설정(scanDirs) > 기본 apps/games/tools.
-export function workspaceScanDirs(): string[] {
+function workspaceScanDirs(): string[] {
   const env = process.env.LAIN_SCAN_DIRS?.split(';')
     .map((s) => s.trim())
     .filter(Boolean)
@@ -100,7 +100,7 @@ function normPath(p: string): string {
   return process.platform === 'win32' ? r.toLowerCase() : r
 }
 // 같은 물리 폴더로 등록된 기존 프로젝트를 찾는다. 루트 변경으로 projectId(상대경로)가 달라져도
-// id만으로는 못 찾는 기존 행을 path로 매칭해 중복 INSERT·이력(대화·교훈·작업) 유실을 막는다.
+// id만으로는 못 찾는 기존 행을 path로 매칭해 중복 INSERT·이력(대화·학습·작업) 유실을 막는다.
 function findByPath(dir: string): Project | undefined {
   const target = normPath(dir)
   return listProjects().find((p) => normPath(p.path) === target)
@@ -113,7 +113,6 @@ export function addProject(dir: string): Project {
     id: existing?.id ?? projectId(dir), // 기존 폴더면 그 id 재사용(재키잉 방지)
     path: dir,
     name: path.basename(dir),
-    enabled: existing?.enabled ?? true,
     ...detected,
   }
   upsertProject(project)

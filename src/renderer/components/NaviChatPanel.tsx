@@ -4,7 +4,7 @@ import { memo, useLayoutEffect, useState, type MouseEvent } from 'react'
 import type { Approval, ChatMessage } from '../../shared/types'
 import { MessageBody } from '../lib/markdown'
 import { useStickyScroll } from '../lib/useStickyScroll'
-import { naviRowPropsEqual } from '../lib/messageRow'
+import { chatRowPropsEqual } from '../lib/messageRow'
 import { projectColor } from './projectSprite'
 import { Icon } from './icons'
 
@@ -105,7 +105,7 @@ const NaviMessageRow = memo(function NaviMessageRow({
       </div>
     </>
   )
-}, naviRowPropsEqual)
+}, chatRowPropsEqual)
 
 interface Props {
   projectId: string

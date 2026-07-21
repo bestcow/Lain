@@ -36,7 +36,6 @@ beforeAll(() => {
     stack: '',
     verifyCmd: null,
     isGit: true,
-    enabled: true,
   } as any)
 })
 afterAll(() => {

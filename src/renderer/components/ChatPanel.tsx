@@ -358,7 +358,7 @@ function QuestionCard({
     else onAnswer([opt]) // 단일 선택 — 클릭 즉시 제출
   }
   return (
-    <div className="chat-question" id={`lain-q-${q.id}`}>
+    <div className="chat-question">
       <div className="cq-q">❓ {q.question}</div>
       <div className="cq-opts">
         {q.options.map((opt) => {

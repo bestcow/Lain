@@ -4,16 +4,22 @@
 // 에서 이미 제외하고, 여기선 kind→표시 라벨 변환과 시간 정렬만 결정론적으로 한다.
 import type { ActivityRaw, ActivityItem } from '../../shared/types'
 
+/** CC 이벤트 라벨 생성. summary가 있으면 붙인다(60자 컷). */
+function ccEventLabel(r: { detail?: string; summary?: string | null }): string {
+  const base =
+    r.detail === 'SessionStart'
+      ? 'CC 세션 시작'
+      : r.detail === 'SessionEnd'
+        ? 'CC 세션 종료'
+        : `CC ${r.detail ?? ''}`
+  return r.summary ? `${base} — ${r.summary.slice(0, 60)}` : base
+}
+
 /** 활동 원시 행(task_event | cc_event)을 사람이 읽을 한 줄 요소로. */
 function toItem(r: ActivityRaw): ActivityItem {
   if (r.source === 'cc') {
     // cc_events.event: SessionStart | SessionEnd (레인 밖 Claude Code 세션)
-    const label =
-      r.detail === 'SessionStart'
-        ? 'CC 세션 시작'
-        : r.detail === 'SessionEnd'
-          ? 'CC 세션 종료'
-          : `CC ${r.detail}`
+    const label = ccEventLabel(r)
     return { source: 'cc', at: r.at, projectId: r.projectId ?? null, taskId: null, label, kind: r.detail }
   }
   // task_event — kind별 표시. text는 status/error 본문(도구 낱낱은 main에서 이미 제외).

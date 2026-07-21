@@ -52,15 +52,15 @@ describe('pickQuip — 순수 선택 로직 (now·rand 주입 결정론)', () =>
   })
 
   it('확률 게이트 — rand가 p 이상이면 null, 미만이면 발화 (레벨2 uncommon p=0.6)', () => {
-    expect(pickQuip('busy_week', { count: 6 }, 2, initialQuipState(), T0, () => 0.61)).toBeNull()
-    expect(pickQuip('busy_week', { count: 6 }, 2, initialQuipState(), T0, () => 0.59)).not.toBeNull()
+    expect(pickQuip('tasks_streak', {}, 2, initialQuipState(), T0, () => 0.61)).toBeNull()
+    expect(pickQuip('tasks_streak', {}, 2, initialQuipState(), T0, () => 0.59)).not.toBeNull()
   })
 
   it('전역 쿨다운 — 발화 후 다른 트리거도 창 내에서는 억제 (레벨2 = 120초)', () => {
     const st = initialQuipState()
     expect(pickQuip('backup_export', {}, 2, st, T0, rand0)).not.toBeNull()
-    expect(pickQuip('busy_week', { count: 6 }, 2, st, T0 + 119_000, rand0)).toBeNull()
-    expect(pickQuip('busy_week', { count: 6 }, 2, st, T0 + 121_000, rand0)).not.toBeNull()
+    expect(pickQuip('tasks_streak', {}, 2, st, T0 + 119_000, rand0)).toBeNull()
+    expect(pickQuip('tasks_streak', {}, 2, st, T0 + 121_000, rand0)).not.toBeNull()
   })
 
   it('트리거별 쿨다운 — 전역 창을 지나도 같은 트리거는 cooldownSec까지 억제', () => {
@@ -107,12 +107,12 @@ describe('pickQuip — 순수 선택 로직 (now·rand 주입 결정론)', () =>
     expect(def('monitor_off').escalation).toContain(third!.text)
   })
 
-  it('플레이스홀더 치환 — {count}·{userTitle}', () => {
+  it('플레이스홀더 치환 — {days}·{userTitle}', () => {
     // recentTexts를 미리 채워 원하는 변주만 fresh로 남긴다(결정론 선택).
     const st1: QuipState = initialQuipState()
-    st1.recentTexts = def('busy_week').variants.filter((v) => !v.includes('{count}개예요'))
-    const hit1 = pickQuip('busy_week', { count: 7 }, 2, st1, T0, rand0)
-    expect(hit1!.text).toBe('일정이 7개예요. 무리하지 마세요.')
+    st1.recentTexts = def('long_absence').variants.filter((v) => !v.includes('{days}일'))
+    const hit1 = pickQuip('long_absence', { days: 5 }, 2, st1, T0, rand0)
+    expect(hit1!.text).toBe('5일 만이에요. 잘 지내셨어요?')
 
     const st2: QuipState = initialQuipState()
     st2.recentTexts = def('late_night').variants.filter((v) => !v.includes('{userTitle}'))
@@ -129,6 +129,16 @@ describe('pickQuip — 순수 선택 로직 (now·rand 주입 결정론)', () =>
       return out
     }
     expect(run()).toEqual(run())
+  })
+
+  it('task_done 트리거가 발화를 고른다 (level 3, common 허용 레벨)', () => {
+    const hit = pickQuip('task_done', {}, 3, initialQuipState(), T0, rand0)
+    expect(hit).not.toBeNull()
+  })
+
+  it('verify_fail / task_error 트리거 존재 (level 2, uncommon)', () => {
+    expect(pickQuip('verify_fail', {}, 2, initialQuipState(), T0, rand0)).not.toBeNull()
+    expect(pickQuip('task_error', {}, 2, initialQuipState(), T0, rand0)).not.toBeNull()
   })
 
   it('카탈로그 무결성 — 트리거 유일·변주 비어있지 않음', () => {

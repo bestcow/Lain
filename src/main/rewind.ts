@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { DATA_DIR } from './paths'
 import { blocksSecretFile } from './safety'
+import { appendCapped } from './logfile'
 import {
   insertEditCheckpoint,
   editCheckpointsForTurn,
@@ -21,6 +22,31 @@ const RETAIN_DAYS = 14
 const RETAIN_TOTAL_BYTES = 200 * 1024 * 1024
 
 let seq = 0 // 백업 파일명 충돌 방지용 프로세스 내 시퀀스(같은 ms에 연속 편집 대비)
+
+// 체크포인트 생성이 실패한 턴(디스크·권한 등). 실패는 편집을 막지 않으므로 그대로 삼키되, 되돌리기
+// 시점에 '보존 기간 만료' 추정으로 오도하지 않도록 흔적만 남긴다. 프로세스 내 한정(재시작하면 사라짐 —
+// 그 뒤엔 원래의 만료 추정 문구가 맞다). 상한을 둬 무한 성장하지 않게 한다.
+const failedTurns = new Set<string>()
+const MAX_FAILED_TURNS = 200
+let lastFailLogAt = 0
+const FAIL_LOG_COOLDOWN_MS = 60_000 // 디스크 풀 등으로 매 편집이 실패해도 로그가 폭주하지 않게
+
+function markCheckpointFailure(turnId: string, toolName: string, e: unknown): void {
+  if (failedTurns.size >= MAX_FAILED_TURNS) {
+    const oldest = failedTurns.values().next().value // 삽입 순 — 가장 오래된 것부터 버린다
+    if (oldest !== undefined) failedTurns.delete(oldest)
+  }
+  failedTurns.add(turnId)
+  const now = Date.now()
+  if (now - lastFailLogAt < FAIL_LOG_COOLDOWN_MS) return
+  lastFailLogAt = now
+  // 파일 경로는 남기지 않는다(§9-6) — 도구명과 에러 메시지만.
+  rlog(`checkpoint 실패: ${toolName} ${(e as Error)?.message ?? e}`)
+}
+
+function rlog(m: string): void {
+  appendCapped(path.join(DATA_DIR, 'recovery.log'), `${new Date().toISOString()} rewind ${m}\n`)
+}
 
 function turnDir(turnId: string): string {
   return path.join(CHECKPOINT_DIR, turnId.replace(/[^\w-]/g, '_'))
@@ -49,8 +75,9 @@ export function checkpointEdit(
       fs.copyFileSync(filePath, backupPath)
     }
     insertEditCheckpoint({ turnId, conversationId, filePath, backupPath, tool: toolName })
-  } catch {
-    /* 체크포인트 실패가 편집을 막지 않는다 */
+  } catch (e) {
+    /* 체크포인트 실패가 편집을 막지 않는다 — 흐름은 그대로, 실패 흔적만 남긴다 */
+    markCheckpointFailure(turnId, toolName, e)
   }
 }
 
@@ -85,8 +112,13 @@ export function revertTurn(turnId: string): {
       restored: 0,
       files: [],
       conversationId: '',
-      error: '이 턴의 체크포인트가 없다(보존 기간 만료·정리됐을 수 있음)',
+      // 이 프로세스에서 체크포인트 생성이 실패한 턴이면 '만료' 추정 대신 실제 원인을 말한다.
+      error: failedTurns.has(turnId)
+        ? '이 턴은 체크포인트 생성이 실패해 복원할 백업이 없다(디스크 여유·권한 확인)'
+        : '이 턴의 체크포인트가 없다(보존 기간 만료·정리됐을 수 있음)',
     }
+  // 일부만 실패한 턴은 남은 행만 복원되고 나머지는 조용히 누락된다 — 최소한 진단에는 남긴다.
+  if (failedTurns.has(turnId)) rlog('revertTurn: 체크포인트 일부 실패한 턴 — 누락 파일 있을 수 있음')
   const first = firstPerFile(rows)
   const conversationId = rows[0].conversationId
   const files = [...first.keys()]

@@ -3,8 +3,8 @@ import {
   contextOccupancyTokens,
   shouldCompact,
   occupancyForMaxTurns,
-  contextPercent,
 } from '../../src/main/compactgate'
+import { contextPercent } from '../../src/shared/gauge'
 
 describe('contextOccupancyTokens — 컨텍스트 점유량(프롬프트 크기), output 제외', () => {
   it('usage 없으면 0', () => {

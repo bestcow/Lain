@@ -14,9 +14,6 @@ export function shouldCompact(contextTokens: number, threshold: number): boolean
   return threshold > 0 && contextTokens >= threshold
 }
 
-// 컨텍스트 게이지 % — 공용 단일 출처(shared/gauge.ts). manager·테스트가 이 경로로 계속 쓰도록 re-export.
-export { contextPercent } from '../shared/gauge'
-
 // max-turns가 result 메시지 대신 throw로 끝나면(SDK error_max_turns 던짐) result 분기의 점유 기록이
 // 누락돼 무한세션 압축 게이트가 영영 안 걸리던 버그 보정. throw 경로에서 기록할 점유값을 정한다:
 //  - threshold 0(압축 비활성): 0 — 강제하지 않음(킬스위치 존중)

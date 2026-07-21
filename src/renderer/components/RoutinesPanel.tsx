@@ -10,7 +10,7 @@ const DOW_KO = ['일', '월', '화', '수', '목', '금', '토']
 
 // 로컬(한국시간) 입력 → UTC cron 문자열. 저장·스케줄러(computeNextRun)는 UTC 기준이라 변환한다.
 // hourly(분)·interval(경과분)은 tz 무관 → 변환 없음. daily·weekly만 로컬→UTC로 시·요일 이동.
-function buildCron(kind: Kind, h: number, m: number, dow: number, interval: number): string | null {
+export function buildCron(kind: Kind, h: number, m: number, dow: number, interval: number): string | null {
   if (kind === 'interval') return interval > 0 ? `interval:${interval}` : null
   if (kind === 'hourly') return m >= 0 && m <= 59 ? `hourly:${m}` : null
   if (kind === 'daily') {
@@ -42,6 +42,9 @@ export function RoutinesPanel({ onClose }: { onClose: () => void }) {
   const [routines, setRoutines] = useState<Routine[] | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
   const [adding, setAdding] = useState(false)
+  // 전역 스위치(기본 off) — off면 scheduler가 디스패치 자체를 안 한다. 목록만 보면 'on · 다음 09:00'이라
+  // 예약이 살아 있는 것처럼 읽히므로 상시 배너로 알린다.
+  const [routinesEnabled, setRoutinesEnabled] = useState(true)
 
   // 추가 폼
   const [title, setTitle] = useState('')
@@ -59,11 +62,18 @@ export function RoutinesPanel({ onClose }: { onClose: () => void }) {
     return window.lain.onRoutinesUpdated(setRoutines)
   }, [])
 
+  // 전역 스위치 조회 + 라이브 반영(환경설정·레인 도구에서 바뀌어도 배너가 따라간다).
+  useEffect(() => {
+    void window.lain.getSettings().then((s) => setRoutinesEnabled(s.routinesEnabled))
+    return window.lain.onSettingsUpdated((s) => setRoutinesEnabled(s.routinesEnabled))
+  }, [])
+
   const all = routines ?? []
 
   async function submit() {
     const [hh, mm] = time.split(':').map(Number)
-    const cron = buildCron(kind, hh || 0, mm || 0, dow, interval)
+    // hourly는 time(HH:MM)이 아니라 전용 minute 입력을 쓴다 — time에서 유도하면 항상 hourly:0이 되던 버그.
+    const cron = buildCron(kind, hh || 0, kind === 'hourly' ? minute : mm || 0, dow, interval)
     if (!title.trim() || !prompt.trim() || !cron) return
     await window.lain.createRoutine({
       projectId: projectId || null,
@@ -84,6 +94,19 @@ export function RoutinesPanel({ onClose }: { onClose: () => void }) {
         <button onClick={onClose}><Icon name="x-circle" size={18} /></button>
       </div>
 
+      {/* 전역 off 배너 — 목록이 생기면 사라지던 경고를 상시로. 그 자리에서 켤 수 있다. */}
+      {!routinesEnabled && (
+        <div className="warn routines-off-banner">
+          루틴 실행이 꺼져 있다 — 등록만 되고 실행되지 않는다.{' '}
+          <button
+            className="chip"
+            onClick={() => void window.lain.setSettings({ routinesEnabled: true })}
+          >
+            켜기
+          </button>
+        </div>
+      )}
+
       {!routines ? (
         <div className="dim">로딩...</div>
       ) : all.length === 0 ? (
@@ -93,20 +116,28 @@ export function RoutinesPanel({ onClose }: { onClose: () => void }) {
       ) : (
         <div className="routines-list">
           {all.map((r) => (
-            <div key={r.id} className={`routine-row${r.enabled ? '' : ' routine-off'}`}>
+            // 전역 off면 개별 on이어도 실제로는 안 돌므로 행 전체를 off 표기로(개별 on이 전역 off를 이긴다는 오해 방지)
+            <div key={r.id} className={`routine-row${r.enabled && routinesEnabled ? '' : ' routine-off'}`}>
               <div className="routine-body">
                 <div className="routine-title">{r.title}</div>
                 <div className="routine-prompt dim">{r.prompt}</div>
                 <div className="dim routine-meta">
                   {cronKindLabel(r.cron)} · 다음 {fmtLocal(r.nextRunAt)}
+                  {!routinesEnabled && ' (실행 안 함)'}
                   {r.projectId ? ` · ${r.projectId}` : ' · 전역'}
                   {r.lastRunAt ? ` · 최근 ${fmtLocal(r.lastRunAt)}` : ''}
                 </div>
               </div>
               <div className="routine-actions">
                 <button
-                  className={`chip${r.enabled ? ' chip-inbox-on' : ''}`}
-                  title={r.enabled ? '끄기' : '켜기'}
+                  className={`chip${r.enabled && routinesEnabled ? ' chip-inbox-on' : ''}`}
+                  title={
+                    r.enabled
+                      ? routinesEnabled
+                        ? '끄기'
+                        : '끄기 — 전역 루틴 실행이 꺼져 있어 지금은 어차피 실행되지 않는다'
+                      : '켜기'
+                  }
                   onClick={() => window.lain.setRoutineEnabled(r.id, !r.enabled)}
                 >
                   {r.enabled ? 'on' : 'off'}

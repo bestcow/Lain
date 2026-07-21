@@ -58,13 +58,13 @@ describe('registry addProject — 물리 경로 기반 dedup (E6 최종리뷰 Im
     const dir = path.join(ws, 'apps', 'bar')
     fs.mkdirSync(dir, { recursive: true })
     const p1 = addProject(dir)
-    // 이 프로젝트에 교훈(이력) 하나 심어 둔다
+    // 이 프로젝트에 학습(이력) 하나 심어 둔다
     insertLesson({
       projectId: p1.id,
       taskId: 'task-x',
       scope: 'project',
       trigger: '테스트',
-      lesson: '길들인 교훈',
+      lesson: '길들인 학습',
     })
     const lessonsBefore = lessonsForProject(p1.id).length
     expect(lessonsBefore).toBeGreaterThan(0)
@@ -76,7 +76,7 @@ describe('registry addProject — 물리 경로 기반 dedup (E6 최종리뷰 Im
     // 같은 물리 폴더를 폴더피커로 재등록하는 상황
     const p2 = addProject(dir)
 
-    // path 기반 dedup → 같은 id 재사용, 행 1개, 교훈 보존
+    // path 기반 dedup → 같은 id 재사용, 행 1개, 학습 보존
     expect(p2.id).toBe(p1.id)
     const rows = listProjects().filter((p) => p.path === dir)
     expect(rows.length).toBe(1)

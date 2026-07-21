@@ -6,13 +6,14 @@
 // 위험 명령은 Navi와 동일하게 승인 큐(§9-4)로 — task_id는 `chat:<projectId>` 합성 키.
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { mcpServersFor } from './mcp'
-import fs from 'node:fs'
 import path from 'node:path'
 import { DATA_DIR, CLAUDE_BIN } from './paths'
 import { appendCapped } from './logfile'
+import { toImageBlocks, type ImageBlock } from './taskimages'
 import {
   activeTaskForProject,
   addNaviMessage,
+  bumpLessonInject,
   conversationSdkSession,
   ensureActiveConversation,
   getConversationContextTokens,
@@ -20,6 +21,7 @@ import {
   getProject,
   getSettings,
   insertApproval,
+  lessonsForProject,
   listConversationDialogue,
   listProjects,
   resetConversationContextTokens,
@@ -43,6 +45,11 @@ import { summarizeNaviHandoff, handoffBlock } from './handoff'
 import { skillOptions } from './skills'
 import { frameMessage, NAVI_SENDER_LEGEND, type NaviSender } from './navisender'
 import { conventionsBlock } from './conventions'
+import {
+  NAVI_CHAT_LESSON_LIMIT,
+  naviChatLessonsBlock,
+  shouldInjectNaviChatLessons,
+} from './lessoninject'
 import type { NaviChatEvent, FileAttachment } from '../shared/types'
 import { encodeToolLine } from '../shared/toolline'
 
@@ -91,7 +98,7 @@ function toolActivityLine(b: any): { display: string; raw: string } {
   }
 }
 
-// §5.6 전체(broadcast) — 모든 enabled 프로젝트에 같은 메시지를 fan-out.
+// §5.6 전체(broadcast) — 등록된 모든 프로젝트에 같은 메시지를 fan-out.
 // 동시 실행은 concurrencyCap으로 제한(§9-7). 작업 중(working) Navi는
 // 건너뛰고 그 사실을 이벤트로 알린다 (§5.7 인터럽트가 붙기 전까지의 정책).
 export async function sendToAllNavis(
@@ -99,7 +106,7 @@ export async function sendToAllNavis(
   emit: (ev: NaviChatEvent) => void,
   from: NaviSender = 'user', // 'lain' = 관리자 broadcast_navis (Navi 대화창에서 'lain>'으로 귀속)
 ): Promise<{ error?: string }> {
-  const targets = listProjects().filter((p) => p.enabled)
+  const targets = listProjects()
   if (targets.length === 0) {
     emit({ projectId: '@all', kind: 'result', costUsd: null, tokens: null, sessionId: null })
     return { error: '대상 프로젝트 없음' }
@@ -228,22 +235,19 @@ export async function sendToNavi(
     : ''
   // 발신자 레전드 + 프로젝트 컨벤션 — 새 세션(resume 없음, handoffInject 주입 조건과 동일)일 때만 1회 선두 주입.
   // resume이 살아있으면 세션 히스토리에 이미 있으니 재주입하지 않는다. (직접 채팅은 project.path에서 돌아 상위 컨벤션도 닿음.)
+  // 학습 주입 — 새 세션이면 이 프로젝트 관련 학습 top-K를 preamble에 1회 주입(manager <lessons> 포맷·cap 동형).
+  // 선별은 store.lessonsForProject 기존 랭킹(메시지 내용 기준 콘텐츠-인지) 재사용, 주입=사용(inject_count·last_used_at).
+  const chatLessons = shouldInjectNaviChatLessons(resume)
+    ? lessonsForProject(projectId, NAVI_CHAT_LESSON_LIMIT, text)
+    : []
+  const lessonsInject = naviChatLessonsBlock(chatLessons)
+  if (chatLessons.length) bumpLessonInject(chatLessons.map((l) => l.id))
   const preamble = !resume ? NAVI_SENDER_LEGEND + conventionsBlock(project.path) : ''
-  const body = `${preamble}${handoffInject}${frameMessage(from, text)}${textSuffix}`
+  const body = `${preamble}${lessonsInject}${handoffInject}${frameMessage(from, text)}${textSuffix}`
   const imageAttachments = attachments.filter((a) => a.isImage)
-  type ImgMedia = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
-  type ImageBlock = {
-    type: 'image'
-    source: { type: 'base64'; media_type: ImgMedia; data: string }
-  }
   type TextBlock = { type: 'text'; text: string }
   const promptContent: (TextBlock | ImageBlock)[] = [{ type: 'text', text: body }]
-  for (const img of imageAttachments) {
-    promptContent.push({
-      type: 'image',
-      source: { type: 'base64', media_type: img.mimeType as ImgMedia, data: img.data },
-    })
-  }
+  promptContent.push(...toImageBlocks(imageAttachments))
   const promptParam =
     imageAttachments.length > 0
       ? (async function* () {

@@ -6,7 +6,7 @@ import type { McpServer, McpTarget } from '../shared/types'
 import { listMcpServers } from './store'
 
 // 순수 — 한 서버 행을 SDK config로. 필수 필드(command/url)가 비면 null(=주입 제외, 잘못 설정한 서버가 턴을 안 깨게).
-export function toSdkConfig(s: McpServer): McpServerConfig | null {
+function toSdkConfig(s: McpServer): McpServerConfig | null {
   if (s.transport === 'stdio') {
     if (!s.command) return null
     return {
@@ -36,7 +36,7 @@ export function toSdkConfig(s: McpServer): McpServerConfig | null {
 }
 
 // 순수 — enabled + target 일치 서버만 레코드로. 'lain'(내부) 키 충돌은 저장 시 validateMcpName이 이미 차단.
-export function buildMcpServers(
+function buildMcpServers(
   servers: McpServer[],
   target: McpTarget,
 ): Record<string, McpServerConfig> {

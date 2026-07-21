@@ -69,7 +69,6 @@ describe('worker task 유한세션 핸드오프 저장', () => {
       stack: '',
       verifyCmd: null,
       isGit: false,
-      enabled: true,
     } as any)
   })
   it('insertTask 후 context_tokens 0·handoff_md null 기본', () => {

@@ -56,4 +56,31 @@ describe('mergeActivity — task_events + cc_events 시간 역순 병합', () =>
     mergeActivity(raws)
     expect(raws.map((r) => r.at)).toEqual(before)
   })
+
+  it('CC SessionEnd에 요약이 있으면 라벨에 붙인다', () => {
+    const rawsWithSummary: ActivityRaw[] = [
+      { source: 'cc', at: '2026-07-07 13:40:00', detail: 'SessionEnd', projectId: 'hermes', summary: '버그 수정 완료' },
+    ]
+    const items = mergeActivity(rawsWithSummary)
+    expect(items[0].label).toContain('버그 수정 완료')
+    expect(items[0].label).toContain('CC 세션 종료')
+  })
+
+  it('CC SessionEnd 요약이 60자 이상이면 자른다', () => {
+    const longSummary = 'a'.repeat(100)
+    const rawsWithSummary: ActivityRaw[] = [
+      { source: 'cc', at: '2026-07-07 13:40:00', detail: 'SessionEnd', projectId: 'hermes', summary: longSummary },
+    ]
+    const items = mergeActivity(rawsWithSummary)
+    expect(items[0].label).toContain('a'.repeat(60))
+    expect(items[0].label.length).toBeLessThanOrEqual('CC 세션 종료 — '.length + 60)
+  })
+
+  it('CC 이벤트에 요약이 없으면 원래대로', () => {
+    const rawsNoSummary: ActivityRaw[] = [
+      { source: 'cc', at: '2026-07-07 13:40:00', detail: 'SessionEnd', projectId: 'hermes' },
+    ]
+    const items = mergeActivity(rawsNoSummary)
+    expect(items[0].label).toBe('CC 세션 종료')
+  })
 })

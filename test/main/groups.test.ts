@@ -61,10 +61,10 @@ const revertMock = revertMergeRange as unknown as ReturnType<typeof vi.fn>
 beforeAll(() => {
   initStore()
   for (const id of ['pA', 'pB', 'pC']) {
-    upsertProject({ id, path: os.tmpdir(), name: id, stack: '', verifyCmd: null, isGit: true, enabled: true })
+    upsertProject({ id, path: os.tmpdir(), name: id, stack: '', verifyCmd: null, isGit: true })
   }
   // 비-git 프로젝트(검증 실패 케이스용)
-  upsertProject({ id: 'pNoGit', path: os.tmpdir(), name: 'pNoGit', stack: '', verifyCmd: null, isGit: false, enabled: true })
+  upsertProject({ id: 'pNoGit', path: os.tmpdir(), name: 'pNoGit', stack: '', verifyCmd: null, isGit: false })
   // rebase 폴백 경로를 끄면 tryMerge 반환이 곧 최종 결과 → 목 제어가 단순해진다.
   saveSettings({ autoRebaseOnMerge: false })
 })

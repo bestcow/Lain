@@ -1,6 +1,6 @@
 {
   "name": "lain",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Multi-project Claude Code orchestrator",
   "author": "bestcow",
   "license": "MIT",
@@ -14,9 +14,9 @@
   },
   "main": "out/main/index.js",
   "scripts": {
+    "postinstall": "node scripts/init-local-docs.mjs",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -46,7 +46,6 @@
     "electron": "^42.4.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
-    "jsdom": "^29.1.1",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "typescript": "^6.0.3",

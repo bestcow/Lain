@@ -4,9 +4,7 @@
 // '카테고리 자동 전환 + 하이라이트' 방식(구현 단순).
 
 export interface PrefsSearchItem {
-  /** 설정 행 식별자(하이라이트 대상 지정용). PrefsModal의 data-skey와 일치. */
-  key: string
-  /** 사람이 보는 설정명(라벨). */
+  /** 사람이 보는 설정명(라벨) — 화면 .settings-key 라벨 텍스트와 일치(하이라이트 대상 지정용). */
   label: string
   /** 힌트/설명 등 부가 검색어(공백 결합). */
   hint?: string
@@ -34,11 +32,6 @@ export function matchesItem(item: PrefsSearchItem, q: string): boolean {
 export function matchingItems(items: PrefsSearchItem[], q: string): PrefsSearchItem[] {
   if (!normalizeQuery(q)) return []
   return items.filter((it) => matchesItem(it, q))
-}
-
-/** 매치되는 항목 key 집합(하이라이트 판정용). */
-export function matchingKeys(items: PrefsSearchItem[], q: string): Set<string> {
-  return new Set(matchingItems(items, q).map((it) => it.key))
 }
 
 /**

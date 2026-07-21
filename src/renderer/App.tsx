@@ -13,7 +13,6 @@ import type {
   ChatHistoryHit,
   ChatMessage,
   Conversation,
-  ConversationPreview,
   FileAttachment,
   ProjectView,
   Task,
@@ -22,9 +21,11 @@ import type {
   DiscordCallState,
   LainSettings,
   UpdateStatus,
+  CcSessionInfo,
 } from '../shared/types'
 import { spokenText } from '../shared/speech'
 import { messagesToMarkdown } from '../shared/exportMarkdown'
+import { humanizeActivity } from '../shared/activity'
 import { decodeToolLine } from '../shared/toolline'
 import { decodeTodoLine, todoProgress } from '../shared/todoline'
 import { decodeEditDiffLine } from '../shared/editdiff'
@@ -41,7 +42,6 @@ import { LessonsPanel } from './components/LessonsPanel'
 import { HistoryPanel } from './components/HistoryPanel'
 import { ActivityPanel } from './components/ActivityPanel'
 import { UsagePopover } from './components/UsagePopover'
-import { PlannerPanel } from './components/PlannerPanel'
 import { BenchPanel } from './components/BenchPanel'
 import { RoutinesPanel } from './components/RoutinesPanel'
 import { AttentionInbox } from './components/AttentionInbox'
@@ -123,6 +123,26 @@ const pushCapped = (prev: ChatMessage[], msg: ChatMessage): ChatMessage[] => {
   return next.length > MAX_CHAT ? next.slice(-MAX_CHAT) : next
 }
 
+// main은 작업 이벤트 1건마다 승인 목록 전체를 조건 없이 브로드캐스트한다(매번 새 배열) — 내용이 그대로면
+// 이전 참조를 유지해 App 리렌더를 스킵한다(updateActivityMap과 동형). 표시·판정에 쓰는 필드만 비교.
+const sameApprovals = (a: Approval[], b: Approval[]): boolean =>
+  a.length === b.length &&
+  a.every((x, i) => {
+    const y = b[i]
+    return (
+      x.id === y.id &&
+      x.state === y.state &&
+      x.taskId === y.taskId &&
+      x.kind === y.kind &&
+      x.payload === y.payload
+    )
+  })
+
+// 토큰 집계(dailyUsage)는 작업의 상태·토큰이 실제로 바뀔 때만 달라진다(worker는 result 시점에만 tokens 기록).
+// TodoWrite 이벤트마다 도는 SQLite 집계 재조회를 이 서명 변화로 좁힌다.
+const usageSignature = (list: Task[]): string =>
+  list.map((t) => `${t.id}:${t.state}:${t.tokens}`).join('|')
+
 // B10 — 팔레트 항목 id → 단축키 표기(paletteHotkeys 단일 출처). 순수라 모듈 로드 시 1회 계산.
 const PALETTE_HOTKEYS = paletteHotkeys()
 
@@ -144,6 +164,9 @@ export default function App() {
   // DB 재로드가 만드는 실제 tool 행과 중복되지 않는다. turnStartedAt은 경과 시간(n초) 표시의 기준(전송 시점).
   const [managerLiveTool, setManagerLiveTool] = useState<string | null>(null)
   const [managerTurnStartedAt, setManagerTurnStartedAt] = useState<number | null>(null)
+  // P3 — 캐릭터 컴팩트화: 평소엔 축소, 발화(quip)·작업(managerBusy) 중엔 부각(.lain-char--active).
+  const [charActive, setCharActive] = useState(false)
+  const charActiveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // PC 네이티브 음성 — 디스코드 없이 창에서 직접 말하기(PTT) + 답변 음성 재생(toggle)
   const [recording, setRecording] = useState(false)
   const [voiceOut, setVoiceOut] = useState(false)
@@ -158,10 +181,21 @@ export default function App() {
   }, [])
   const voiceOutRef = useRef(false) // onChatEvent 클로저에서 최신값 참조
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null) // 재생 중 Audio 참조 유지(GC 방지)
-  const voiceGenRef = useRef(0) // 음성 세대 — 합성(speakTts) 대기 중 정지/새 응답이 끼면 늦게 온 결과를 폐기
+  const voiceGenRef = useRef(0) // 음성 세대 — 스트림 시작(speakTtsStream) 대기 중 정지가 끼면 늦게 온 id 장착을 폐기
+  // TTS 스트리밍 재생 큐 — main이 문장 단위로 합성해 tts:chunk로 밀면 순서대로 이어 재생한다.
+  // voiceStreamIdRef와 다른 id의 청크는 폐기(정지/새 응답 후 늦게 도착한 이전 스트림 잔여 차단).
+  const voiceQueueRef = useRef<string[]>([])
+  const voiceStreamIdRef = useRef<number | null>(null)
+  const voicePlayingRef = useRef(false) // 재생 루프가 도는 중인지 — 청크 수신 시 시동 여부 판정(상태값은 리렌더 지연)
+  const voiceFallbackNotedRef = useRef<number | null>(null) // 폴백 힌트를 이미 띄운 스트림 id(청크마다 반복 통보 방지)
   // 음성 재생 중단 — 새 응답 도착·전송·음성 토글 off 시 호출해 긴 음성이 쌓여 다음 작업을 막지 않게 한다.
+  // main측 합성 루프도 함께 중단(stopTtsSpeak — 죽은 스트림에 청크를 계속 합성하지 않게).
   const stopVoice = useCallback(() => {
-    voiceGenRef.current++ // 진행 중인 speakTts 프라미스를 무효화(세대 불일치로 .then이 재생을 건너뜀)
+    voiceGenRef.current++
+    voiceStreamIdRef.current = null
+    voiceQueueRef.current = []
+    void window.lain.stopTtsSpeak().catch(() => {})
+    voicePlayingRef.current = false
     setVoicePlaying(false)
     const a = voiceAudioRef.current
     if (!a) return
@@ -173,6 +207,36 @@ export default function App() {
     }
     voiceAudioRef.current = null
   }, [])
+  // 큐 순차 재생 — onended마다 다음 청크. 재생 실패 청크는 건너뛴다(전체 침묵 방지).
+  const playNextVoice = useCallback(() => {
+    const next = voiceQueueRef.current.shift()
+    if (!next) {
+      voiceAudioRef.current = null
+      voicePlayingRef.current = false
+      setVoicePlaying(false)
+      return
+    }
+    const a = new Audio(next) // mime 포함 data URI(edge=mp3, 나머지=wav)
+    voiceAudioRef.current = a // 참조 유지 — 미보관 시 재생 전 GC될 수 있음
+    voicePlayingRef.current = true
+    setVoicePlaying(true)
+    a.onended = () => playNextVoice()
+    void a.play().catch(() => playNextVoice())
+  }, [])
+  // main의 문장 단위 합성 청크 수신 — 큐에 쌓고, 재생 루프가 멈춰 있으면 시동한다(첫 문장부터 바로 소리).
+  // 지금 장착된 스트림(voiceStreamIdRef) 외의 id는 폐기 — 정지·새 응답 뒤 늦게 도착한 이전 스트림 잔여.
+  useEffect(() => {
+    return window.lain.onTtsChunk((ev) => {
+      if (voiceStreamIdRef.current !== ev.id) return
+      // B7-2 — 설정한 로컬 엔진이 죽어 edge로 대체된 스트림은 한 번만 통보(목소리가 달라진 이유).
+      if (ev.fallback && voiceFallbackNotedRef.current !== ev.id) {
+        voiceFallbackNotedRef.current = ev.id
+        showVoiceHint('로컬 음성 엔진 실패 — edge 목소리로 대체')
+      }
+      if (ev.uri) voiceQueueRef.current.push(ev.uri)
+      if (!voicePlayingRef.current) playNextVoice()
+    })
+  }, [playNextVoice, showVoiceHint])
   const mediaRecRef = useRef<MediaRecorder | null>(null)
   const recChunksRef = useRef<Blob[]>([])
   // ① 스트리밍 — 현재 라이브로 채워지는 assistant 버블(음수 id + 누적 텍스트). 델타는 여기 이어붙이고
@@ -213,7 +277,6 @@ export default function App() {
   const [activityOpen, setActivityOpen] = useState(false) // C6 — 전역 활동 피드 패널
   const [benchOpen, setBenchOpen] = useState(false)
   const [routinesOpen, setRoutinesOpen] = useState(false)
-  const [plannerOpen, setPlannerOpen] = useState(false)
   const [inboxOpen, setInboxOpen] = useState(false)
   // '숨김'(muted 내비 — 레인은 관리하되 먼저 언급 안 함) 섹션 — 기본 접힘. 구 대기실 대체.
   const [hiddenRoomOpen, setHiddenRoomOpen] = useState(false)
@@ -244,6 +307,18 @@ export default function App() {
   useEffect(() => {
     void window.lain.getUpdateStatus().then(setUpd)
     return window.lain.onUpdateStatus(setUpd)
+  }, [])
+  // P3 — 캐릭터 컴팩트화: quip 수신 시 부각(6초 후 자동 해제, 재수신 시 타이머 리셋).
+  useEffect(() => {
+    const off = window.lain.onQuip(() => {
+      setCharActive(true)
+      if (charActiveTimer.current) clearTimeout(charActiveTimer.current)
+      charActiveTimer.current = setTimeout(() => setCharActive(false), 6000)
+    })
+    return () => {
+      off()
+      if (charActiveTimer.current) clearTimeout(charActiveTimer.current)
+    }
   }, [])
   // Ctrl+K/Ctrl+P 명령 팔레트
   const [paletteOpen, setPaletteOpen] = useState(false)
@@ -296,8 +371,7 @@ export default function App() {
   const [naviAttachments, setNaviAttachments] = useState<FileAttachment[]>([])
   const naviInputRef = useRef<HTMLTextAreaElement>(null)
   const naviFileInputRef = useRef<HTMLInputElement>(null)
-  // 대화 인박스 — 대화별 마지막 메시지 미리보기 + 안 읽은(unread) 대화 표시
-  const [previews, setPreviews] = useState<Map<string, ConversationPreview>>(new Map())
+  // 대화 인박스 — 안 읽은(unread) 대화 표시
   const [unread, setUnread] = useState<Set<string>>(new Set())
   const [briefing, setBriefing] = useState<string | null>(null) // B — 레인 prose 보고(Claude)
   // top-zone에서 연 Navi(null=타일 그리드). 그 Navi의 세션 목록(convList) + 열린 대화(naviConv)를 위에 띄운다.
@@ -325,6 +399,14 @@ export default function App() {
   const [taskEvents, setTaskEvents] = useState<TaskEvent[] | null>(null)
   // C1 — 타일용 라이브 활동: taskId별 '마지막 활동 한 줄'(decode된 display만). 드로어와 무관하게 항상 갱신.
   const [taskActivity, setTaskActivity] = useState<Map<string, string>>(new Map())
+  // CC 세션 열람 — 드릴 헤더 'CC 세션' 버튼. null=닫힘, []=열었지만 세션 없음. 뷰어는 발췌 텍스트.
+  const [ccSessions, setCcSessions] = useState<CcSessionInfo[] | null>(null)
+  const [ccDigest, setCcDigest] = useState<{ title: string; text: string } | null>(null)
+  // 드릴 대상이 바뀌면 CC 세션 패널을 닫는다 — 다른 프로젝트의 세션 목록이 남아 보이는 것 방지.
+  useEffect(() => {
+    setCcSessions(null)
+    setCcDigest(null)
+  }, [drillTarget])
   const openTaskIdRef = useRef<string | null>(null)
   openTaskIdRef.current = openTaskId
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -355,12 +437,13 @@ export default function App() {
   )
 
   // 파일 → FileAttachment 변환(파일선택·드롭 공용). 이미지=dataURL base64, 그 외=UTF-8 텍스트.
+  // 읽기 실패한 파일은 null로 resolve한다 — reject/미해결로 두면 Promise.all이 통째로 죽어 그 배치 첨부가 전부 사라진다.
   const filesToAttachments = useCallback(
-    (files: File[]): Promise<FileAttachment[]> =>
+    (files: File[]): Promise<(FileAttachment | null)[]> =>
       Promise.all(
         files.map(
           (file) =>
-            new Promise<FileAttachment>((resolve) => {
+            new Promise<FileAttachment | null>((resolve) => {
               const reader = new FileReader()
               // Anthropic이 받는 이미지 4종만 이미지로 취급 — bmp/svg/tiff 등은 첨부 시 API 400 방지
               const isImage = isImageMime(file.type)
@@ -373,45 +456,57 @@ export default function App() {
                   isImage,
                 })
               }
-              if (isImage) reader.readAsDataURL(file)
-              else reader.readAsText(file)
+              reader.onerror = () => resolve(null)
+              reader.onabort = () => resolve(null)
+              try {
+                if (isImage) reader.readAsDataURL(file)
+                else reader.readAsText(file)
+              } catch {
+                resolve(null) // 읽기 시작조차 못한 경우(권한·삭제된 파일 등)
+              }
             }),
         ),
       ),
     [],
   )
+  // 읽기 실패분을 걸러내고, 걸러진 개수가 있으면 조용히 사라지지 않게 힌트로 알린다.
+  const readAttachments = useCallback(
+    async (files: File[]): Promise<FileAttachment[]> => {
+      const raw = await filesToAttachments(files)
+      const ok = raw.filter((a): a is FileAttachment => a !== null)
+      const failed = raw.length - ok.length
+      if (failed > 0) showVoiceHint(`파일 ${failed}개를 읽지 못했어`)
+      return ok
+    },
+    [filesToAttachments, showVoiceHint],
+  )
   const addFiles = useCallback(
     async (files: File[]) => {
       if (!files.length) return
-      const atts = await filesToAttachments(files)
-      setAttachments((prev) => [...prev, ...atts])
+      const atts = await readAttachments(files)
+      if (atts.length) setAttachments((prev) => [...prev, ...atts])
     },
-    [filesToAttachments],
+    [readAttachments],
   )
   // top-zone Navi 입력 첨부(하단 레인 첨부와 별개 표면)
   const addNaviFiles = useCallback(
     async (files: File[]) => {
       if (!files.length) return
-      const atts = await filesToAttachments(files)
-      setNaviAttachments((prev) => [...prev, ...atts])
+      const atts = await readAttachments(files)
+      if (atts.length) setNaviAttachments((prev) => [...prev, ...atts])
     },
-    [filesToAttachments],
+    [readAttachments],
   )
 
-  // 인박스 — 대화 미리보기 갱신 + (현재 보고 있지 않은 대화면) unread 점등. 셋 다 stable.
-  const bumpPreview = useCallback((target: string, role: ChatMessage['role'], text: string) => {
-    setPreviews((prev) =>
-      new Map(prev).set(target, {
-        target,
-        role,
-        content: text.split('\n')[0].slice(0, 200),
-        createdAt: new Date().toISOString(),
-      }),
-    )
-    // manager는 하단에 상시 표시(unread 없음). Navi는 위(drillTarget)에 열려 있지 않을 때만 unread 점등.
+  // 인박스 — 현재 보고 있지 않은 Navi 대화면 unread 점등. stable.
+  // manager는 하단에 상시 표시(unread 없음). Navi는 위(drillTarget)에 열려 있지 않을 때만 점등.
+  const markUnread = useCallback((target: string) => {
     if (target !== 'manager' && target !== drillTargetRef.current)
       setUnread((prev) => new Set(prev).add(target))
   }, [])
+
+  // 마지막으로 토큰 집계를 재조회한 시점의 작업 서명 — 변화가 있을 때만 dailyUsage IPC를 태운다.
+  const usageSigRef = useRef('')
 
   useEffect(() => {
     // 초기 로드 실패 공통 처리 — 콘솔 기록 + 채팅에 한 줄 표시(조용한 빈 화면 방지).
@@ -446,10 +541,13 @@ export default function App() {
           }).catch(onInitLoadError('대화 내역'))
       }).catch(onInitLoadError('활성 대화'))
     }).catch(onInitLoadError('세션 시작 시각'))
-    window.lain.conversationPreviews().then((list) =>
-      setPreviews(new Map(list.map((p) => [p.target, p]))),
-    ).catch(onInitLoadError('대화 미리보기'))
-    window.lain.listTasks().then(setTasks).catch(onInitLoadError('작업 목록'))
+    window.lain
+      .listTasks()
+      .then((list) => {
+        usageSigRef.current = usageSignature(list) // 아래 dailyUsage 초기 로드와 짝 — 직후 중복 재조회 방지
+        setTasks(list)
+      })
+      .catch(onInitLoadError('작업 목록'))
     window.lain.listApprovals().then(setApprovals).catch(onInitLoadError('승인 목록'))
     window.lain.getBriefing().then(setBriefing).catch(onInitLoadError('브리핑'))
     // C4 — 토큰 사용량(일별 집계 원시 행) 로드 + 작업 갱신 시 재조회('오늘'/추이는 작업 완료로 바뀜).
@@ -457,9 +555,17 @@ export default function App() {
     const offProjects = window.lain.onProjectsUpdated(setProjects)
     const offTasks = window.lain.onTasksUpdated((list) => {
       setTasks(list)
-      window.lain.dailyUsage().then(setUsageRows).catch(() => {})
+      // tasks:updated는 TodoWrite 이벤트마다 날아온다 — 토큰 집계는 상태·토큰이 실제로 바뀐 경우에만
+      // 재조회한다(불필요한 SQLite 집계 IPC + 추가 리렌더 제거). 표시값은 완료 시점에만 달라진다.
+      const sig = usageSignature(list)
+      if (sig !== usageSigRef.current) {
+        usageSigRef.current = sig
+        window.lain.dailyUsage().then(setUsageRows).catch(() => {})
+      }
     })
-    const offApprovals = window.lain.onApprovalsUpdated(setApprovals)
+    const offApprovals = window.lain.onApprovalsUpdated((list) =>
+      setApprovals((prev) => (sameApprovals(prev, list) ? prev : list)),
+    )
     const offBriefing = window.lain.onBriefingUpdated(setBriefing)
     const offTaskEvent = window.lain.onTaskEvent((ev) => {
       // C1 — 타일용 최소 상태(마지막 활동 한 줄)는 열린 드로어와 무관하게 항상 갱신한다.
@@ -509,7 +615,6 @@ export default function App() {
           setManagerBusy(true)
           setManagerTurnStartedAt(Date.now()) // A2 — 경과 시간(n초) 표시 기준
         }
-        bumpPreview('manager', 'user', ev.text)
       } else if (ev.kind === 'assistant_delta') {
         // ① 스트리밍 — 라이브 버블에 텍스트 증분을 이어붙인다(forOpen만). 최종 assistant가 전문으로 확정.
         // PI4 — 검색 점프 중이면 화면이 과거 구간이라 최신 델타를 섞지 않는다(DB엔 저장됨, 복귀 시 재로드).
@@ -558,29 +663,21 @@ export default function App() {
         // 발화는 재생 중인 음성을 끊지도, 스스로 읽지도 않는다(오버레이는 조용한 시각 채널).
         // 새 응답이 오면 이전 재생을 즉시 끊고(적체 방지) <<say:>> 한 줄 요약만 읽는다(spokenText).
         if (forOpen && !ev.proactive) {
-          stopVoice() // 세대(voiceGenRef) 증가 포함 — 아래 대기 중이던 이전 speakTts는 폐기된다
+          stopVoice() // 세대 증가 + main측 합성 루프 중단 포함 — 이전 스트림 잔여 청크는 id 불일치로 폐기된다
           if (voiceOutRef.current) {
             const speech = spokenText(ev.text)
             if (speech) {
-              const gen = voiceGenRef.current // 이 요청의 세대 — 결과 도착 시 아직 유효한지 확인
+              const gen = voiceGenRef.current // 이 요청의 세대 — id 장착 시점에 아직 유효한지 확인
               window.lain
-                .speakTts(speech)
-                .then(({ uri, fallback }) => {
-                  // 정지/새 응답이 끼어들었으면(세대 불일치) 늦게 온 오디오는 재생하지 않는다.
-                  if (!uri || gen !== voiceGenRef.current) return
-                  // B7-2 — 설정한 로컬 엔진(gpt-sovits/supertonic)이 실패해 edge로 대체됐다는 통보.
-                  if (fallback) showVoiceHint('⚠ 로컬 TTS 실패 — edge로 대체')
-                  const a = new Audio(uri) // mime 포함 data URI(edge=mp3, 나머지=wav)
-                  voiceAudioRef.current = a // 참조 유지 — 미보관 시 재생 전 GC될 수 있음
-                  setVoicePlaying(true) // B7-3 — voiceout 버튼을 재생 표시로 전환
-                  a.onended = () => setVoicePlaying(false)
-                  void a.play().catch(() => setVoicePlaying(false))
+                .speakTtsStream(speech)
+                .then(({ id }) => {
+                  // 정지가 끼어들었으면(세대 불일치) 이전 스트림 id를 장착하지 않는다(늦은 청크 차단).
+                  if (gen === voiceGenRef.current) voiceStreamIdRef.current = id
                 })
                 .catch(() => {})
             }
           }
         }
-        bumpPreview('manager', 'assistant', ev.text)
       } else if (ev.kind === 'tool') {
         // A2 — 매니저 라이브 tool 라인을 busy 표시 영역에 임시(ephemeral)로 노출한다(구 동작: 채팅엔 안 보이고
         // result 후 DB 재로드로만 노출 — 수분짜리 턴 동안 화면이 침묵하는 문제를 뒤집는 결정). 최신 1줄만 유지,
@@ -631,7 +728,6 @@ export default function App() {
         setManagerLiveTool(null) // A2 — 턴이 오류로 끝나도 임시 tool 라인은 정리
         setManagerTurnStartedAt(null)
         if (forOpen) append('tool', `[error] ${ev.message}`)
-        bumpPreview('manager', 'tool', `[error] ${ev.message}`)
         setManagerBusy(false)
       } else if (ev.kind === 'question') {
         // Lain이 선택형/체크형 질문을 띄움 — 답 대기 중이라 '응답 중'은 끈다. 카드는 그 질문이 지금 연
@@ -661,12 +757,9 @@ export default function App() {
     const offNaviChat = window.lain.onNaviChatEvent((ev) => {
       // top-zone에 그 Navi가 열려 있으면(=drillTarget) 본문에 표시. broadcast 메타(@all)는 실제 대화 아님.
       const visible = ev.projectId === drillTargetRef.current && ev.projectId !== '@all'
-      // 인박스 미리보기·unread는 현재 보고 있지 않은 Navi도 갱신(타일 점등용). broadcast 메타(@all) 제외.
+      // 인박스 unread는 현재 보고 있지 않은 Navi도 갱신(타일 점등용). broadcast 메타(@all) 제외.
       if (ev.projectId && ev.projectId !== '@all' && (ev.kind === 'assistant' || ev.kind === 'tool')) {
-        // I2 — Navi tool 라인도 encodeToolLine 형태일 수 있어 인박스 미리보기엔 display만(제어문자·raw 숨김).
-        // 본문(naviMsgs)은 아래에서 원문 그대로 push → MessageBody가 decode·전개 토글로 원문 보존.
-        const previewText = ev.kind === 'tool' ? decodeToolLine(ev.text).display : ev.text
-        bumpPreview(ev.projectId, ev.kind === 'assistant' ? 'assistant' : 'tool', previewText)
+        markUnread(ev.projectId)
       }
       if (ev.kind === 'assistant_delta') {
         // A9 — 레인 streamingRef와 동형: naviId별 라이브 버블에 텍스트 증분을 이어붙인다(visible만).
@@ -742,7 +835,7 @@ export default function App() {
         })
       } else if (ev.kind === 'error') {
         naviStreamingRef.current.delete(ev.projectId) // A9 — 스트리밍 도중 오류, 라이브 버블 확정 종료
-        if (ev.projectId && ev.projectId !== '@all') bumpPreview(ev.projectId, 'tool', `[error] ${ev.message}`)
+        if (ev.projectId && ev.projectId !== '@all') markUnread(ev.projectId)
         if (visible) {
           setNaviMsgs((prev) =>
             pushCapped(prev, {
@@ -774,13 +867,10 @@ export default function App() {
     // #3 디스코드 통화 단계 — 초기 상태 + 라이브 갱신
     window.lain.discordStatus().then((s) => setCallState(s.callState))
     const offDiscordState = window.lain.onDiscordState((ev) => setCallState(ev.state))
-    // 대화 제목 자동요약 완료 → 드릴 열린 대상이면 목록, 그리고 미리보기 새로고침
+    // 대화 제목 자동요약 완료 → 드릴 열린 대상이면 목록 새로고침
     const offConvUpd = window.lain.onConversationsUpdated((target) => {
       if (drillTargetRef.current === target)
         window.lain.listConversations(target).then(setConvList)
-      window.lain
-        .conversationPreviews()
-        .then((list) => setPreviews(new Map(list.map((p) => [p.target, p]))))
     })
     return () => {
       offProjects()
@@ -881,6 +971,9 @@ export default function App() {
     setTaskEvents(null) // B15 — 로드 전 상태로 리셋(TaskDrawer가 '로딩 중' 표시)
     window.lain.taskEvents(taskId).then(setTaskEvents)
   }, [])
+  // memo 실효화 — TaskDrawer/AttentionInbox는 memo인데 인라인 화살표를 넘기면 매 렌더 새 참조라 항상 통과 실패한다.
+  const closeTask = useCallback(() => setOpenTaskId(null), [])
+  const closeInbox = useCallback(() => setInboxOpen(false), [])
 
   const startTask = useCallback(
     async (projectId: string) => {
@@ -1029,9 +1122,6 @@ export default function App() {
       window.lain.deleteConversation(convId).then(async () => {
         const list = await window.lain.listConversations(naviId)
         setConvList(list)
-        window.lain
-          .conversationPreviews()
-          .then((l) => setPreviews(new Map(l.map((p) => [p.target, p]))))
         if (naviConvRef.current === convId) {
           const fb = list[0]
           if (fb) openNaviConversation(fb.id)
@@ -1040,6 +1130,24 @@ export default function App() {
       })
     },
     [openNaviConversation, newConversation, confirm, convList],
+  )
+
+  // memo 실효화 — SessionList(memo)에 넘길 핸들러. drillTarget을 클로저로 묶되 참조는 drillTarget이
+  // 바뀔 때만 새로 만든다(인라인 화살표였을 땐 매 렌더 새 참조라 memo가 무력화됐다).
+  const onNewConversation = useCallback(() => {
+    if (drillTarget) newConversation(drillTarget)
+  }, [drillTarget, newConversation])
+  const onRenameConversation = useCallback(
+    (convId: string, title: string) => {
+      if (drillTarget) renameConversation(drillTarget, convId, title)
+    },
+    [drillTarget, renameConversation],
+  )
+  const onDeleteConversation = useCallback(
+    (convId: string) => {
+      if (drillTarget) void deleteConversation(drillTarget, convId)
+    },
+    [drillTarget, deleteConversation],
   )
 
   // ── 채팅 메시지 우클릭 메뉴 ──
@@ -1331,7 +1439,6 @@ export default function App() {
       else if (lessonsOpen) setLessonsOpen(false)
       else if (benchOpen) setBenchOpen(false)
       else if (routinesOpen) setRoutinesOpen(false)
-      else if (plannerOpen) setPlannerOpen(false)
       // C3 — HISTORY에서 연 드로어가 그 위에 뜨므로, 드로어를 먼저 닫고(openTaskId) 그다음 이력 패널을 닫는다.
       else if (openTaskIdRef.current) setOpenTaskId(null)
       else if (historyOpen) setHistoryOpen(false)
@@ -1375,7 +1482,6 @@ export default function App() {
     activityOpen,
     benchOpen,
     routinesOpen,
-    plannerOpen,
     searchOpen,
     slashOpen,
     atToken,
@@ -1397,7 +1503,23 @@ export default function App() {
       // 브로드캐스트 — 전 Navi에 전달(전용 패널 없음, 응답은 각 Navi 타일 unread·워크스페이스로). 대화 conv 없음.
       setInput('')
       setAttachments([])
-      window.lain.sendNaviChat('@all', text, pendingAttachments)
+      // 대상 0곳·전원 전송 불가면 입력창만 비고 아무 흔적이 없어 '보냈다'고 오인한다 — 실패는 레인 채팅에 한 줄.
+      const broadcastFail = (msg: string) =>
+        setMessages((prev) =>
+          pushCapped(prev, {
+            id: nextLocalId--,
+            scope: 'manager',
+            role: 'tool',
+            content: `[error] 브로드캐스트 실패: ${msg}`,
+            createdAt: new Date().toISOString(),
+          }),
+        )
+      window.lain
+        .sendNaviChat('@all', text, pendingAttachments)
+        .then((res) => {
+          if (res?.error) broadcastFail(res.error)
+        })
+        .catch((e) => broadcastFail(String((e as Error)?.message || e)))
       return
     }
     // manager
@@ -1421,13 +1543,11 @@ export default function App() {
         { text, attachments: pendingAttachments, localId: optimistic.id },
       ])
       setMessages((prev) => pushCapped(prev, optimistic))
-      bumpPreview('manager', 'user', content)
       return
     }
     setManagerBusy(true)
     setManagerTurnStartedAt(Date.now()) // A2 — 경과 시간(n초) 표시 기준(전송 시점)
     setMessages((prev) => pushCapped(prev, optimistic))
-    bumpPreview('manager', 'user', content)
     // 정상 흐름은 result/error chat:event가 managerBusy를 해제한다. IPC 자체가 거부되는 예외 상황엔
     // 종료 이벤트가 못 올 수 있으니(서버측 보장과 별개의 2차 방어) busy를 직접 풀어 "응답 중" 고착을 막는다.
     window.lain.sendChat(text, pendingAttachments, openConv ?? undefined).catch(() => setManagerBusy(false))
@@ -1500,26 +1620,32 @@ export default function App() {
   const dispatchNavi = useCallback(
     (target: string, text: string, attachments: FileAttachment[], conversationId?: string) => {
       setNaviBusy((prev) => new Set(prev).add(target))
-      window.lain.sendNaviChat(target, text, attachments, conversationId).then((res) => {
-        if (res?.error) {
-          if (target === drillTargetRef.current) {
-            setNaviMsgs((prev) =>
-              pushCapped(prev, {
-                id: nextLocalId--,
-                scope: 'worker',
-                role: 'tool',
-                content: res.error!,
-                createdAt: new Date().toISOString(),
-              }),
-            )
-          }
-          setNaviBusy((prev) => {
-            const next = new Set(prev)
-            next.delete(target)
-            return next
-          })
+      // 실패 공통 처리 — 연 Navi면 사유를 한 줄 남기고, busy를 풀어 '응답 중' 고착과 큐 정체를 막는다.
+      const fail = (msg: string) => {
+        if (target === drillTargetRef.current) {
+          setNaviMsgs((prev) =>
+            pushCapped(prev, {
+              id: nextLocalId--,
+              scope: 'worker',
+              role: 'tool',
+              content: msg,
+              createdAt: new Date().toISOString(),
+            }),
+          )
         }
-      })
+        setNaviBusy((prev) => {
+          const next = new Set(prev)
+          next.delete(target)
+          return next
+        })
+      }
+      window.lain
+        .sendNaviChat(target, text, attachments, conversationId)
+        .then((res) => {
+          if (res?.error) fail(res.error)
+        })
+        // IPC 자체가 거부되면 종료 이벤트가 못 올 수 있다(레인 경로와 동형 2차 방어) — busy를 직접 푼다.
+        .catch((e) => fail(`[error] 전송 실패: ${String((e as Error)?.message || e)}`))
     },
     [],
   )
@@ -1555,11 +1681,9 @@ export default function App() {
         }),
       )
       setNaviMsgs((prev) => pushCapped(prev, optimistic))
-      bumpPreview(target, 'user', content)
       return
     }
     setNaviMsgs((prev) => pushCapped(prev, optimistic))
-    bumpPreview(target, 'user', content)
     dispatchNavi(target, text, pendingAttachments, naviConv ?? undefined)
   }, [naviInput, naviAttachments, naviBusy, drillTarget, naviConv, dispatchNavi])
 
@@ -1598,7 +1722,21 @@ export default function App() {
   const scan = useCallback(async () => {
     setRefreshing(true)
     try {
-      await window.lain.scanProjects()
+      const added = await window.lain.scanProjects()
+      // 0개면 화면이 그대로라 '고장난 버튼'으로 오인된다 — 결정론 한 줄로 결과를 남긴다(플레이버 quip은
+      // chattiness 게이트를 타 신뢰할 수 없다). 0개일 땐 스캔 루트를 같이 보여 원인 자가진단이 되게.
+      setMessages((prev) =>
+        pushCapped(prev, {
+          id: nextLocalId--,
+          scope: 'manager',
+          role: 'tool',
+          content:
+            added > 0
+              ? `스캔 완료 — 새 프로젝트 ${added}개`
+              : `스캔 완료 — 새 프로젝트 없음 (루트: ${wsRoot})`,
+          createdAt: new Date().toISOString(),
+        }),
+      )
     } catch (e) {
       setMessages((prev) =>
         pushCapped(prev, {
@@ -1612,13 +1750,12 @@ export default function App() {
     } finally {
       setRefreshing(false)
     }
-  }, [])
+  }, [wsRoot])
 
   // B15 — 미로드(null)면 빈 배열로 취급. 렌더 분기(로딩 vs 빈 상태)는 projects 원본으로 별도 판정.
   const projectList = projects ?? []
-  const enabled = projectList.filter((p) => p.enabled)
-  const dirtyCount = enabled.filter((p) => (p.status?.dirtyFiles ?? 0) > 0).length
-  const failCount = enabled.filter((p) => p.status?.testState === 'fail').length
+  const dirtyCount = projectList.filter((p) => (p.status?.dirtyFiles ?? 0) > 0).length
+  const failCount = projectList.filter((p) => p.status?.testState === 'fail').length
   const activeTaskOf = (projectId: string) => {
     const act = tasks.filter(
       (t) => t.projectId === projectId && !['done', 'cancelled'].includes(t.state),
@@ -1638,8 +1775,23 @@ export default function App() {
   const todayCost = usage ? usage.todayCost : costUsed
   // 레인 브리핑 위젯(레인의 첫 말) — 전부 결정론(이미 가진 상태로 계산, LLM·비용 0).
   const workingCount = tasks.filter((t) => t.state === 'working' || t.state === 'clarifying').length
+  // 착수 대기(queued) — '작업 중'에 안 잡혀 사라져 보이던 상태. 주의 항목이 아니라 중립 카운터로만 센다.
+  const queuedCount = tasks.filter((t) => t.state === 'queued').length
+  // UI③ — 레인 일러스트 옆 '지금 뭐 하는 중' 한 줄(사람말). 레인이 응답 중이면 레인 자신의 활동,
+  // 아니면 진행 중 Navi의 최근 활동 요약. 둘 다 없으면 null(표시 안 함). 결론 전이라도 상황만 가볍게 공유.
+  const lainNow = (() => {
+    if (managerBusy)
+      return managerLiveTool ? humanizeActivity(managerLiveTool) : '생각 중…'
+    const working = tasks.filter((t) => t.state === 'working')
+    if (working.length === 0) return null
+    const withAct = working.find((t) => taskActivity.get(t.id))
+    const prefix = working.length > 1 ? `Navi ${working.length}명 작업 중 · ` : ''
+    if (!withAct) return `${prefix}Navi 작업 중`
+    const pname = projectList.find((p) => p.id === withAct.projectId)?.name ?? withAct.projectId
+    return `${prefix}${pname}: ${humanizeActivity(taskActivity.get(withAct.id)!)}`
+  })()
   const errorCount = tasks.filter((t) => t.state === 'error').length
-  const unpushedCount = enabled.filter((p) => (p.status?.ahead ?? 0) > 0).length
+  const unpushedCount = projectList.filter((p) => (p.status?.ahead ?? 0) > 0).length
   const attnTotal = reviewCount + blockedCount + approvals.length + errorCount + failCount
   const attnPairs = [
     ['결재', reviewCount],
@@ -1654,6 +1806,19 @@ export default function App() {
     .filter(([l, n]) => l !== '에러' && n > 0)
     .map(([l, n]) => `${l} ${n}`)
   const openedTask = openTaskId ? (tasks.find((t) => t.id === openTaskId) ?? null) : null
+  // memo 실효화 — TaskDrawer(memo)에 넘길 activity. 렌더 안 IIFE는 매번 새로 계산돼 값이 같아도
+  // 참조 비교 전에 드로어 전체를 다시 그리게 만든다(UI③ 헤더 '지금 뭐 하는 중' 한 줄).
+  const openedTaskActivity = useMemo(() => {
+    if (!openedTask) return null
+    const a = taskActivity.get(openedTask.id)
+    return a ? humanizeActivity(a) : null
+  }, [openedTask, taskActivity])
+  // memo 실효화 — SessionList(memo)에 넘길 스프라이트. 렌더 안에서 엘리먼트를 만들면 매번 새 객체라
+  // 나머지 prop이 그대로여도 memo가 항상 통과 실패한다.
+  const drillSprite = useMemo(() => {
+    const dp = drillTarget ? (projects ?? []).find((p) => p.id === drillTarget) : null
+    return dp ? <ProjectSprite project={dp} px={3} /> : null
+  }, [projects, drillTarget])
 
   // ── 대화 내 검색 — substring(대소문자 무시) 매치 메시지 id 목록. 드릴(Navi) 뷰면 naviMsgs,
   // 아니면 하단 레인(manager) 대화(messages) 대상 — 검색바·상태(searchOpen 등)는 두 화면이 공유
@@ -1753,7 +1918,7 @@ export default function App() {
       <div className="msg-body">
         {briefing && <div className="lain-brief-say">{briefing}</div>}
         <div className="lain-brief-line">
-          감시 {enabled.length}
+          감시 {projectList.length}
           {' · 작업 '}
           <span className={workingCount > 0 ? 'st-working' : ''}>{workingCount}</span>
           {' · 미커밋 '}
@@ -1775,7 +1940,7 @@ export default function App() {
       </div>
     </div>
     ),
-    [briefing, enabled.length, workingCount, dirtyCount, unpushedCount, attnTotal, attnPartsStr, usageStr],
+    [briefing, projectList.length, workingCount, dirtyCount, unpushedCount, attnTotal, attnPartsStr, usageStr],
   )
 
   // ── '/' 슬래시 명령 필터(첫 토큰 접두 매칭) ──
@@ -1833,7 +1998,7 @@ export default function App() {
   const paletteItems: PaletteItem[] = [
     { id: 'jump:manager', label: '@Lain 매니저로', group: '대상', run: () => switchTarget('manager') },
     { id: 'jump:@all', label: '@all 브로드캐스트', group: '대상', run: () => switchTarget('@all') },
-    ...enabled.map((p) => ({
+    ...projectList.map((p) => ({
       id: `jump:${p.id}`,
       label: `@${p.id}`,
       hint: p.name,
@@ -1851,7 +2016,6 @@ export default function App() {
     { id: 'act:activity', label: '최근 활동 (ACTIVITY)', group: '액션', run: () => setActivityOpen(true) },
     { id: 'act:bench', label: '평가 (BENCH)', group: '액션', run: () => setBenchOpen(true) },
     { id: 'act:routines', label: '루틴 (ROUTINES)', group: '액션', run: () => setRoutinesOpen(true) },
-    { id: 'act:planner', label: '플래너 (PLANNER)', group: '액션', run: () => setPlannerOpen(true) },
     { id: 'act:shortcuts', label: '단축키 도움말', group: '뷰', run: () => setHelpOpen(true) },
     { id: 'act:crt', label: 'CRT 효과 토글', group: '뷰', run: () => setCrtFx((v) => !v) },
     {
@@ -1860,7 +2024,7 @@ export default function App() {
       group: '뷰',
       run: () => setTheme((t) => (t === 'wired' ? 'amber' : t === 'amber' ? 'mono' : 'wired')),
     },
-    ...enabled
+    ...projectList
       .filter((p) => p.verifyCmd)
       .map((p) => ({
         id: `verify:${p.id}`,
@@ -1869,7 +2033,7 @@ export default function App() {
         group: 'verify',
         run: () => window.lain.runVerify(p.id),
       })),
-    ...enabled
+    ...projectList
       .filter((p) => p.status?.hasTaskMd)
       .map((p) => ({
         id: `task:${p.id}`,
@@ -1903,9 +2067,6 @@ export default function App() {
         case '/tasks':
         case '/approvals':
           setInboxOpen(true)
-          break
-        case '/plan':
-          setPlannerOpen(true)
           break
         case '/compact':
           void compactNow()
@@ -2400,15 +2561,6 @@ export default function App() {
                 <button
                   role="menuitem"
                   onClick={() => {
-                    setPlannerOpen((v) => !v)
-                    setMenuOpen(false)
-                  }}
-                >
-                  <Icon name="calendar" size={14} /> 플래너
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
                     setCrtFx((v) => !v)
                     setMenuOpen(false)
                   }}
@@ -2432,7 +2584,7 @@ export default function App() {
         </span>
         <span className="bar-stat">
           <span className="stat-text">
-            projects {enabled.length} · dirty {dirtyCount} · fail {failCount} ·{' '}
+            projects {projectList.length} · dirty {dirtyCount} · fail {failCount} ·{' '}
           </span>
           {/* C4 — 토큰 표시 클릭 → 최근 14일 미니 바차트 + 프로젝트별 상위 소비 팝오버. '오늘'은 created_at 기준. */}
           <span className="usage-anchor">
@@ -2507,16 +2659,13 @@ export default function App() {
             {drillTarget ? (
               <SessionList
                   name={projectList.find((p) => p.id === drillTarget)?.name ?? drillTarget}
-                  sprite={(() => {
-                    const dp = projectList.find((p) => p.id === drillTarget)
-                    return dp ? <ProjectSprite project={dp} px={3} /> : null
-                  })()}
+                  sprite={drillSprite}
                   conversations={convList}
                   openConv={naviConv}
                   onPick={openNaviConversation}
-                  onNew={() => newConversation(drillTarget)}
-                  onRename={(cid, t) => renameConversation(drillTarget, cid, t)}
-                  onDelete={(cid) => deleteConversation(drillTarget, cid)}
+                  onNew={onNewConversation}
+                  onRename={onRenameConversation}
+                  onDelete={onDeleteConversation}
                   onBack={closeDrill}
                 />
             ) : projects === null ? (
@@ -2546,11 +2695,10 @@ export default function App() {
                     key={p.id}
                     project={p}
                     task={activeTaskOf(p.id)}
-                    focused={false}
                     unread={unread.has(p.id)}
                     activity={(() => {
-                      const t = activeTaskOf(p.id)
-                      return t ? (taskActivity.get(t.id) ?? null) : null
+                      const a = activeTaskOf(p.id) && taskActivity.get(activeTaskOf(p.id)!.id)
+                      return a ? humanizeActivity(a) : null // UI③ — 도구 라인은 사람말로, 발화는 원문 유지
                     })()}
                     onFocus={openDrill}
                     onOpenTask={openTask}
@@ -2587,11 +2735,10 @@ export default function App() {
                             key={p.id}
                             project={p}
                             task={activeTaskOf(p.id)}
-                            focused={false}
                             unread={unread.has(p.id)}
                             activity={(() => {
-                              const t = activeTaskOf(p.id)
-                              return t ? (taskActivity.get(t.id) ?? null) : null
+                              const a = activeTaskOf(p.id) && taskActivity.get(activeTaskOf(p.id)!.id)
+                              return a ? humanizeActivity(a) : null // UI③ — 도구 라인은 사람말로
                             })()}
                             onFocus={openDrill}
                             onOpenTask={openTask}
@@ -2608,9 +2755,11 @@ export default function App() {
           )}
           </div>
           {/* 레인 캐릭터 — 사이드바 하단 고정(지금처럼 아래쪽). 캐릭터가 곧 lain 본인. */}
-          <div className="lain-char">
+          <div className={'lain-char' + (charActive || managerBusy ? ' lain-char--active' : '')}>
             <LainBubble /> {/* 상호작용 대사(quips) 말풍선 — 절대배치, 클릭 통과 */}
-            <ManagerSprite size={260} busy={managerBusy} />
+            <div className="mgr-zoom">
+              <ManagerSprite size={120} busy={managerBusy} />
+            </div>
             <div className="lain-meta">
             {/* 🔄 Lain 세션 새로고침 — 메타 컬럼 최상단. 무한세션이라 '새 대화'가 없어, 옛 스레드로 헛도는 Lain을 리셋 */}
             <button
@@ -2646,12 +2795,23 @@ export default function App() {
                 </span>
               )}
             </div>
+            {/* UI③ — 지금 뭐 하는 중(사람말 한 줄). 레인 busy=레인 활동, 아니면 진행 중 Navi 요약. */}
+            {lainNow && (
+              <div className="lain-now" title={lainNow}>
+                {lainNow}
+              </div>
+            )}
             {/* 카운터 — 항목별 한 줄(감시 중/작업 중/미커밋/미푸시/에러). 나머지 주의 항목은 ⚠ 줄 유지. */}
             <div className="lain-stat">
-              <div className="lain-stat-line">감시 중 {enabled.length}</div>
+              <div className="lain-stat-line">감시 중 {projectList.length}</div>
               <div className="lain-stat-line">
                 작업 중 <span className={workingCount > 0 ? 'st-working' : ''}>{workingCount}</span>
               </div>
+              {queuedCount > 0 && (
+                <div className="lain-stat-line" title="동시 실행 한도에 걸려 착수를 기다리는 작업">
+                  대기 <span>{queuedCount}</span>
+                </div>
+              )}
               <div className="lain-stat-line">
                 미커밋 <span className={dirtyCount > 0 ? 'st-dirty' : ''}>{dirtyCount}</span>
               </div>
@@ -2701,7 +2861,8 @@ export default function App() {
               task={openedTask}
               approvals={approvals}
               events={taskEvents}
-              onClose={() => setOpenTaskId(null)}
+              activity={openedTaskActivity}
+              onClose={closeTask}
             />
           )}
           {drillTarget ? (
@@ -2714,11 +2875,19 @@ export default function App() {
                       <Icon name="menu" size={14} /> 콘솔
                     </button>
                   ) : (
-                    projectList.find((p) => p.id === drillTarget)?.status?.hasTaskMd && (
-                      <button onClick={() => startTask(drillTarget)}>
-                        <Icon name="play" size={14} /> 작업
-                      </button>
-                    )
+                    // TASK.md가 없어도 버튼을 감추지 않는다(NaviTile과 같은 규칙) — 사라지면 왜 못 하는지
+                    // 알 길이 없어 막다른 골목이 된다. 비활성 + title로 이유를 알린다.
+                    <button
+                      onClick={() => startTask(drillTarget)}
+                      disabled={!projectList.find((p) => p.id === drillTarget)?.status?.hasTaskMd}
+                      title={
+                        projectList.find((p) => p.id === drillTarget)?.status?.hasTaskMd
+                          ? 'TASK.md의 지시로 작업 시작'
+                          : 'TASK.md가 없다 — 프로젝트 루트에 TASK.md를 만들거나, 레인에게 작업을 말하면 시작된다'
+                      }
+                    >
+                      <Icon name="play" size={14} /> 작업
+                    </button>
                   )}
                   <button
                     onClick={() => exportConversation(naviConv)}
@@ -2727,7 +2896,64 @@ export default function App() {
                   >
                     내보내기(.md)
                   </button>
+                  <button
+                    className={ccSessions ? 'active' : ''}
+                    title="이 프로젝트에서 클로드코드(데스크톱 앱·터미널)로 직접 연 세션들을 본다"
+                    onClick={async () => {
+                      if (ccSessions) {
+                        setCcSessions(null)
+                        setCcDigest(null)
+                        return
+                      }
+                      setCcSessions(await window.lain.listCcSessions(drillTarget))
+                    }}
+                  >
+                    <Icon name="window" size={14} /> CC 세션
+                  </button>
                 </div>
+                {/* CC 세션 목록 — 데스크톱/CLI에서 이 프로젝트(+워크트리)로 직접 연 클로드코드 세션(읽기 전용) */}
+                {ccSessions && !ccDigest && (
+                  <div className="cc-sessions">
+                    {ccSessions.length === 0 && (
+                      <div className="cc-empty">이 프로젝트에서 연 클로드코드 세션이 없다.</div>
+                    )}
+                    {ccSessions.map((s) => (
+                      <button
+                        key={s.id}
+                        className="cc-session-row"
+                        title={s.firstUserText || s.title}
+                        onClick={async () => {
+                          const d = await window.lain.ccSessionDigest(drillTarget, s.id)
+                          setCcDigest({ title: s.title, text: d ?? '(세션을 읽지 못함)' })
+                        }}
+                      >
+                        <span className="cc-title">{s.title}</span>
+                        <span className="cc-meta">
+                          {s.entrypoint === 'claude-desktop' ? '데스크톱' : 'CLI'} ·{' '}
+                          {new Date(s.lastAt).toLocaleString('sv-SE').slice(0, 16)}
+                          {s.gitBranch ? ` · ${s.gitBranch}` : ''}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {ccDigest && (
+                  <div className="cc-digest">
+                    <div className="cc-digest-head">
+                      <span className="cc-title">{ccDigest.title}</span>
+                      <button onClick={() => setCcDigest(null)}>← 목록</button>
+                      <button
+                        onClick={() => {
+                          setCcSessions(null)
+                          setCcDigest(null)
+                        }}
+                      >
+                        닫기
+                      </button>
+                    </div>
+                    <pre className="cc-digest-body">{ccDigest.text}</pre>
+                  </div>
+                )}
                 {/* 막힌 작업의 명세 질문 — blocked 동안만, 답하면 사라진다 */}
                 {activeTaskOf(drillTarget)?.state === 'blocked' && (
                   <div className="blocked-banner">
@@ -2948,7 +3174,6 @@ export default function App() {
                 )}
               </div>
             )}
-            {/* 검색 토글(🔍)·세션 새로고침(🔄) 버튼은 각각 Ctrl+F·레인 캐릭터 옆으로 이동됨 */}
             {/* 검색바 — 레인 대화 메시지를 클라이언트에서 필터·하이라이트·이동 (A11: 드릴 뷰에도 동일하게 렌더) */}
             {chatTarget !== '@all' && searchBar}
             <ChatPanel
@@ -2976,7 +3201,7 @@ export default function App() {
               approvals={approvals}
               tasks={tasks}
               onOpenTask={openTask}
-              onClose={() => setInboxOpen(false)}
+              onClose={closeInbox}
             />
           )}
 
@@ -3077,20 +3302,22 @@ export default function App() {
               {/* PC 네이티브 음성 — 매니저 대화에서만. 마이크 PTT + 답변 음성 듣기 토글. */}
               {chatTarget === 'manager' && (
                 <>
-                  <button
-                    className={`mic-btn${recording ? ' rec' : ''}`}
-                    title={
-                      settings?.groqApiKey
-                        ? '눌러서 말하기 (떼면 전송) — 디스코드 없이 PC에서 직접'
-                        : '음성 입력엔 Groq STT 키 필요 (환경설정)'
-                    }
-                    disabled={!settings?.groqApiKey || managerBusy}
-                    onMouseDown={startRec}
-                    onMouseUp={stopRec}
-                    onMouseLeave={() => recording && stopRec()}
-                  >
-                    {recording ? <Icon name="stop" size={14} /> : <Icon name="microphone" size={14} />}
-                  </button>
+                  {settings?.pcVoiceIn && (
+                    <button
+                      className={`mic-btn${recording ? ' rec' : ''}`}
+                      title={
+                        settings?.groqApiKey
+                          ? '눌러서 말하기 (떼면 전송) — 디스코드 없이 PC에서 직접'
+                          : '음성 입력엔 Groq STT 키 필요 (환경설정)'
+                      }
+                      disabled={!settings?.groqApiKey || managerBusy}
+                      onMouseDown={startRec}
+                      onMouseUp={stopRec}
+                      onMouseLeave={() => recording && stopRec()}
+                    >
+                      {recording ? <Icon name="stop" size={14} /> : <Icon name="microphone" size={14} />}
+                    </button>
+                  )}
                   <button
                     className={`voiceout-btn${voiceOut ? ' on' : ''}${voicePlaying ? ' playing' : ''}`}
                     title={voicePlaying ? '재생 중 — 클릭하면 정지' : '레인 답변을 음성으로 듣기 (Supertonic)'}
@@ -3174,7 +3401,6 @@ export default function App() {
 
       {benchOpen && <BenchPanel onClose={() => setBenchOpen(false)} />}
       {routinesOpen && <RoutinesPanel onClose={() => setRoutinesOpen(false)} />}
-      {plannerOpen && <PlannerPanel onClose={() => setPlannerOpen(false)} />}
 
       {ctxMenu && (
         <ContextMenu

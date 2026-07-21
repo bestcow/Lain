@@ -11,7 +11,6 @@ import {
   stripAttachSuffix,
   computeTargetKey,
   sessionStartStamp,
-  filterThisSession,
   fmtCost,
   usageLabel,
   contextPercent,
@@ -60,8 +59,8 @@ describe('filterSlash — 첫 토큰 접두 매칭', () => {
   it("'/sc' → /scan", () => {
     expect(cmds(filterSlash('/sc', SLASH_COMMANDS))).toEqual(['/scan'])
   })
-  it("'/' → 전체 11개", () => {
-    expect(filterSlash('/', SLASH_COMMANDS)).toHaveLength(11)
+  it("'/' → 전체 10개", () => {
+    expect(filterSlash('/', SLASH_COMMANDS)).toHaveLength(10)
   })
   it("'/zzz' → 없음", () => {
     expect(filterSlash('/zzz', SLASH_COMMANDS)).toEqual([])
@@ -75,11 +74,11 @@ describe('filterSlash — 첫 토큰 접두 매칭', () => {
 })
 
 describe('SLASH_COMMANDS — 상수 무결성', () => {
-  it('정확히 11개', () => {
-    expect(SLASH_COMMANDS).toHaveLength(11)
+  it('정확히 10개', () => {
+    expect(SLASH_COMMANDS).toHaveLength(10)
   })
   it('cmd 유니크', () => {
-    expect(new Set(SLASH_COMMANDS.map((c) => c.cmd)).size).toBe(11)
+    expect(new Set(SLASH_COMMANDS.map((c) => c.cmd)).size).toBe(10)
   })
   it('모든 cmd는 / 로 시작', () => {
     expect(SLASH_COMMANDS.every((c) => c.cmd.startsWith('/'))).toBe(true)
@@ -254,27 +253,10 @@ describe('computeTargetKey — 초안 키', () => {
   })
 })
 
-describe('sessionStartStamp / filterThisSession — 이번 실행 메시지 필터(DB 포맷 정합)', () => {
+describe('sessionStartStamp — 이번 실행 경계 스탬프(DB 포맷 정합)', () => {
   // DB(store.nowStamp)는 'YYYY-MM-DD HH:MM:SS'(공백 구분, UTC) 포맷으로 저장한다.
-  const rows: ChatMessage[] = [
-    { id: 1, scope: 'manager', role: 'user', content: '이전 실행', createdAt: '2026-06-26 10:00:00' },
-    { id: 2, scope: 'manager', role: 'assistant', content: '이번 실행', createdAt: '2026-06-26 11:00:00' },
-  ]
-
   it('sessionStartStamp은 DB와 동일한 공백 구분 포맷을 만든다(T/Z 없음)', () => {
     expect(sessionStartStamp(new Date('2026-06-26T10:30:00.123Z'))).toBe('2026-06-26 10:30:00')
-  })
-
-  it('세션 시작 이후 메시지만 남긴다 — 공백 포맷 문자열 비교가 정확', () => {
-    const start = sessionStartStamp(new Date('2026-06-26T10:30:00Z'))
-    expect(filterThisSession(rows, start).map((m) => m.id)).toEqual([2])
-  })
-
-  it('회귀: toISOString 포맷을 기준으로 쓰면 전부 누락된다(채팅창 리셋 버그)', () => {
-    // ' '(0x20) < 'T'(0x54)이라 모든 DB 메시지가 toISOString 기준보다 작다고 판정 → 빈 배열.
-    const buggyStart = new Date('2026-06-26T10:30:00Z').toISOString()
-    expect(rows.every((m) => m.createdAt < buggyStart)).toBe(true)
-    expect(filterThisSession(rows, buggyStart)).toEqual([])
   })
 })
 
@@ -315,26 +297,6 @@ describe('shouldRefocusInboxRow — total 변화·입력중 가드 조합', () =
   })
   it('개수 불변인데 입력 중이면 스킵', () => {
     expect(shouldRefocusInboxRow(3, 3, input)).toBe(false)
-  })
-})
-
-describe('이번 실행 경계 = main 기동 시각 — 렌더러 reload 후에도 세션 메시지 보존', () => {
-  // 렌더러가 크래시하면 main이 자동 reload하는데(index.ts render-process-gone), 그때 경계를 '지금'으로
-  // 재계산하면 이번 실행 메시지가 전부 < 경계로 필터돼 콜드스타트처럼 사라진다(화면이 빈 화면으로 리셋).
-  // 그래서 경계는 reload 불변인 main(APP_STARTED_AT)에서 받아야 한다.
-  const appStart = '2026-06-26 10:00:00' // main 기동 시각 — reload돼도 불변
-  const sessionRows: ChatMessage[] = [
-    { id: 9, scope: 'manager', role: 'assistant', content: '이번 실행 중 답', createdAt: '2026-06-26 10:05:00' },
-  ]
-
-  it('main 경계로 필터하면 reload 후에도 이번 실행 메시지가 남는다', () => {
-    expect(filterThisSession(sessionRows, appStart).map((m) => m.id)).toEqual([9])
-  })
-
-  it('회귀: reload 시각으로 경계를 재계산하면 이번 실행 메시지가 사라진다', () => {
-    // 메시지(10:05) 이후 시각에 reload → 그 시각을 경계로 쓰면 빈 배열(버그 재현).
-    const reloadStart = sessionStartStamp(new Date('2026-06-26T10:10:00Z'))
-    expect(filterThisSession(sessionRows, reloadStart)).toEqual([])
   })
 })
 

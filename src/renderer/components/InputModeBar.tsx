@@ -10,20 +10,20 @@ function ModeDropdown({
   value,
   options,
   onChange,
-  disabled,
   title,
   header,
   footer,
   align = 'left',
+  cat,
 }: {
   value: string
   options: Opt[]
   onChange: (v: string) => void
-  disabled?: boolean
   title?: string
   header?: string
   footer?: ReactNode
   align?: 'left' | 'right'
+  cat?: string // 값 앞에 병기할 카테고리 이름표 — 닫힌 상태에서도 무슨 설정인지 보이게
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -38,15 +38,11 @@ function ModeDropdown({
   const current = options.find((o) => o.value === value)
   return (
     <div className="imb-dd" ref={ref}>
-      <button
-        className="imb-sel"
-        disabled={disabled}
-        title={title}
-        onClick={() => !disabled && setOpen((v) => !v)}
-      >
+      <button className="imb-sel" title={title} onClick={() => setOpen((v) => !v)}>
+        {cat && <span className="imb-cat">{cat}</span>}
         {current?.label ?? value}
       </button>
-      {open && !disabled && (
+      {open && (
         <div className={`imb-menu${align === 'right' ? ' imb-menu-right' : ''}`}>
           {header && <div className="imb-menu-head">{header}</div>}
           {options.map((o) => (
@@ -91,13 +87,14 @@ const EFFORT_OPTS: Opt[] = [
 ]
 const TASKMODE_OPTS: Opt[] = [
   { value: 'auto', label: '자동판정' },
-  { value: 'autonomous', label: '자동' },
+  { value: 'autonomous', label: '자율' },
   { value: 'interactive', label: '대화형' },
 ]
 const MODEL_OPTS: Opt[] = MODEL_TIERS.map((t) => ({ value: t, label: MODEL_NAME[t] }))
+// 버튼에 '동시' 이름표를 병기하므로 값은 숫자만 — '동시 동시 7' 중복 방지
 const CONC_OPTS: Opt[] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => ({
   value: String(n),
-  label: `동시 ${n}`,
+  label: String(n),
 }))
 
 export function InputModeBar({
@@ -134,6 +131,7 @@ export function InputModeBar({
           onChange={(v) => onPatch({ managerPermissionMode: v as TaskPermissionMode })}
           title="레인 권한 — 요청 / 편집 수락 / 계획 / 건너뛰기"
           header="권한"
+          cat="권한"
           align="left"
         />
       </div>
@@ -144,6 +142,7 @@ export function InputModeBar({
           onChange={(v) => onPatch({ managerModel: v as LainSettings['managerModel'] })}
           title="레인 모델"
           header="모델"
+          cat="모델"
           align="right"
           footer={
             <button
@@ -164,16 +163,20 @@ export function InputModeBar({
               ? onPatch({ managerEffortAuto: true })
               : onPatch({ managerEffortAuto: false, managerEffort: v as ManagerEffort })
           }
-          title="레인 작업량 — 자동(스스로 조절) 또는 낮음~Ultracode"
-          header="작업량"
+          title="레인 강도 — 자동(이번 입력에 맞춰 조절) 또는 낮음~Ultracode"
+          header="강도"
+          cat="강도"
           align="right"
         />
+        {/* 그룹 경계 — 여기부터는 레인 자신이 아니라 '작업을 어떻게 굴리나' */}
+        <span className="imb-sep" aria-hidden="true" />
         <ModeDropdown
           value={settings.defaultTaskMode}
           options={TASKMODE_OPTS}
           onChange={(v) => onPatch({ defaultTaskMode: v as LainSettings['defaultTaskMode'] })}
-          title="작업 위임 기본 방식"
-          header="작업"
+          title="작업 방식 — 자동판정 / 자율(무개입) / 대화형"
+          header="작업 방식"
+          cat="작업방식"
           align="right"
         />
         <ModeDropdown
@@ -182,6 +185,7 @@ export function InputModeBar({
           onChange={(v) => onPatch({ concurrencyCap: Number(v) || 1 })}
           title="동시 작업(내비) 수"
           header="동시 작업"
+          cat="동시"
           align="right"
         />
         <span

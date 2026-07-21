@@ -2,11 +2,8 @@
 :root {
   --ov-bg: rgba(18, 14, 38, 0.92);
   --ov-border: rgba(177, 140, 240, 0.34);
-  --ov-signal: #b18cf0;
   --ov-signal-soft: #c9b6f3;
-  --ov-signal-bright: #e7dcff;
   --ov-text: #efeaff;
-  --ov-text-dim: #b9b0d8;
   --ov-font: 'MonoplexKR', 'Hack', 'Consolas', monospace;
 }
 
@@ -74,16 +71,6 @@ body {
   background: linear-gradient(to top, var(--ov-bg), rgba(18, 14, 38, 0));
   pointer-events: none;
 }
-@keyframes ov-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
 
 .ov-face {
   flex: none;
@@ -93,18 +80,6 @@ body {
   image-rendering: pixelated;
   object-fit: cover;
   filter: drop-shadow(0 0 4px rgba(177, 140, 240, 0.35));
-}
-.ov-face.ov-thinking {
-  animation: ov-pulse 1.1s ease-in-out infinite;
-}
-@keyframes ov-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.55;
-  }
 }
 
 .ov-body {
@@ -127,8 +102,4 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
-}
-.ov-text.ov-idle {
-  color: var(--ov-text-dim);
-  font-style: italic;
 }

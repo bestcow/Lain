@@ -1,5 +1,5 @@
 // §23 평가 하네스 — 자기개선이 지표를 실제로 올리는지 A/B로 측정.
-// 같은 벤치 task 묶음을 교훈 off/on 두 조건으로 돌려 성공률·1회통과율·턴·비용 비교.
+// 같은 벤치 task 묶음을 학습 off/on 두 조건으로 돌려 성공률·1회통과율·턴·비용 비교.
 // Hermes(curator)도 "사용량"만 보고 "효과"는 측정 안 함 → lain의 차별점.
 import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
@@ -186,7 +186,7 @@ export function aggregate(runId: string, results: BenchTaskResult[], startedAt: 
   return { runId, startedAt, byCondition, results, regression: detectRegression(byCondition) }
 }
 
-/** §24 회귀 감지 — 교훈 ON이 OFF보다 지표를 악화시키면 경보. 자기개선이 '틀린 교훈 누적'으로
+/** §24 회귀 감지 — 학습 ON이 OFF보다 지표를 악화시키면 경보. 자기개선이 '틀린 학습 누적'으로
  *  역효과를 내는 경우(§22.2)를 평가 하네스가 CI처럼 잡아내게 한다. 둘 다 있을 때만 비교. */
 function detectRegression(bc: BenchSummary['byCondition']): string | null {
   const off = bc['no-lessons']
@@ -198,7 +198,7 @@ function detectRegression(bc: BenchSummary['byCondition']): string | null {
     issues.push(`성공률 하락 ${pct(off.successRate)}→${pct(on.successRate)}`)
   if (on.firstPassRate < off.firstPassRate - 1e-9)
     issues.push(`1회통과율 하락 ${pct(off.firstPassRate)}→${pct(on.firstPassRate)}`)
-  // 효율 회귀는 성공률이 떨어지지 않은 전제에서만 의미(교훈은 효율을 올려야 함 §23.2). >10% 악화면 경보.
+  // 효율 회귀는 성공률이 떨어지지 않은 전제에서만 의미(학습은 효율을 올려야 함 §23.2). >10% 악화면 경보.
   if (on.successRate >= off.successRate - 1e-9) {
     if (off.avgTurns > 0 && on.avgTurns > off.avgTurns * 1.1)
       issues.push(`평균 턴 증가 ${off.avgTurns.toFixed(1)}→${on.avgTurns.toFixed(1)}`)
@@ -206,7 +206,7 @@ function detectRegression(bc: BenchSummary['byCondition']): string | null {
       issues.push(`평균 비용 증가 $${off.avgCost.toFixed(3)}→$${on.avgCost.toFixed(3)}`)
   }
   return issues.length
-    ? `⚠️ 교훈 회귀 의심: ${issues.join('; ')} — 틀린 교훈 누적 가능(§22.2). 교훈 정제(curator) 필요.`
+    ? `⚠️ 학습 회귀 의심: ${issues.join('; ')} — 틀린 학습 누적 가능(§22.2). 학습 정제(curator) 필요.`
     : null
 }
 
@@ -227,11 +227,11 @@ export async function runBench(
   const tasks = loadBenchTasks(benchRoot)
   fs.mkdirSync(BENCH_TMP, { recursive: true })
   const results: BenchTaskResult[] = []
-  // 사용자 교훈 보호 — 조건 격리는 스냅샷 안에서만. 중간에 throw/크래시해도 finally·부팅 복원으로 원본 보존.
+  // 사용자 학습 보호 — 조건 격리는 스냅샷 안에서만. 중간에 throw/크래시해도 finally·부팅 복원으로 원본 보존.
   snapshotLessonsForBench()
   try {
     for (const cond of conditions) {
-      // 조건 간 교훈 격리 — no-lessons는 빈 상태에서 출발
+      // 조건 간 학습 격리 — no-lessons는 빈 상태에서 출발
       deleteAllLessons()
       for (const def of tasks) {
         progress(`[${cond}] ${def.id} 실행 중...`)

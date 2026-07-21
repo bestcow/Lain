@@ -35,12 +35,15 @@ export function parseInstalledPlugin(
 }
 
 // 순수 — plugins·할당·enabled로 query() 부분옵션 조립.
+// settingSources는 스킬 on/off와 무관하게 **항상 []** 다: SDK 0.3.x는 미지정 시 사용자/프로젝트
+// 설정을 전부 로드해 ~/.claude/settings.json의 훅·플러그인·permissions가 lain 세션에 새어든다
+// (정체성·권한 오염). 조건부인 것은 plugins/skills 로드뿐이다.
 export function assembleSkillOptions(
   plugins: SdkPluginConfig[],
   assigned: string[] | null,
   enabled: boolean,
 ): SkillOptions {
-  if (!enabled || plugins.length === 0) return {}
+  if (!enabled || plugins.length === 0) return { settingSources: [] }
   return {
     plugins,
     settingSources: [],
@@ -48,7 +51,7 @@ export function assembleSkillOptions(
   }
 }
 
-export function resolveInstalledPlugin(name: string): string | null {
+function resolveInstalledPlugin(name: string): string | null {
   try {
     const manifest = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json')
     const p = parseInstalledPlugin(fs.readFileSync(manifest, 'utf8'), name)

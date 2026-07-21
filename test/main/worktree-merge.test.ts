@@ -65,7 +65,6 @@ beforeEach(() => {
     stack: '',
     verifyCmd: null,
     isGit: true,
-    enabled: true,
   } as Project
 })
 

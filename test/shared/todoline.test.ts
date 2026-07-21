@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest'
 import {
   parseTodoWriteInput,
   todoProgress,
-  currentTodo,
   encodeTodoLine,
   decodeTodoLine,
   TODO_STATUS_ICON,
@@ -65,17 +64,6 @@ describe('todoProgress — 진행률 n/m 계산', () => {
   it('전부 완료면 total과 done이 같다', () => {
     const all = sample.map((t) => ({ ...t, status: 'completed' as const }))
     expect(todoProgress(all)).toEqual({ done: 3, total: 3 })
-  })
-})
-
-describe('currentTodo — 진행 중 항목', () => {
-  it('in_progress 항목을 찾는다', () => {
-    expect(currentTodo(sample)).toEqual(sample[1])
-  })
-
-  it('in_progress가 없으면 null', () => {
-    const noProgress = sample.filter((t) => t.status !== 'in_progress')
-    expect(currentTodo(noProgress)).toBeNull()
   })
 })
 

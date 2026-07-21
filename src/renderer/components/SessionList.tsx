@@ -1,6 +1,6 @@
 // 다중 세션 — 한 대상(Lain | Navi)의 대화 세션 목록(드릴다운). 헤더(◄ 뒤로 + 캐릭터 + 이름 + 새 대화)
 // + 세션 행들. 세션 클릭 = 우측에서 그 세션으로 대화, "새 대화" = 새 세션 시작.
-import { useState, useEffect, type ReactNode } from 'react'
+import { memo, useState, useEffect, type ReactNode } from 'react'
 import type { Conversation } from '../../shared/types'
 
 // 5분 이내 텔레그램 메시지가 있으면 모바일 활성으로 판단 (Lain 기여)
@@ -30,7 +30,7 @@ interface Props {
   onBack: () => void
 }
 
-export function SessionList({
+function SessionListInner({
   name,
   sprite,
   conversations,
@@ -180,3 +180,7 @@ export function SessionList({
     </div>
   )
 }
+
+// B4 — 세션 목록은 App의 모든 리렌더(입력창 키 입력 포함)에 딸려 다시 그려졌다. props가 그대로면 스킵.
+// sprite(ReactNode)·콜백이 App에서 매 렌더 새로 만들어지면 무력하니, 그쪽 안정화가 선행돼야 실효한다.
+export const SessionList = memo(SessionListInner)

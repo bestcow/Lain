@@ -14,9 +14,11 @@ import { spawn, execFileSync } from 'node:child_process'
 import { app } from 'electron'
 import { DATA_DIR, AGENT_CWD, CLAUDE_BIN, SELF_SRC_DIR } from './paths'
 import { appendCapped } from './logfile'
+import { toImageBlocks, type ImageBlock } from './taskimages'
 import type { ChatEvent, FileAttachment, ProjectView, NaviChatEvent, Task } from '../shared/types'
 import { encodeToolLine } from '../shared/toolline'
 import { parseTodoWriteInput, encodeTodoLine, todoProgress } from '../shared/todoline'
+import { formatLoopStatsLine } from '../shared/loopstats'
 import {
   buildEditDiffLines,
   buildWriteDiffLines,
@@ -26,10 +28,12 @@ import {
   type EditDiffPayload,
 } from '../shared/editdiff'
 import { getForeground, type Observation } from './watcher'
+import { listCcSessions, ccSessionDigest, findCcSessionFile, ccSessionMeta, buildAdoptContent } from './ccsessions'
 import { isTransientApiError, transientBackoffMs, MAX_TRANSIENT_RETRIES } from './retry'
 import {
   addMessage,
   listRecentCcEvents,
+  latestCcSummaries,
   getSettings,
   saveSettings,
   listProjects,
@@ -68,20 +72,9 @@ import {
   setRoutineEnabled,
   deleteRoutine,
   insertApproval,
-  listPlanItems,
-  upsertPlanItem,
-  setPlanItemDone,
-  archivePlanItem,
-  listPlanTags,
-  upsertPlanTag,
-  deletePlanTag,
-  listPlanSections,
-  upsertPlanSection,
-  deletePlanSection,
+  loopStats,
 } from './store'
-import { occurrencesInRange, parseLocal, fmtLocal } from '../shared/planmath'
-import { plannerDigestLine } from './planner'
-import { managerAgentOptions, tierQueryOptions, judgeQueryOptions } from './agentopts'
+import { managerAgentOptions, tierQueryOptions, judgeQueryOptions, preToolUseGuard, secretDeny } from './agentopts'
 import { summarizeDiffStat } from './checkpoint'
 import { QuestionBus, type PendingQuestion } from './questionbus'
 import { summarizeConversationTitle } from './title'
@@ -89,9 +82,6 @@ import { summarizeWorldState } from './compact'
 import { shouldCompact, contextOccupancyTokens, occupancyForMaxTurns } from './compactgate'
 import { startTask, answerClarify, cancelTask, resolveReview, rerunTask, revertMerge, setTaskDeps, startTaskGroup, resolveGroup } from './orchestrator'
 import {
-  blocksSecretFile,
-  blocksSecretPath,
-  SECRET_DENY_MESSAGE,
   redactSecrets,
   scanSkillInjection,
   isSecretFile,
@@ -109,10 +99,11 @@ import { sumUsageTokens, waitApproval, extractToolResults, RISKY } from './worke
 import { classifySystemDestructive } from './sysrisk'
 import { notifyUser } from './notify'
 import { sendToNavi, sendToAllNavis } from './navichat'
-import { scanProjects } from './registry'
+import { scanProjects, workspaceInfo } from './registry'
 import { collectStatus, runVerify } from './collectors'
 import { sendTelegram, sendTelegramPhoto } from './telegram'
 import { skillOptions } from './skills'
+import { buildOverlayPrompt } from './overlayprompt'
 
 // 페르소나 코어 — 정체성 + 말투(존댓말·톤). 메인 채팅과 곁가지(음성·오버레이·웹조사)가 공유하는 단일
 // 출처. 운영 규칙(도구·다이제스트·위임)은 메인 전용이라 SYSTEM_PROMPT에만 둔다 — 곁가지는 도구 없는
@@ -143,11 +134,9 @@ const SYSTEM_PROMPT = `${PERSONA_CORE}
 - 브라우저 조작: mcp__chrome__* 도구가 있으면(설정에서 등록 시) 크롬 창을 직접 열어 이동·클릭·입력·스크린샷·콘솔/네트워크 확인을 할 수 있다. 이 크롬은 전용 프로필이라 사용자의 일상 크롬 로그인과 분리돼 있다 — 로그인이 필요한 사이트는 그 창에서 사용자가 직접 한 번 로그인하게 요청해라(이후 유지). 구매·결제·게시·전송 같은 비가역 행동은 실행 전에 사용자 확인을 받는다.
 - 사용자가 행동을 지시하면 mcp__lain__* 와이어드 도구로 직접 수행한다. 도구 없이 "했다"고 말하지 마라.
 - 도구가 "시작했다"고 답한 것은 "완료됐다"가 아니다. 비동기 작업(deploy_lain·start_task 등)은 완료 증거(로그·재시작·상태 변화)를 확인하기 전에 완료로 보고하지 마라 — 확인 전엔 "시작함, 결과 확인 필요"까지만 말해라.
-- 사용자가 학습된 행동·사실을 정정하면(예: "그렇게 부르지 마", "그 규칙 틀렸어") retract_lessons로 관련 교훈을 철회해라 — 설정·프로필 수정만으로는 잘못 학습된 교훈이 계속 주입된다.
-- 플래너: 사용자가 일정·할일을 말하면 plan_manage로 등록하고 한 줄로 확인해라(잡담인지 애매하면 등록하지 말고 넘어간다). "오늘/이번 주 뭐 있지"는 plan_view로 답한다. 다이제스트의 "플래너:" 줄에 방치 항목이 보이고 설정상 넛지가 켜져 있으면, 한가한 턴에 한 번만 "할래, 버릴래, 내가 해줄까?"로 꺼내라 — 같은 항목을 거듭 조르지 마라.
-- 플래너 대신 처리: 조사·탐색·정리형 todo는 (설정 plannerOfferHelp가 켜져 있으면) "내가 해줄까?"를 1회 제안하고, 수락하면 수행 결과를 그 항목 body에 plan_manage(update)로 붙인 뒤 완료할지 물어라. 사용자가 직접 시키면 설정과 무관하게 즉시 수행한다.
-- 절차 스킬: 매 메시지의 <skills-index>에 네가 저장한 절차 스킬 목록이 주어진다. 관련 작업이면 **먼저 skill_view로 본문을 확인**하고 그 절차를 따른다. 네가 도구로 직접 수행해 검증까지 끝낸 절차는 skill_save로 바로 남기고 한 줄로 보고해라. 대화에서 나온 절차거나 저장 가치가 애매하면 먼저 "방금 내용을 스킬로 저장할까요?"라고 짧게 제안하고 수락 시 저장해라 — 같은 절차를 거듭 제안하지 말고, 거절한 절차는 다시 꺼내지 마라. 교훈(<lessons>)은 한두 문장 규칙, 스킬은 여러 단계 절차다 — 구분해 저장해라.
-- 사용자 프로필: 사용자 자체에 대한 지속 사실(호칭·선호·습관·기술 수준)을 새로 알게 되면 user_profile 도구로 저장·정리해라(상한 초과 에러가 오면 같은 턴에서 스스로 병합·정리 후 재시도). 프로필=사용자, 교훈=작업 규칙이다.
+- 사용자가 학습된 행동·사실을 정정하면(예: "그렇게 부르지 마", "그 규칙 틀렸어") retract_lessons로 관련 학습을 철회해라 — 설정·프로필 수정만으로는 잘못 학습된 학습이 계속 주입된다.
+- 절차 스킬: 매 메시지의 <skills-index>에 네가 저장한 절차 스킬 목록이 주어진다. 관련 작업이면 **먼저 skill_view로 본문을 확인**하고 그 절차를 따른다. 네가 도구로 직접 수행해 검증까지 끝낸 절차는 skill_save로 바로 남기고 한 줄로 보고해라. 대화에서 나온 절차거나 저장 가치가 애매하면 먼저 "방금 내용을 스킬로 저장할까요?"라고 짧게 제안하고 수락 시 저장해라 — 같은 절차를 거듭 제안하지 말고, 거절한 절차는 다시 꺼내지 마라. 학습(<lessons>)은 한두 문장 규칙, 스킬은 여러 단계 절차다 — 구분해 저장해라.
+- 사용자 프로필: 사용자 자체에 대한 지속 사실(호칭·선호·습관·기술 수준)을 새로 알게 되면 user_profile 도구로 저장·정리해라(상한 초과 에러가 오면 같은 턴에서 스스로 병합·정리 후 재시도). 프로필=사용자, 학습=작업 규칙이다.
 - 과거 대화: 옛 대화 내용이 필요한데 기억(월드모델 요약)에 없으면 search_chat_history로 원문을 검색해라. 추측으로 "그때 ~라고 했다"고 말하지 마라.
 - 등록된 모든 저장소(프로젝트 폴더)의 파일을 직접 읽고 고칠 수 있다(Read/Grep/Edit/Write). 코드를 직접 봐야 하거나 간단한 수정은 Navi에 위임하지 말고 해당 경로에서 직접 한다. Bash/PowerShell로 명령도 직접 실행할 수 있다(빌드·git·npm 등). Workflow/Agent 도구도 쓸 수 있다. lain 자체 재빌드·배포는 deploy_lain 도구(또는 텔레그램 /deploy)를 쓴다 — 단 배포 가드가 커밋 안 된/구버전 소스 배포를 거부하니, 자기 소스를 고쳤으면 먼저 커밋해야 배포된다. 종료는 stop_lain, 재시작은 restart_lain.
 ${SELF_SRC_LINE}
@@ -233,8 +222,43 @@ function checkpointFragments(tasks: Task[]): Map<string, string> {
   return byProject
 }
 
-export function buildDigest(projects: ProjectView[], tasks?: Task[]): string {
-  const enabled = projects.filter((p) => p.enabled)
+// 첫 실행 온보딩 — 등록 프로젝트가 0개일 때만 다이제스트에 얹는 지시문. 신규 사용자는 워크스페이스 루트가
+// 기본값(C:\workspace)이라 자기 코드가 잡히지 않고, 그 사실을 모른 채 빈 화면만 본다. 레인이 먼저 물어보게 한다.
+// 프로젝트가 하나라도 등록되면 이 분기를 안 타므로 지시는 자동으로 사라진다.
+const ONBOARDING_HINT = `## 첫 실행 안내(등록된 프로젝트가 0개일 때만 붙는다)
+사용자는 lain을 이제 막 켠 사람일 가능성이 높다. 다른 얘기보다 먼저 아래를 챙긴다 — 한 번에 하나씩 묻고, 사용자가 다른 용건을 꺼내면 그쪽을 우선한다.
+1) 프로젝트들이 모여 있는 상위 폴더(워크스페이스 루트)가 어디인지 묻는다. 경로를 받으면 set_workspace_root 도구로 설정하고, 몇 개가 등록됐는지 결과를 보고한다.
+2) lain은 루트 바로 아래가 아니라 하위 폴더 apps/games/tools 안의 프로젝트를 스캔하는 관례다. 구조가 다르면 그대로 알려주고, 스캔할 하위 폴더는 환경설정에서 바꿀 수 있다고 안내한다(그래도 안 잡히는 프로젝트는 수동 추가).
+3) 쓸 모델·권한 같은 나머지는 환경설정 창에서 바꿀 수 있다고 한 줄 덧붙인다.`
+
+/** set_workspace_root 저장 전 경로 검증 — 존재하는 디렉터리만 통과(없는 경로를 설정에 밀어넣으면 빈 화면이 그대로 굳는다). */
+export function validateWorkspaceRoot(
+  input: string,
+): { ok: true; root: string } | { ok: false; reason: string } {
+  // 사용자가 붙여넣는 경로는 따옴표·공백이 붙어 오는 일이 흔하다.
+  const p = input.trim().replace(/^"(.*)"$/s, '$1').trim()
+  if (!p) return { ok: false, reason: '빈 경로다' }
+  // 상대경로는 앱 프로세스의 cwd(설치 디렉터리) 기준으로 풀려 엉뚱한 루트가 저장될 수 있다 — 절대경로만 받는다.
+  if (!path.isAbsolute(p)) return { ok: false, reason: '절대경로가 아니다(예: C:\\workspace)' }
+  let st: fs.Stats
+  try {
+    st = fs.statSync(p)
+  } catch {
+    return { ok: false, reason: '존재하지 않는 경로다' }
+  }
+  if (!st.isDirectory()) return { ok: false, reason: '디렉터리가 아니라 파일이다' }
+  return { ok: true, root: path.resolve(p) }
+}
+
+/**
+ * @param opts.onboarding 프로젝트 0개일 때 온보딩 '지시문'을 얹을지. 기본 true(레인에게 먹이는 경로).
+ *   다이제스트를 사람이 그대로 읽는 표면(텔레그램 /status 등)에서는 false — 지시문이 사용자에게 새어나간다.
+ */
+export function buildDigest(
+  projects: ProjectView[],
+  tasks?: Task[],
+  opts?: { onboarding?: boolean },
+): string {
   // task 조회 실패(DB 미초기화 등)는 무해 — 체크포인트 조각만 생략하고 기존 다이제스트 유지.
   let cp: Map<string, string>
   try {
@@ -242,10 +266,14 @@ export function buildDigest(projects: ProjectView[], tasks?: Task[]): string {
   } catch {
     cp = new Map()
   }
-  const base =
-    enabled.length === 0
+  const empty =
+    opts?.onboarding === false
       ? '(등록된 프로젝트 없음 — 스캔 필요)'
-      : enabled
+      : `(등록된 프로젝트 없음 — 스캔 필요)\n${ONBOARDING_HINT}`
+  let base =
+    projects.length === 0
+      ? empty
+      : projects
           .map((p) => {
             const s = p.status
             // [숨김] — 유저가 숨긴 내비. 관리(수집·작업)는 정상이나 레인이 먼저 화제로 꺼내면 안 됨(SYSTEM_PROMPT 규칙).
@@ -267,15 +295,22 @@ export function buildDigest(projects: ProjectView[], tasks?: Task[]): string {
             return parts.join(' | ')
           })
           .join('\n')
-  // 플래너 요약 1줄(§21b) — 설정으로 끄면 브리핑에서 제외. DB 미가용 등 실패는 무해하게 base만 반환.
+  // C3 — CC 세션 종료 judge 요약 역반영. judge 산출물(요약 결과)이라 redact 불요 — 세션 원문이 아니라
+  // 이미 2줄 한국어 요약으로 변환된 결과만 다이제스트에 싣는다. 조회 실패(DB 미초기화 등)는 무해 — 생략.
   try {
-    const s = getSettings()
-    if (!s.plannerInBriefing) return base
-    const line = plannerDigestLine(listPlanItems(), new Date(), s)
-    return line ? `${base}\n${line}` : base
+    const cc = latestCcSummaries(3)
+    if (cc.length) base += '\n' + cc.map((c) => `CC(${c.projectId}): ${c.summary}`).join('\n')
   } catch {
-    return base
+    /* 무해 — CC 요약 없이 기존 다이제스트 유지 */
   }
+  // L6 — 루프 성적표(최근 7일 1회 통과율·재작업·실패) 한 줄. 집계할 게 없으면(total=0) 빈 문자열이라 생략.
+  try {
+    const ls = formatLoopStatsLine(loopStats(7))
+    if (ls) base += '\n' + ls
+  } catch {
+    /* 무해 — 루프 성적표 없이 기존 다이제스트 유지 */
+  }
+  return base
 }
 
 // Lain은 와이어드 지휘 + 등록 저장소 직접 파일 읽기·수정(옵션1 2026-06-15)을 한다 — 다파일 작업은 도구
@@ -439,8 +474,6 @@ type ManagerHooks = {
   onNaviEvent: (ev: NaviChatEvent) => void
   // #1: 채팅으로 받은 디스코드 설정을 저장+어댑터 재기동(ipc가 주입 — manager→discord 순환참조 회피).
   setDiscordConfig: (cfg: DiscordConfigPatch) => void
-  // 플래너(스펙 2026-07-05): 레인 도구(plan_manage 등)가 store를 바꾼 뒤 렌더러 플래너 뷰 갱신 요청.
-  refreshPlanner: () => void
 }
 let hooks: ManagerHooks = {
   refreshProjects: () => {},
@@ -448,25 +481,12 @@ let hooks: ManagerHooks = {
   refreshApprovals: () => {},
   onNaviEvent: () => {},
   setDiscordConfig: () => {},
-  refreshPlanner: () => {},
 }
 export function bindManager(h: ManagerHooks): void {
   hooks = h
 }
 
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] })
-
-// ── 플래너 이름→id resolve — 레인은 태그/섹션 id를 모르니 이름으로만 지정한다.
-// plan_tags.name은 UNIQUE라 upsertPlanTag(id 없이)를 그대로 부르면 동명 재등록 시 제약 위반 —
-// 기존 이름이 있으면 그 id를 재사용하고, 없을 때만 새로 만든다(plan_sections도 동형으로 통일).
-function resolvePlanTagId(name: string, color = '#b18cf0'): number {
-  const existing = listPlanTags().find((t) => t.name === name)
-  return existing ? existing.id : upsertPlanTag({ name, color })
-}
-function resolvePlanSectionId(name: string): number {
-  const existing = listPlanSections().find((s) => s.name === name)
-  return existing ? existing.id : upsertPlanSection({ name })
-}
 
 // ── 인라인 사용자 질문 (개선 #1 + B5 크로스서피스) — Lain이 선택형/체크형 질문을 던지고 답을 받아 이어간다.
 // ask_manager(worker→Lain)와 동형의 블로킹 패턴이되, 여기선 Lain→사용자 채팅 인라인 카드로 띄운다.
@@ -630,6 +650,120 @@ const lainServer = createSdkMcpServer({
         return ok(evs.map((e) => `- [${e.createdAt}] ${e.projectId}: ${e.event}`).join('\n'))
       },
     ),
+    // CC 세션 열람 — 트랜스크립트(~/.claude/projects) 직접 읽기라 연동 설정과 무관하게 항상 동작.
+    tool(
+      'list_cc_sessions',
+      '프로젝트의 클로드코드(데스크톱 앱·터미널) 세션 목록을 조회한다(워크트리 세션 포함, 최근순). 사용자가 "클로드코드에서 하던 것"을 언급하면 먼저 이걸로 세션 id를 찾고 read_cc_session/ask_cc_session으로 이어가라. 그 작업을 레인 작업으로 이어받으려면 adopt_cc_session을 쓴다.',
+      {
+        project_id: z.string().describe('프로젝트 id'),
+        limit: z.number().optional().describe('최대 건수(기본 15)'),
+      },
+      async ({ project_id, limit }) => {
+        const p = getProject(project_id)
+        if (!p) return ok(`프로젝트 없음: ${project_id}`)
+        const rows = listCcSessions(p.path, limit ?? 15)
+        if (!rows.length) return ok('이 프로젝트의 클로드코드 세션이 없다.')
+        return ok(
+          rows
+            .map(
+              (s) =>
+                `- ${s.id} | ${s.title} | ${new Date(s.lastAt).toLocaleString('sv-SE')} | ${s.entrypoint === 'claude-desktop' ? '데스크톱' : 'CLI'}${s.gitBranch ? ` | ${s.gitBranch}` : ''}`,
+            )
+            .join('\n'),
+        )
+      },
+    ),
+    tool(
+      'read_cc_session',
+      '특정 클로드코드 세션의 최근 대화 발췌를 읽는다(읽기 전용 — 원본 무변경). 그 세션에서 무슨 작업을 했는지 파악해 사용자에게 요약할 때 쓴다. 세션 id는 list_cc_sessions로 확인.',
+      {
+        project_id: z.string().describe('프로젝트 id'),
+        session_id: z.string().describe('세션 id (list_cc_sessions 출력)'),
+      },
+      async ({ project_id, session_id }) => {
+        const p = getProject(project_id)
+        if (!p) return ok(`프로젝트 없음: ${project_id}`)
+        const d = ccSessionDigest(p.path, session_id)
+        return ok(d ?? `세션을 찾지 못함: ${session_id}`)
+      },
+    ),
+    tool(
+      'ask_cc_session',
+      '클로드코드 세션을 읽기 전용 분기(fork)로 이어받아 질문한다 — 그 세션의 맥락을 가진 Claude가 답한다. 원본 세션은 절대 변하지 않는다. 파일 수정·명령 실행 불가(Read/Grep/Glob만 허용). 수십 초 걸릴 수 있으니 발췌(read_cc_session)로 부족할 때만 쓴다.',
+      {
+        project_id: z.string().describe('프로젝트 id'),
+        session_id: z.string().describe('세션 id (list_cc_sessions 출력)'),
+        prompt: z.string().describe('그 세션의 Claude에게 물을 질문'),
+      },
+      async ({ project_id, session_id, prompt }) => {
+        const p = getProject(project_id)
+        if (!p) return ok(`프로젝트 없음: ${project_id}`)
+        const file = findCcSessionFile(p.path, session_id)
+        if (!file) return ok(`세션을 찾지 못함: ${session_id}`)
+        // resume은 세션의 원 cwd 기준이어야 트랜스크립트가 잡힌다. 워크트리가 이미 지워졌으면 프로젝트 루트로.
+        const meta = ccSessionMeta(file)
+        const cwd = meta?.cwd && fs.existsSync(meta.cwd) ? meta.cwd : p.path
+        const ac = new AbortController()
+        const kill = setTimeout(() => ac.abort(), 180_000)
+        let text = '' // 스트림이 maxTurns/abort로 throw해도 그때까지 받은 답은 살린다(SDK 함정 — title.ts와 동일)
+        try {
+          const stream = query({
+            prompt,
+            options: {
+              cwd,
+              resume: session_id,
+              forkSession: true, // 원본 세션 파일에 이어 쓰지 않고 새 세션으로 분기 — 데스크톱 세션 무손상
+              allowedTools: ['Read', 'Grep', 'Glob'],
+              maxTurns: 16,
+              abortController: ac,
+              executable: 'node',
+              pathToClaudeCodeExecutable: CLAUDE_BIN,
+              ...tierQueryOptions(getSettings().naviModel, getSettings()),
+            },
+          })
+          for await (const msg of stream) {
+            if (msg.type === 'assistant') {
+              const t = ((msg as { message?: { content?: unknown } }).message?.content ?? [])
+              const joined = Array.isArray(t)
+                ? t
+                    .filter((b: { type?: string; text?: string }) => b?.type === 'text' && b.text)
+                    .map((b: { text?: string }) => b.text)
+                    .join('')
+                : ''
+              if (joined) text = joined
+            }
+          }
+        } catch (e) {
+          if (!text) return ok(`세션 질의 실패: ${String(e).slice(0, 200)}`)
+        } finally {
+          clearTimeout(kill)
+        }
+        return ok(text || '(응답 없음)')
+      },
+    ),
+    tool(
+      'adopt_cc_session',
+      'CC 세션에서 하다 만 작업을 레인 작업으로 승격(이어받기). 세션 내용을 핸드오프로 감싸 새 작업을 시작한다.',
+      {
+        project_id: z.string().describe('프로젝트 id'),
+        session_id: z.string().describe('세션 id (list_cc_sessions 출력)'),
+        goal: z.string().optional().describe('이어받아 완료할 목표 한 줄(생략 시 세션 작업 완결)'),
+        mode: z.enum(['interactive', 'autonomous']).optional(),
+      },
+      async ({ project_id, session_id, goal, mode }) => {
+        const p = getProject(project_id)
+        if (!p) return ok(`프로젝트 없음: ${project_id}`)
+        const digest = ccSessionDigest(p.path, session_id, 6000)
+        if (!digest) return ok(`CC 세션을 읽을 수 없음(id 확인): ${session_id}`)
+        const r = await startTask(project_id, { content: buildAdoptContent(digest, goal, session_id), mode })
+        hooks.refreshTasks()
+        hooks.refreshProjects()
+        if (r.error) return ok(`이어받기 작업 시작 실패: ${r.error}`)
+        if (r.queued)
+          return ok(`이어받기 작업 큐 적재됨 (task ${r.taskId}, mode ${r.mode ?? '?'}, ${r.queuePos ?? '?'}번째 대기) — 슬롯이 열리면 자동 착수한다.`)
+        return ok(`이어받기 작업 시작됨 (task ${r.taskId}, mode ${r.mode ?? '?'})`)
+      },
+    ),
     tool(
       'start_task',
       'Navi 작업을 시작한다(clarify 게이트 → worktree 격리 Navi → review). content를 주면 그 지시로 ad-hoc 시작, 없으면 프로젝트 TASK.md를 읽는다. mode=autonomous면 무개입(승인 0·테스트=판사) — verify_cmd 있는 프로젝트만.',
@@ -671,7 +805,7 @@ const lainServer = createSdkMcpServer({
           .enum(['claude', 'codex'])
           .optional()
           .describe(
-            '실행 엔진. codex=OpenAI Codex CLI(별도 설치·로그인 필요, Claude 크레딧 절약). 사용자가 명시로 원할 때만 codex — 단 codex는 승인 큐·ask_manager 질문·교훈/스킬 주입이 없고(샌드박스가 방어선) autonomous 미지원. 생략=claude',
+            '실행 엔진. codex=OpenAI Codex CLI(별도 설치·로그인 필요, Claude 크레딧 절약). 사용자가 명시로 원할 때만 codex — 단 codex는 승인 큐·ask_manager 질문·학습/스킬 주입이 없고(샌드박스가 방어선) autonomous 미지원. 생략=claude',
           ),
         depends_on: z
           .array(z.string())
@@ -679,8 +813,12 @@ const lainServer = createSdkMcpServer({
           .describe(
             "D2 — 선행 task id 배열. 전부 done(병합/브랜치 보존 결재)이 될 때까지 대기했다가 자동 착수한다. 'A 끝나면 B' 연쇄는 A의 start_task가 돌려준 task_id를 B의 depends_on에 넣어 즉시 등록해라 — 기억으로 챙기지 말 것(재시작·압축에도 L0이 진행시킨다)",
           ),
+        review_depth: z
+          .enum(['light', 'standard', 'adversarial'])
+          .optional()
+          .describe('리뷰 강도 — adversarial은 3렌즈 심사(비용↑). 생략 시 설정 기본값'),
       },
-      async ({ project_id, content, mode, permission_mode, thinking, disallowed_tools, skills, fast, engine, depends_on }) => {
+      async ({ project_id, content, mode, permission_mode, thinking, disallowed_tools, skills, fast, engine, depends_on, review_depth }) => {
         const r = await startTask(project_id, {
           content,
           mode,
@@ -691,6 +829,7 @@ const lainServer = createSdkMcpServer({
           fastMode: fast,
           engine,
           dependsOn: depends_on,
+          reviewDepth: review_depth,
         })
         hooks.refreshTasks()
         hooks.refreshProjects()
@@ -752,176 +891,23 @@ const lainServer = createSdkMcpServer({
         return ok(`의존 갱신됨: ${task_id} ← [${depends_on.join(', ') || '없음'}] — 선행이 전부 done이면 자동 착수한다.`)
       },
     ),
-    // 학습 철회 — 사용자 정정 시 잘못 학습된 교훈(+병합 파생본)을 즉시 주입 중단(2026-07-05 사고 재발 방지).
+    // 학습 철회 — 사용자 정정 시 잘못 학습된 학습(+병합 파생본)을 즉시 주입 중단(2026-07-05 사고 재발 방지).
     tool(
       'retract_lessons',
-      '사용자가 학습된 행동·사실이 틀렸다고 정정하면 호출한다(예: "그렇게 부르지 마", "그 규칙 틀렸어, 지워"). 키워드로 관련 교훈을 찾아 보관 처리해 주입을 즉시 중단한다 — 큐레이터 병합 파생본(umbrella)까지 함께. 설정·프로필 수정만으로는 잘못 학습된 교훈이 계속 주입되니, 학습 정정엔 반드시 이것도 호출해라.',
+      '사용자가 학습된 행동·사실이 틀렸다고 정정하면 호출한다(예: "그렇게 부르지 마", "그 규칙 틀렸어, 지워"). 키워드로 관련 학습을 찾아 보관 처리해 주입을 즉시 중단한다 — 큐레이터 병합 파생본(umbrella)까지 함께. 설정·프로필 수정만으로는 잘못 학습된 학습이 계속 주입되니, 학습 정정엔 반드시 이것도 호출해라.',
       {
         keyword: z
           .string()
           .min(2)
           .max(60)
-          .describe('철회할 교훈을 특정하는 핵심 키워드(교훈 본문에 실제로 들어 있는 고유 단어 — 이름, 규칙의 핵심어)'),
+          .describe('철회할 학습을 특정하는 핵심 키워드(학습 본문에 실제로 들어 있는 고유 단어 — 이름, 규칙의 핵심어)'),
       },
       async ({ keyword }) => {
         const removed = retractLessons(keyword)
-        if (!removed.length) return ok(`"${keyword}"에 해당하는 활성 교훈이 없다 — 키워드를 바꿔 다시 시도하거나, 교훈이 아니라 프로필(user_profile)/호칭(set_user_title) 문제인지 확인해라.`)
+        if (!removed.length) return ok(`"${keyword}"에 해당하는 활성 학습이 없다 — 키워드를 바꿔 다시 시도하거나, 학습이 아니라 프로필(user_profile)/호칭(set_user_title) 문제인지 확인해라.`)
         return ok(
-          `교훈 ${removed.length}건 보관(주입 중단):\n${removed.map((r) => `- [L${r.id}] ${r.lesson.replace(/\s+/g, ' ').slice(0, 100)}`).join('\n')}`,
+          `학습 ${removed.length}건 보관(주입 중단):\n${removed.map((r) => `- [L${r.id}] ${r.lesson.replace(/\s+/g, ' ').slice(0, 100)}`).join('\n')}`,
         )
-      },
-    ),
-    // ── 플래너(스펙 2026-07-05) — 자연어 시각 해석은 레인이, 저장·검증은 결정론 ──
-    tool(
-      'plan_manage',
-      '플래너에 일정(event)·할일(todo)을 등록·수정·완료·보관한다. 사용자가 일정/할일을 말하면 이걸로 등록하고 한 줄 확인해라. start_at은 로컬 "YYYY-MM-DDTHH:mm" — "내일 3시" 같은 자연어는 네가 현재 시각 기준으로 변환해서 넣는다. todo는 start_at 생략 가능(주면 마감일).',
-      {
-        action: z.enum(['add', 'update', 'done', 'undone', 'remove']),
-        id: z.number().optional().describe('update/done/undone/remove 시 — plan_view로 확인'),
-        kind: z.enum(['event', 'todo']).optional(),
-        title: z.string().max(200).optional(),
-        body: z.string().max(4000).optional().describe('메모·링크(md)'),
-        start_at: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/).optional(),
-        end_at: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/).optional(),
-        all_day: z.boolean().optional(),
-        recur: z.string().regex(/^(none|daily|weekly:[0-6]|monthly:([1-9]|[12][0-9]|3[01]))$/).optional(),
-        tag: z.string().optional().describe('태그 이름(없으면 생성)'),
-        section: z.string().optional().describe('체크리스트 섹션 이름(todo용, 없으면 생성)'),
-        remind_min: z.number().min(0).max(1440).optional(),
-        pinned: z.boolean().optional(),
-      },
-      async (a) => {
-        if (a.action === 'add') {
-          if (!a.title || !a.kind) return ok('add에는 kind와 title이 필요하다.')
-          if (a.kind === 'event' && !a.start_at) return ok('event에는 start_at이 필요하다.')
-          const tagId = a.tag ? resolvePlanTagId(a.tag) : null
-          const sectionId = a.section ? resolvePlanSectionId(a.section) : null
-          const id = upsertPlanItem({
-            kind: a.kind, title: a.title, body: a.body ?? '', startAt: a.start_at ?? null,
-            endAt: a.end_at ?? null, allDay: a.all_day ?? false, recur: a.recur ?? 'none',
-            tagId, sectionId, remindOffsetMin: a.remind_min ?? null, pinned: a.pinned ?? false, origin: 'lain',
-          })
-          hooks.refreshPlanner()
-          return ok(`등록됨 [P${id}] ${a.kind === 'event' ? `${a.start_at} ` : ''}${a.title}`)
-        }
-        if (!a.id) return ok('id가 필요하다 — plan_view로 확인해라.')
-        if (a.action === 'done' || a.action === 'undone') setPlanItemDone(a.id, a.action === 'done')
-        else if (a.action === 'remove') archivePlanItem(a.id)
-        else {
-          const cur = listPlanItems(true).find((i) => i.id === a.id)
-          if (!cur) return ok(`P${a.id} 없음`)
-          upsertPlanItem({
-            ...cur,
-            title: a.title ?? cur.title, body: a.body ?? cur.body,
-            startAt: a.start_at ?? cur.startAt, endAt: a.end_at ?? cur.endAt,
-            allDay: a.all_day ?? cur.allDay, recur: a.recur ?? cur.recur,
-            tagId: a.tag ? resolvePlanTagId(a.tag) : cur.tagId,
-            sectionId: a.section ? resolvePlanSectionId(a.section) : cur.sectionId,
-            remindOffsetMin: a.remind_min ?? cur.remindOffsetMin, pinned: a.pinned ?? cur.pinned,
-          })
-        }
-        hooks.refreshPlanner()
-        return ok(`${a.action} 완료 [P${a.id}]`)
-      },
-    ),
-    tool(
-      'plan_view',
-      '플래너 조회 — 기간 내 일정(반복 전개 포함)과 체크리스트를 본다. 브리핑·"오늘 뭐 있지"·대신 처리 판단에 사용.',
-      {
-        from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('기본 오늘'),
-        to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('기본 from+7일'),
-        include_done: z.boolean().optional(),
-      },
-      async ({ from, to, include_done }) => {
-        const items = listPlanItems().filter((i) => include_done || !i.done)
-        const now = new Date()
-        const f = from ? `${from}T00:00` : fmtLocal(new Date(now.getFullYear(), now.getMonth(), now.getDate()))
-        const tD = to ? parseLocal(`${to}T00:00`) : new Date(parseLocal(f).getTime() + 7 * 86_400_000)
-        const t = fmtLocal(tD)
-        const tags = new Map(listPlanTags().map((x) => [x.id, x.name]))
-        const secs = new Map(listPlanSections().map((x) => [x.id, x.name]))
-        const evs = items
-          .flatMap((i) => occurrencesInRange(i, f, t).map((o) => ({ i, o })))
-          .sort((a, b) => a.o.localeCompare(b.o))
-          .map(({ i, o }) => `- [P${i.id}] ${o.replace('T', ' ')} ${i.title}${i.tagId ? ` #${tags.get(i.tagId)}` : ''}${i.recur !== 'none' ? ' ↻' : ''}`)
-        const todos = items
-          .filter((i) => i.kind === 'todo')
-          .map((i) => `- [P${i.id}] ${i.done ? '☑' : '☐'} ${i.title}${i.sectionId ? ` (${secs.get(i.sectionId)})` : ''}${i.startAt ? ` 마감 ${i.startAt.slice(0, 10)}` : ''}${i.body ? ' 📎' : ''}`)
-        return ok(`기간 ${f.slice(0, 10)}~${t.slice(0, 10)}\n[일정]\n${evs.join('\n') || '(없음)'}\n[체크리스트]\n${todos.join('\n') || '(없음)'}`)
-      },
-    ),
-    tool(
-      'plan_tag_manage',
-      '플래너 태그 관리 — 목록·추가·이름변경·색변경·삭제. 태그 색은 #rrggbb.',
-      {
-        action: z.enum(['list', 'add', 'rename', 'recolor', 'remove']),
-        id: z.number().optional().describe('rename/recolor/remove 시 — list로 확인'),
-        name: z.string().max(40).optional().describe('add/rename 시 이름'),
-        color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().describe('add/recolor 시 색'),
-      },
-      async (a) => {
-        if (a.action === 'list') {
-          const tags = listPlanTags()
-          return ok(tags.length ? tags.map((t) => `- [T${t.id}] ${t.name} ${t.color}`).join('\n') : '태그 없음')
-        }
-        if (a.action === 'add') {
-          if (!a.name) return ok('add에는 name이 필요하다.')
-          const dup = listPlanTags().find((t) => t.name === a.name)
-          if (dup) return ok(`태그 '${a.name}' 이미 있음(기존 색 유지) — 색 변경은 action:'recolor'`)
-          const id = resolvePlanTagId(a.name, a.color ?? '#b18cf0')
-          hooks.refreshPlanner()
-          return ok(`태그 등록됨 [T${id}] ${a.name}`)
-        }
-        if (!a.id) return ok('id가 필요하다 — list로 확인해라.')
-        const cur = listPlanTags().find((t) => t.id === a.id)
-        if (!cur) return ok(`T${a.id} 없음`)
-        if (a.action === 'remove') {
-          deletePlanTag(a.id)
-        } else if (a.action === 'rename') {
-          if (!a.name) return ok('rename에는 name이 필요하다.')
-          upsertPlanTag({ id: cur.id, name: a.name, color: cur.color, sortOrder: cur.sortOrder })
-        } else if (a.action === 'recolor') {
-          if (!a.color) return ok('recolor에는 color가 필요하다.')
-          upsertPlanTag({ id: cur.id, name: cur.name, color: a.color, sortOrder: cur.sortOrder })
-        }
-        hooks.refreshPlanner()
-        return ok(`${a.action} 완료 [T${a.id}]`)
-      },
-    ),
-    tool(
-      'plan_section_manage',
-      '플래너 체크리스트 섹션 관리 — 목록·추가·이름변경·삭제·순서변경.',
-      {
-        action: z.enum(['list', 'add', 'rename', 'remove', 'reorder']),
-        id: z.number().optional().describe('rename/remove/reorder 시 — list로 확인'),
-        name: z.string().max(40).optional().describe('add/rename 시 이름'),
-        sort_order: z.number().optional().describe('reorder 시 새 순서값'),
-      },
-      async (a) => {
-        if (a.action === 'list') {
-          const secs = listPlanSections()
-          return ok(secs.length ? secs.map((s) => `- [S${s.id}] ${s.name} (order ${s.sortOrder})`).join('\n') : '섹션 없음')
-        }
-        if (a.action === 'add') {
-          if (!a.name) return ok('add에는 name이 필요하다.')
-          const id = resolvePlanSectionId(a.name)
-          hooks.refreshPlanner()
-          return ok(`섹션 등록됨 [S${id}] ${a.name}`)
-        }
-        if (!a.id) return ok('id가 필요하다 — list로 확인해라.')
-        const cur = listPlanSections().find((s) => s.id === a.id)
-        if (!cur) return ok(`S${a.id} 없음`)
-        if (a.action === 'remove') {
-          deletePlanSection(a.id)
-        } else if (a.action === 'rename') {
-          if (!a.name) return ok('rename에는 name이 필요하다.')
-          upsertPlanSection({ id: cur.id, name: a.name, sortOrder: cur.sortOrder, collapsed: cur.collapsed })
-        } else if (a.action === 'reorder') {
-          if (a.sort_order === undefined) return ok('reorder에는 sort_order가 필요하다.')
-          upsertPlanSection({ id: cur.id, name: cur.name, sortOrder: a.sort_order, collapsed: cur.collapsed })
-        }
-        hooks.refreshPlanner()
-        return ok(`${a.action} 완료 [S${a.id}]`)
       },
     ),
     tool(
@@ -1110,6 +1096,39 @@ const lainServer = createSdkMcpServer({
         return ok('전체 Navi에 broadcast 전달 — 각 Navi 진행·응답은 Navi 채팅·작업 드로어(UI/폰)에서 확인(@all).')
       },
     ),
+    // 첫 실행 온보딩 — 워크스페이스 루트를 채팅으로 바꾸는 경로(설정 UI를 못 찾아도 대화만으로 시작 가능).
+    tool(
+      'set_workspace_root',
+      '프로젝트들이 모여 있는 상위 폴더(워크스페이스 루트)를 바꾸고 즉시 재스캔한다. 등록된 프로젝트가 없거나 사용자가 코드 위치를 알려줄 때 호출한다. 스캔 대상은 루트 바로 아래가 아니라 하위 폴더(기본 apps/games/tools — 환경설정 scanDirs 또는 환경변수 LAIN_SCAN_DIRS로 변경) 안의 프로젝트다.',
+      {
+        path: z.string().min(1).describe('워크스페이스 루트의 절대경로(존재하는 폴더여야 한다)'),
+      },
+      async ({ path: input }) => {
+        const v = validateWorkspaceRoot(input)
+        if (!v.ok)
+          return ok(
+            `워크스페이스 루트를 바꾸지 않았다 — '${input.trim()}'는 ${v.reason}. 실제 폴더 경로를 다시 확인해 달라고 해라.`,
+          )
+        saveSettings({ workspaceRoot: v.root })
+        const n = scanProjects()
+        hooks.refreshProjects()
+        emitSettingsUpdated?.() // 렌더러 설정 표시 라이브 갱신
+        const info = workspaceInfo()
+        const lines = [
+          `워크스페이스 루트를 ${v.root}(으)로 저장하고 재스캔했다 — ${n}개 등록/갱신, 현재 등록 ${listProjects().length}개.`,
+          `스캔한 하위 폴더: ${info.scanDirs.join(', ')} — 이 폴더들 안의 프로젝트만 잡힌다. 구조가 다르면 환경설정에서 스캔 폴더를 바꾸거나 프로젝트를 수동으로 추가해야 한다.`,
+        ]
+        // 설정 표시=실제 적용 일치 — env가 앱 설정보다 우선하므로(registry.ts workspaceRoot), 저장해도
+        // 실제 스캔은 env 값을 쓴다는 사실을 숨기지 않고 그대로 알린다.
+        if (info.envRootOverride)
+          lines.push(
+            `⚠️ 환경변수 LAIN_WORKSPACE가 설정돼 있어 실제 스캔 루트는 여전히 ${info.root}다 — 방금 저장한 값은 그 환경변수를 지우기 전까지 적용되지 않는다. 이 사실을 사용자에게 그대로 알려라.`,
+          )
+        if (info.envScanOverride)
+          lines.push('⚠️ 스캔 하위 폴더도 환경변수 LAIN_SCAN_DIRS가 앱 설정보다 우선한다.')
+        return ok(lines.join('\n'))
+      },
+    ),
     tool('scan_projects', '프로젝트 루트를 다시 스캔해 새 프로젝트를 등록한다.', {}, async () => {
       const n = scanProjects()
       hooks.refreshProjects()
@@ -1145,14 +1164,10 @@ const lainServer = createSdkMcpServer({
     ),
     tool(
       'refresh_status',
-      '프로젝트 현황(git·test·TODO)을 새로 수집한다. project_id 생략 시 활성 프로젝트 전체.',
+      '프로젝트 현황(git·test·TODO)을 새로 수집한다. project_id 생략 시 등록 프로젝트 전체.',
       { project_id: z.string().optional() },
       async ({ project_id }) => {
-        const ids = project_id
-          ? [project_id]
-          : listProjects()
-              .filter((p) => p.enabled)
-              .map((p) => p.id)
+        const ids = project_id ? [project_id] : listProjects().map((p) => p.id)
         let n = 0
         for (const id of ids) {
           const p = getProject(id)
@@ -1199,7 +1214,7 @@ const lainServer = createSdkMcpServer({
     ),
     tool(
       'remove_project',
-      '내비(프로젝트)를 보드에서 제거(숨김)한다. 작업·대화·교훈·현황 기록은 보존되며, 같은 폴더를 다시 추가하면 그대로 복원된다(누적 학습은 파괴하지 않는다). 디스크 폴더도 안 건드린다.',
+      '내비(프로젝트)를 보드에서 제거(숨김)한다. 작업·대화·학습·현황 기록은 보존되며, 같은 폴더를 다시 추가하면 그대로 복원된다(누적 학습은 파괴하지 않는다). 디스크 폴더도 안 건드린다.',
       { project_id: z.string().describe('제거할 프로젝트 id (list_projects로 확인)') },
       async ({ project_id }) => {
         const p = getProject(project_id)
@@ -1333,7 +1348,15 @@ const lainServer = createSdkMcpServer({
           if (!title || !prompt || !cron)
             return ok('create는 title·prompt·cron이 모두 필요하다.')
           const id = insertRoutine({ projectId: project_id ?? null, title, prompt, cron })
-          return ok(`루틴 생성됨 (id ${id})`)
+          // 전역 스위치가 off면 scheduler가 디스패치를 막는다 — '등록됐다'만 보고하면 사용자는 도는 줄 안다.
+          // 채팅·텔레그램 어느 표면에서 만들든 이 경고가 같이 나가야 한다.
+          const gated = !getSettings().routinesEnabled
+          return ok(
+            `루틴 생성됨 (id ${id})` +
+              (gated
+                ? ' — 다만 전역 루틴 실행이 꺼져 있어 등록만 되고 실행되지 않는다(환경설정에서 켜야 한다). 이 문장을 사용자에게 그대로 알려라.'
+                : ''),
+          )
         }
         // enable/disable/delete는 routine_id 필수 — 지어내지 말고 list_routines로 확인하게 안내.
         if (!routine_id) return ok('routine_id가 필요하다 — list_routines로 id를 확인해라.')
@@ -1410,7 +1433,7 @@ const lainServer = createSdkMcpServer({
     ),
     tool(
       'user_profile',
-      `사용자 프로필(user.md, 상한 ${USER_PROFILE_MAX}자)을 갱신한다. 프로필=사용자 자체의 지속 사실(호칭·선호·습관·기술 수준) — 작업 규칙(교훈)과 구분. add=끝에 추가 / replace=old_text를 content로 교체 / remove=old_text 삭제. 상한 초과면 에러가 돌아오니 같은 턴에서 낡은 항목을 병합·정리해 재시도해라(자동 삭제 없음).`,
+      `사용자 프로필(user.md, 상한 ${USER_PROFILE_MAX}자)을 갱신한다. 프로필=사용자 자체의 지속 사실(호칭·선호·습관·기술 수준) — 작업 규칙(학습)과 구분. add=끝에 추가 / replace=old_text를 content로 교체 / remove=old_text 삭제. 상한 초과면 에러가 돌아오니 같은 턴에서 낡은 항목을 병합·정리해 재시도해라(자동 삭제 없음).`,
       {
         action: z.enum(['add', 'replace', 'remove']),
         old_text: z.string().optional().describe('replace/remove — 대상 부분 문자열(정확히 일치)'),
@@ -1643,7 +1666,7 @@ async function tryFastChat(
   text: string,
   emit: (ev: ChatEvent) => void,
   conversationId: string,
-  origin: 'pc' | 'telegram' | 'discord',
+  origin: 'pc' | 'telegram',
   abort: AbortController,
   overlayCtx: string, // 오버레이 인지 맥락 — sendToManager가 소모적으로 취해 넘긴다(여기선 clear 안 함)
 ): Promise<'answered' | 'escalate' | 'aborted'> {
@@ -1675,7 +1698,7 @@ ${digest}
         cwd: AGENT_CWD,
         systemPrompt: sys,
         allowedTools: [],
-        maxTurns: 2, // 1은 error_max_turns로 텍스트 유실([[lain-sdk-maxturns-error-max-turns]]) — 도구 없어 2로 충분
+        maxTurns: 2, // 1은 error_max_turns로 텍스트 유실(SDK maxTurns 함정) — 도구 없어 2로 충분
         thinking: { type: 'disabled' },
         ...tierQueryOptions(getSettings().managerModel, getSettings()), // 본체와 동일 모델(local 라우팅 포함)
         executable: 'node',
@@ -1706,7 +1729,7 @@ ${digest}
     addMessage('manager', 'user', text, conversationId, [], origin)
     setConversationTitleIfEmpty(conversationId, text)
     touchConversation(conversationId)
-    if (origin === 'telegram' || origin === 'discord')
+    if (origin === 'telegram')
       rendererMirror?.({ kind: 'user', text, origin, conversationId })
     addMessage('manager', 'assistant', v.text, conversationId)
   } catch (e) {
@@ -1757,20 +1780,11 @@ export function emitManagerCard(text: string, conversationId?: string): void {
 const BROWSER_HINT =
   '웹 브라우저다 — 창 제목이 지금 보는 페이지 제목이다. 페이지 내용에서 사용자가 무엇을 하려는지(검색·문서 읽기·쇼핑·영상 시청·개발 등) 파악하고 그 목적에 맞춰 판단하라.'
 const APP_HINTS: [string, string][] = [
-  [
-    'discord',
-    '채팅/음성 앱이다 — 어느 서버·채널에서 누구와 무슨 대화를 하는지, 공유된 이미지·파일 내용까지 스크린샷에서 읽어라. 발신자 이름을 반드시 확인해 사용자 본인 메시지와 남의 메시지를 구별하라.',
-  ],
-  ['kakaotalk', '메신저다 — 누구와 무슨 대화인지, 공유된 이미지 내용까지 스크린샷에서 읽어라. 발신자를 구별하라.'],
-  ['slack', '업무 메신저다 — 채널·상대·대화 주제를 스크린샷에서 읽고 발신자를 구별하라.'],
   ['chrome', BROWSER_HINT],
   ['msedge', BROWSER_HINT],
   ['firefox', BROWSER_HINT],
   ['whale', BROWSER_HINT],
   ['code', 'IDE(VS Code)다 — 열린 파일·코드·에러 표시를 읽고 개발 맥락으로 판단하라.'],
-  ['fl64', 'DAW(FL Studio)다 — 음악 작업 중이다. 패턴·플레이리스트·믹서 상태를 보라.'],
-  ['winword', '문서 편집 중이다 — 문서 내용·제목에서 무엇을 쓰는지 파악하라.'],
-  ['excel', '스프레드시트 작업 중이다 — 시트 내용에서 무엇을 정리하는지 파악하라.'],
 ]
 const appHint = (app: string): string => {
   const a = app.toLowerCase()
@@ -1822,15 +1836,7 @@ export async function reactToObservation(obs: Observation): Promise<void> {
     if (obsLessons.length) bumpLessonInject(obsLessons.map((l) => l.id))
     const sys = `${personaCore()}
 
-# 지금 상황 — 유저 감시(오버레이)
-사용자가 다른 앱에서 작업하는 걸 '어깨너머로' 지켜보고 있다(화면 우하단 작은 오버레이로 말한다). 지금 사용자는 화면에서 직접 작업 중이고 너를 보고 있지 않다.
-진짜로 도움이 될 한마디가 있을 때만 짧고 담백하게(한두 문장) 말한다.
-- 조언·방향·주의 줄 게 없으면 정확히 '<<SILENT>>'만 출력한다. 대부분의 경우 침묵이 맞다 — 어색한 추임새·인사·"지켜보는 중" 같은 군더더기 금지.
-- 같은 말 반복 금지. 새로 보탤 게 있을 때만.
-- 스크린샷은 대충 훑지 말고 실제 내용을 읽어라 — 창 단위 캡처라 텍스트가 판독 가능하다. 채팅이면 발신자·대화 내용, 이미지가 있으면 그 이미지 내용까지 본다.
-- 화면 속 채팅·문서에서 발신자나 행동 주체가 누구인지 불확실하면 단정하지 마라 — "누가 응답/처리해야 한다" 같은 추측성 권고 대신 '<<SILENT>>'. 화면과 아래 맥락에서 직접 확인된 사실만 말한다.${aliasLine}
-- 아래 <world-state>·<recent-dialogue>는 사용자와 네가 나눈 대화 맥락이다 — 사용자가 이미 말한 계획·요청과 화면 내용을 연결해서 판단하라(예: 사용자가 하겠다고 한 일을 남의 요청으로 오인하지 않기).
-- 잘 모르는 프로그램 사용법 등 더 조사해야 제대로 도울 수 있으면 정확히 '<<RESEARCH>>'만 출력한다(내가 웹으로 알아본 뒤 다시 답한다).${recent}
+${buildOverlayPrompt(appHint(obs.app))}${aliasLine}${recent}
 <관찰>
 앱: ${obs.app}${appHint(obs.app) ? `\n해석 지침: ${appHint(obs.app)}` : ''}
 창 제목: ${obs.title || '(없음)'}
@@ -1907,9 +1913,7 @@ ${digest}
     recentReactions.push(reply)
     if (recentReactions.length > REACTION_MEM_MAX) recentReactions = recentReactions.slice(-REACTION_MEM_MAX)
     // 본체가 다음 턴에 이 발화를 맥락으로 인지하도록 버퍼에 쌓는다(recentReactions와 동형 캡).
-    pendingOverlayForManager.push(reply)
-    if (pendingOverlayForManager.length > OVERLAY_CTX_MAX)
-      pendingOverlayForManager = pendingOverlayForManager.slice(-OVERLAY_CTX_MAX)
+    pushManagerNotice(reply)
   } finally {
     reacting = false
   }
@@ -2161,7 +2165,7 @@ export async function sendToManager(
   const nowAnchor = new Date().toISOString().slice(0, 16).replace('T', ' ')
   // 출처 주입 — 매 메시지에 PC/모바일 채널을 명시해 Lain이 맥락에 맞게 응답하도록 한다.
   const originLabel = origin === 'telegram' ? '📱 모바일(텔레그램)' : origin === 'discord' ? '📞 음성통화(디스코드)' : '🖥 PC'
-  // 교훈 주입 — 레인 전역 교훈(scope=global, sentinel '__lain__')을 메시지 내용 기준 top-K로 주입.
+  // 학습 주입 — 레인 전역 학습(scope=global, sentinel '__lain__')을 메시지 내용 기준 top-K로 주입.
   // 누적된 사용자 선호·컨벤션·원칙을 레인이 매 응답에 적용하게 한다(개인화). 주입=사용(inject_count·last_used_at).
   const lainLessons = lessonsForProject('__lain__', 6, text)
   const lessonsText = lainLessons.length
@@ -2202,16 +2206,9 @@ export async function sendToManager(
 
   // 이미지 파일 → SDKUserMessage content block. SDK(Anthropic)가 받는 media_type은 4종뿐.
   const imageAttachments = attachments.filter((a) => a.isImage)
-  type ImgMedia = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
-  type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: ImgMedia; data: string } }
   type TextBlock = { type: 'text'; text: string }
   const promptContent: (TextBlock | ImageBlock)[] = [{ type: 'text', text: fullText }]
-  for (const img of imageAttachments) {
-    promptContent.push({
-      type: 'image',
-      source: { type: 'base64', media_type: img.mimeType as ImgMedia, data: img.data },
-    })
-  }
+  promptContent.push(...toImageBlocks(imageAttachments))
   // 이미지가 있으면 SDKUserMessage 스트림, 없으면 단순 문자열
   const promptParam =
     imageAttachments.length > 0
@@ -2279,27 +2276,25 @@ export async function sendToManager(
         // 사용자 승인(2026-06-19): Lain에게 클로드코드 전체 도구 허용(파일·셸·Workflow 등).
         // 등록된 모든 프로젝트 경로를 additionalDirectories로 연다. 시크릿 파일만 차단(canUseTool).
         additionalDirectories: listProjects().map((p) => p.path),
-        ...managerAgentOptions(getSettings()),
+        ...managerAgentOptions(getSettings(), { text: modelText ?? text, attachments: attachments.length }),
         maxTurns: MANAGER_MAX_TURNS, // 다파일 직접 작업 여유 (§9b) — 초과 시 아래에서 이어가기/보고
         ...tierQueryOptions(getSettings().managerModel, getSettings()), // §9b 티어링 — 설정에서 결정(local 라우팅 포함)
         ...skillOptions(null, getSettings().skillsEnabled, getSettings().curatedPlugins),
         // Electron 안에서 process.execPath는 electron.exe → CLI 스폰 실패. 시스템 node 사용.
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
+        // 비밀 파일 데노리스트 (§24 Phase1) — Lain은 전 저장소 접근 권한이라 .env 노출면이 크다.
+        // canUseTool이 아니라 PreToolUse 훅에 둔다: auto-allow된 호출(기본 허용 Read, acceptEdits의
+        // Edit/Write)은 canUseTool을 아예 거치지 않아 차단이 발동하지 않았다(실측).
+        ...preToolUseGuard(secretDeny),
         // 모든 도구 허용 (사용자 승인 2026-06-19, Lain 기여). 단 시크릿 파일 접근만 차단.
         // 작업 유실 방지는 권한 차단이 아니라 배포 가드(deploy.ps1: 커밋 안 된/구버전 소스 배포 거부)로 한다.
         canUseTool: async (toolName, input) => {
-          // 비밀 파일 데노리스트 (§24 Phase1) — Lain은 전 저장소 접근 권한이라 .env 노출면이 큼.
-          if (blocksSecretFile(toolName, input)) {
-            return { behavior: 'deny', message: SECRET_DENY_MESSAGE }
-          }
-          // 셸 명령·인자에 박힌 시크릿 경로 차단(§3 i15s) — blocksSecretFile은 파일도구 input 전용이라
-          // Bash/PowerShell의 `cat .env` 같은 셸 인자는 못 막는다. 문자열 인자를 모아 경로 토큰을 검사.
-          const argText = Object.values((input ?? {}) as Record<string, unknown>)
-            .filter((v): v is string => typeof v === 'string')
-            .join(' ')
-          if (argText && blocksSecretPath(argText)) {
-            return { behavior: 'deny', message: SECRET_DENY_MESSAGE }
+          // 시크릿 차단은 PreToolUse 훅이 이미 했다(모든 호출 경유). 여기 한 번 더 보는 것은
+          // 훅이 어떤 이유로 등록되지 않았을 때를 위한 이중 방어 — 순수 판정이라 비용 0.
+          const secret = secretDeny(toolName, input)
+          if (secret) {
+            return { behavior: 'deny', message: secret.message }
           }
           // 시스템/PC 파괴 명령 게이트(HANDOFF 2026-07-04) — Lain은 셸 전권이라(2026-06-19 승인)
           // shutdown·format·레지스트리 삭제 같은 OS 파괴만은 승인 큐(PC+폰 버튼)로 막는다.
@@ -2611,7 +2606,7 @@ export async function sendToManager(
       // 턴 한도 도달 — init에서 세션 id가 저장돼 있어 같은 세션 resume으로 이어갈 수 있다.
       hitMaxTurns = true
       // ⚠ result 메시지를 못 받는 throw 경로 — 여기서 점유를 기록하지 않으면 무한세션 압축 게이트가
-      // 영영 안 걸려 트랜스크립트가 무한 증가한다(점유가 stale). 마지막 점유(또는 보수적 임계값)로 기록. [[lain-sdk-maxturns-error-max-turns]]
+      // 영영 안 걸려 트랜스크립트가 무한 증가한다(점유가 stale). 마지막 점유(또는 보수적 임계값)로 기록. SDK maxTurns 함정
       const occ = occupancyForMaxTurns(lastOccupancy, getSettings().contextCompactThreshold)
       if (occ > 0) setConversationContextTokens(conversationId, occ)
     } else if (/aborted by user/i.test(msg)) {

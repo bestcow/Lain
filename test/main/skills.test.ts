@@ -24,8 +24,8 @@ describe('parseInstalledPlugin', () => {
 
 describe('assembleSkillOptions', () => {
   const plugins = [{ type: 'local' as const, path: 'C:/x/superpowers/6.0.3', skipMcpDiscovery: true }]
-  it('enabled=false면 빈 객체(회귀0)', () => {
-    expect(assembleSkillOptions(plugins, null, false)).toEqual({})
+  it('enabled=false여도 settingSources:[]는 유지(사용자 전역 설정 유입 차단)', () => {
+    expect(assembleSkillOptions(plugins, null, false)).toEqual({ settingSources: [] })
   })
   it('enabled=true·미할당이면 all + settingSources:[]', () => {
     expect(assembleSkillOptions(plugins, null, true)).toEqual({ plugins, settingSources: [], skills: 'all' })
@@ -36,7 +36,7 @@ describe('assembleSkillOptions', () => {
   it('할당 배열이면 그 목록', () => {
     expect(assembleSkillOptions(plugins, ['systematic-debugging'], true).skills).toEqual(['systematic-debugging'])
   })
-  it('플러그인 0개면 빈 객체(폴백)', () => {
-    expect(assembleSkillOptions([], ['x'], true)).toEqual({})
+  it('플러그인 0개면 로드는 없고 settingSources:[]만(폴백)', () => {
+    expect(assembleSkillOptions([], ['x'], true)).toEqual({ settingSources: [] })
   })
 })

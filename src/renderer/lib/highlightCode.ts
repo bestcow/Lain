@@ -108,15 +108,11 @@ export function tokenizeCode(code: string, lang: string): CodeToken[] {
       if (m) {
         const start = offset + m.index
         const end = offset + lineText.length
-        const overlapsString = spans.some(
-          (s) => s.type === 'string' && s.start < end && s.end > start && s.start <= start,
-        )
         // 주석 시작 지점 자체가 기존 문자열 스팬 내부에 있으면(예: "http://") 스킵.
         const startInsideString = spans.some((s) => s.type === 'string' && start >= s.start && start < s.end)
         if (!startInsideString) {
           spans.push({ start, end, type: 'comment' })
         }
-        void overlapsString
       }
       offset += lineText.length + 1 // '\n' 만큼
     }

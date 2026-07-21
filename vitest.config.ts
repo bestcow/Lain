@@ -6,9 +6,8 @@ import path from 'node:path'
 
 export default defineConfig({
   test: {
-    // 메인은 node, 렌더러(src/renderer/**)만 jsdom — highlight 등 JSX 반환 헬퍼용.
+    // 전 테스트 node 환경 — 렌더러 테스트도 DOM 미사용(ReactNode 구조 검사).
     environment: 'node',
-    environmentMatchGlobs: [['src/renderer/**', 'jsdom']],
     include: ['test/**/*.{test,spec}.{ts,tsx}'],
     globals: false,
   },

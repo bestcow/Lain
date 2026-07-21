@@ -112,11 +112,11 @@ export function redactSecrets(text: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 교훈 주입 인젝션 스캔 (§자기개선) — origin='agent' 교훈을 프롬프트에 주입하기 전 게이트.
-// 단일 PC라 user origin은 신뢰루트(스캔 안 함). agent가 생성한 교훈에 프롬프트 탈취 시도가
+// 학습 주입 인젝션 스캔 (§자기개선) — origin='agent' 학습을 프롬프트에 주입하기 전 게이트.
+// 단일 PC라 user origin은 신뢰루트(스캔 안 함). agent가 생성한 학습에 프롬프트 탈취 시도가
 // 섞여 들어가는 것을 결정론으로 잡는다. 소형 정규식셋 + invisible char + 크기 한도.
 
-const LESSON_MAX_BYTES = 2048 // 단일 교훈 2KB 초과는 비정상(정상 교훈은 한두 문장).
+const LESSON_MAX_BYTES = 2048 // 단일 학습 2KB 초과는 비정상(정상 학습은 한두 문장).
 
 // 보이지 않는/방향제어 문자 — zero-width, BiDi override 등(프롬프트 위장에 악용).
 // U+200B-200D(ZW), U+200E/200F(LRM/RLM), U+202A-202E(BiDi embed/override), U+2060(WJ), U+FEFF(BOM).
@@ -132,7 +132,7 @@ const INJECTION_RE: { re: RegExp; reason: string }[] = [
 ]
 
 /**
- * 교훈 본문에 프롬프트 인젝션 시도가 있으면 {blocked:true, reason}. 없으면 {blocked:false}.
+ * 학습 본문에 프롬프트 인젝션 시도가 있으면 {blocked:true, reason}. 없으면 {blocked:false}.
  * insertLesson에서 origin==='agent'일 때만 호출 → blocked면 status='archived'로 격리(소비처 책임).
  * 결정론·순수(LLM 없음).
  */
@@ -140,11 +140,11 @@ export function scanLessonInjection(text: string): { blocked: boolean; reason?: 
   return scanInjectionPayload(text, LESSON_MAX_BYTES)
 }
 
-const SKILL_MAX_BYTES = 24 * 1024 // 스킬 md는 절차 문서라 교훈보다 크다 — 24KB 초과는 비정상
+const SKILL_MAX_BYTES = 24 * 1024 // 스킬 md는 절차 문서라 학습보다 크다 — 24KB 초과는 비정상
 
 /**
  * 스킬 md/사용자 프로필처럼 프롬프트·도구결과로 재주입되는 에이전트 저작물의 인젝션 스캔(학습루프 T1/T5).
- * 교훈과 같은 패턴셋, 크기 한도만 문서 규모(24KB). 결정론·순수.
+ * 학습과 같은 패턴셋, 크기 한도만 문서 규모(24KB). 결정론·순수.
  */
 export function scanSkillInjection(text: string): { blocked: boolean; reason?: string } {
   return scanInjectionPayload(text, SKILL_MAX_BYTES)
@@ -178,6 +178,9 @@ function normForCompare(p: string): string {
  * 절대경로가 시크릿 디렉터리(HOME/.ssh·.aws·.gnupg·.kube·.docker) 또는 lain DATA_DIR
  * 하위(자기 자신 포함)면 true. isSecretFile의 디렉터리 단위 보강 — basename이 평범해도 차단.
  * 결정론·순수(LLM 없음). 절대경로 전용(상대경로는 그대로 false 처리되어 안전).
+ *
+ * ⚠ 계약: 인자는 **경로 하나**다. 셸 명령문을 통째로 넣으면 내부 path.resolve가 cwd를 앞에
+ * 붙여버려 사실상 항상 false다 — 명령문은 blocksSecretCommand를 써라.
  */
 export function blocksSecretPath(absPath: string): boolean {
   if (!absPath) return false
@@ -192,6 +195,42 @@ export function blocksSecretPath(absPath: string): boolean {
   for (const name of SECRET_DIR_NAMES) {
     const dir = `${home}/${name}`
     if (target === dir || target.startsWith(`${dir}/`)) return true
+  }
+  return false
+}
+
+// 셸 토큰화(경량) — 따옴표(" ')로 감싼 구간은 공백을 포함해 한 토큰, 나머지는 공백 분리.
+const SHELL_TOKEN_RE = /"([^"]*)"|'([^']*)'|([^\s"']+)/g
+
+/**
+ * 토큰에서 절대경로 조각만 뽑는다 — `--file=C:\x`·`2>/etc/x` 같은 접두는 떼고 경로만 남긴다.
+ * 상대경로(`data/lain.db`)는 null — blocksSecretPath가 cwd를 붙여 오판하는 것을 막는다.
+ */
+function absPathIn(token: string): string | null {
+  const win = /[A-Za-z]:[\\/]/.exec(token)
+  if (win) return token.slice(win.index)
+  const posix = /(?:^|[=>|;&])([\\/][^\s]*)/.exec(token)
+  return posix ? posix[1] : null
+}
+
+/**
+ * 셸 명령문에 시크릿 디렉터리를 가리키는 절대경로가 섞여 있으면 true
+ * (`type C:\Users\me\.ssh\id_rsa`, `cat C:/lain/data/lain.db` 등).
+ * blocksSecretPath는 경로 하나가 계약이라 명령문을 통째로 넘기면 항상 false다 — 호출부가
+ * 오용하지 않게 여기서 토큰화(따옴표 보존)한 뒤 절대경로 토큰만 개별로 넘긴다.
+ * 결정론·순수(LLM 없음).
+ */
+export function blocksSecretCommand(cmd: string): boolean {
+  if (!cmd) return false
+  SHELL_TOKEN_RE.lastIndex = 0 // 전역 정규식 재사용 — 이전 호출의 lastIndex 잔재 제거
+  let m: RegExpExecArray | null
+  while ((m = SHELL_TOKEN_RE.exec(cmd))) {
+    const token = m[1] ?? m[2] ?? m[3] ?? ''
+    const p = absPathIn(token)
+    if (p && blocksSecretPath(p)) {
+      SHELL_TOKEN_RE.lastIndex = 0
+      return true
+    }
   }
   return false
 }

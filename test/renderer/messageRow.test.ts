@@ -2,9 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   sameMessageRenderFields,
   chatRowPropsEqual,
-  naviRowPropsEqual,
   type ChatRowCompareProps,
-  type NaviRowCompareProps,
 } from '../../src/renderer/lib/messageRow'
 import type { ChatMessage } from '../../src/shared/types'
 
@@ -103,38 +101,8 @@ describe('chatRowPropsEqual — ChatPanel 행 memo', () => {
   it('참조가 다른 동일 메시지 객체는 스킵(스트리밍 시 안 바뀐 행)', () => {
     expect(chatRowPropsEqual(chatProps(), chatProps({ m: { ...base } }))).toBe(true)
   })
-})
 
-const naviProps = (over: Partial<NaviRowCompareProps> = {}): NaviRowCompareProps => ({
-  m: base,
-  query: '',
-  isActiveHit: false,
-  queued: false,
-  sameSpeaker: false,
-  onMessageContext: undefined,
-  onCancelQueued: undefined,
-  ...over,
-})
-
-describe('naviRowPropsEqual — NaviChatPanel 행 memo', () => {
-  it('모든 prop 동일하면 true', () => {
-    expect(naviRowPropsEqual(naviProps(), naviProps())).toBe(true)
-  })
-
-  it('content가 바뀌면 false', () => {
-    expect(naviRowPropsEqual(naviProps(), naviProps({ m: { ...base, content: '다름' } }))).toBe(false)
-  })
-
-  it('projectId가 바뀌면 false(worker-avatar 색 반영)', () => {
-    expect(naviRowPropsEqual(naviProps(), naviProps({ m: { ...base, projectId: 'p2' } }))).toBe(false)
-  })
-
-  it.each([
-    ['isActiveHit', { isActiveHit: true }],
-    ['queued', { queued: true }],
-    ['sameSpeaker', { sameSpeaker: true }],
-    ['query', { query: 'x' }],
-  ])('%s가 바뀌면 false', (_label, patch) => {
-    expect(naviRowPropsEqual(naviProps(), naviProps(patch))).toBe(false)
+  it('projectId가 바뀌면 false(NaviChatPanel worker-avatar 색 반영)', () => {
+    expect(chatRowPropsEqual(chatProps(), chatProps({ m: { ...base, projectId: 'p2' } }))).toBe(false)
   })
 })

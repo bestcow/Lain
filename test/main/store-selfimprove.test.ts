@@ -167,10 +167,10 @@ describe('routines CRUD + 스케줄', () => {
   })
 })
 
-describe('교훈 inject vs reuse 적합도 랭킹 (lessonsForProject)', () => {
-  it('여러 번 주입됐으나 한 번도 적용(reuse) 안 된 교훈은 동률에서 강등된다', () => {
+describe('학습 inject vs reuse 적합도 랭킹 (lessonsForProject)', () => {
+  it('여러 번 주입됐으나 한 번도 적용(reuse) 안 된 학습은 동률에서 강등된다', () => {
     const pid = 'proj-fitness'
-    // 두 교훈: 같은 키워드 매칭·같은 reuse 0. A는 주입 3회(미적용→fitness 0), B는 주입 0회(중립 1.0).
+    // 두 학습: 같은 키워드 매칭·같은 reuse 0. A는 주입 3회(미적용→fitness 0), B는 주입 0회(중립 1.0).
     const a = insertLesson({
       projectId: pid,
       taskId: 't1',
@@ -196,7 +196,7 @@ describe('교훈 inject vs reuse 적합도 랭킹 (lessonsForProject)', () => {
     expect(ib).toBeLessThan(ia)
   })
 
-  it('주입은 last_used_at을 갱신한다 — 적용 중 교훈은 보존(자동 만료 폐지)', () => {
+  it('주입은 last_used_at을 갱신한다 — 적용 중 학습은 보존(자동 만료 폐지)', () => {
     const id = insertLesson({
       projectId: 'proj-lastused',
       taskId: 't1',

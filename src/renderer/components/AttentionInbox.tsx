@@ -1,7 +1,7 @@
 // Attention Inbox — 너를 기다리는 것 전부를 한 곳에서 처리(승인·질문·결재).
 // 별도 백엔드 없음: App이 이미 들고 있는 approvals + tasks(blocked·review)를
 // 합쳐 보여주는 파생 뷰. 액션도 기존 IPC 재사용(resolveApproval·answerClarify·resolveReview).
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import type { Approval, Task } from '../../shared/types'
 import { elapsedMinutes, fmtElapsed, longestWait, shouldRefocusInboxRow } from '../lib/chat'
 import { ConfirmWindow } from './ConfirmWindow'
@@ -223,8 +223,21 @@ function ClarifyRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) =
 }
 
 // review 도달 작업의 결재(§8-9) — 병합/브랜치/폐기
-function ReviewRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) => void }) {
+// 처리하면 이 행은 목록에서 사라지므로, main이 돌려주는 사유(병합 실패 등)는 패널 상단 줄(onResult)로 올린다.
+function ReviewRow({
+  t,
+  onOpenTask,
+  onResult,
+}: {
+  t: Task
+  onOpenTask: (taskId: string) => void
+  onResult: (projectId: string, msg: string) => void
+}) {
   const [confirmDiscard, setConfirmDiscard] = useState(false)
+  const resolve = async (action: 'merge' | 'keep-branch' | 'discard') => {
+    const msg = await window.lain.resolveReview(t.id, action)
+    onResult(t.projectId, msg)
+  }
   return (
     <div
       className="inbox-row ir-review"
@@ -234,10 +247,10 @@ function ReviewRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) =>
         // 비가역 폐기(discard)는 키보드에서 제외(오발동 방지) — 마우스 전용, 그마저도 확인창 경유.
         if ((e.key === 'm' || e.key === 'M' || e.key === 'Enter') && !e.nativeEvent.isComposing) {
           e.preventDefault()
-          window.lain.resolveReview(t.id, 'merge')
+          void resolve('merge')
         } else if (e.key === 'b' || e.key === 'B') {
           e.preventDefault()
-          window.lain.resolveReview(t.id, 'keep-branch')
+          void resolve('keep-branch')
         }
       }}
     >
@@ -260,10 +273,10 @@ function ReviewRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) =>
         </div>
       </div>
       <div className="ir-acts">
-        <button className="ib-ok" onClick={() => window.lain.resolveReview(t.id, 'merge')}>
+        <button className="ib-ok" onClick={() => void resolve('merge')}>
           병합
         </button>
-        <button onClick={() => window.lain.resolveReview(t.id, 'keep-branch')}>브랜치</button>
+        <button onClick={() => void resolve('keep-branch')}>브랜치</button>
         <button className="ib-no" onClick={() => setConfirmDiscard(true)}>
           폐기
         </button>
@@ -280,7 +293,7 @@ function ReviewRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) =>
           confirmLabel="폐기"
           onCancel={() => setConfirmDiscard(false)}
           onConfirm={() => {
-            window.lain.resolveReview(t.id, 'discard')
+            void resolve('discard')
             setConfirmDiscard(false)
           }}
         />
@@ -289,14 +302,46 @@ function ReviewRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) =>
   )
 }
 
-export function AttentionInbox({ approvals, tasks, onOpenTask, onClose }: Props) {
+// C2 — 에러로 멈춘 작업. 인박스가 '너를 기다리는 것 전부'인데 error만 빠져 실패를 놓치면 '큐 비었음'으로 보였다.
+// 소음을 줄이려 수동 재개가 가능한(worktree·세션 생존) 것만 넣는다 — 액션도 기존 resumeTask 재사용.
+function ErrorRow({ t, onOpenTask }: { t: Task; onOpenTask: (taskId: string) => void }) {
+  return (
+    <div className="inbox-row ir-error">
+      <span className="ir-badge b-error st-error">에러</span>
+      <div className="ir-mid">
+        <div className="ir-proj">
+          <span className="ir-link" onClick={() => onOpenTask(t.id)} title="콘솔 열기">
+            {t.projectId}
+          </span>{' '}
+          · {t.title}
+          <WaitBadge since={t.updatedAt} />
+        </div>
+        <div className="ir-cmd warn">{t.error?.slice(0, 160) || '알 수 없는 오류'}</div>
+      </div>
+      <div className="ir-acts">
+        <button
+          className="ib-ok"
+          title="작업트리·세션 그대로 마지막 중단 지점부터 재개"
+          onClick={() => window.lain.resumeTask(t.id)}
+        >
+          재개
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function AttentionInboxInner({ approvals, tasks, onOpenTask, onClose }: Props) {
   const byId = new Map(tasks.map((t) => [t.id, t]))
   const blocked = tasks.filter((t) => t.state === 'blocked')
   const review = tasks.filter((t) => t.state === 'review')
-  const total = approvals.length + blocked.length + review.length
+  const errored = tasks.filter((t) => t.state === 'error' && !!t.worktreePath && !!t.naviSessionId)
+  const total = approvals.length + blocked.length + review.length + errored.length
   const listRef = useRef<HTMLDivElement>(null)
   const prevTotalRef = useRef(total)
   const [, setNow] = useState(Date.now())
+  // 결재 결과(병합 실패 사유 등) — 행은 처리 즉시 사라지므로 패널에 한 줄로 남긴다. 다음 결재에 덮어쓴다.
+  const [actionMsg, setActionMsg] = useState<string | null>(null)
   // C5 — 대기 배지는 시간이 흐르면서 값이 바뀌는데, approvals/tasks는 이벤트 기반 갱신(App.tsx)이라
   // 변동 없인 리렌더가 없다 — TaskDrawer와 같은 30초 틱으로 배지를 계속 최신 유지.
   useEffect(() => {
@@ -308,6 +353,7 @@ export function AttentionInbox({ approvals, tasks, onOpenTask, onClose }: Props)
     ...approvals.map((a) => a.createdAt),
     ...blocked.map((t) => t.updatedAt),
     ...review.map((t) => t.updatedAt),
+    ...errored.map((t) => t.updatedAt),
   ])
 
   // 마운트/목록 변동 시 첫 행에 포커스 — 키보드 승인을 바로 받을 수 있게(처리로 행이 사라지면 재포커스).
@@ -330,6 +376,7 @@ export function AttentionInbox({ approvals, tasks, onOpenTask, onClose }: Props)
           title={longestWaitLabel ? `최장 대기: ${longestWaitLabel}` : undefined}
         >
           {total}건 · 승인 {approvals.length} · 질문 {blocked.length} · 결재 {review.length}
+          {errored.length > 0 ? ` · 에러 ${errored.length}` : ''}
         </span>
         <button onClick={onClose}><Icon name="x-circle" size={18} /></button>
       </div>
@@ -339,6 +386,8 @@ export function AttentionInbox({ approvals, tasks, onOpenTask, onClose }: Props)
           <kbd>y</kbd> 승인 · <kbd>n</kbd> 거절 · <kbd>m</kbd> 병합 · <kbd>b</kbd> 브랜치
         </div>
       )}
+      {/* 결재 결과 한 줄 — 병합 실패('rebase 후 verify 실패' 등)를 성공과 구분해 남긴다 */}
+      {actionMsg && <div className="inbox-hint warn">{actionMsg}</div>}
       {total === 0 ? (
         <div className="empty">큐 비었음 — lain 대기 ●</div>
       ) : (
@@ -356,10 +405,21 @@ export function AttentionInbox({ approvals, tasks, onOpenTask, onClose }: Props)
             <ClarifyRow key={`b${t.id}`} t={t} onOpenTask={onOpenTask} />
           ))}
           {review.map((t) => (
-            <ReviewRow key={`r${t.id}`} t={t} onOpenTask={onOpenTask} />
+            <ReviewRow
+              key={`r${t.id}`}
+              t={t}
+              onOpenTask={onOpenTask}
+              onResult={(projectId, msg) => setActionMsg(`${projectId}: ${msg}`)}
+            />
+          ))}
+          {errored.map((t) => (
+            <ErrorRow key={`e${t.id}`} t={t} onOpenTask={onOpenTask} />
           ))}
         </div>
       )}
     </div>
   )
 }
+
+// B4 — 인박스는 App의 모든 리렌더(키 입력 포함)에 딸려 다시 그려졌다. approvals·tasks·콜백이 그대로면 스킵.
+export const AttentionInbox = memo(AttentionInboxInner)

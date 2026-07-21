@@ -65,6 +65,32 @@ class ErrorBoundary extends React.Component<
   }
 }
 
+// 전역 조용한 실패 관측 — ErrorBoundary는 렌더 중 예외만 잡고, Promise rejection·비동기 예외는 못 잡는다.
+// window.lain 호출 다수가 .catch 없이 .then만 달려 있어 실패하면 어디에도 흔적이 없었다(빈 화면·무반응의
+// 원인 추적 불가). 최소 조치로 콘솔에 한 줄 남긴다. 폭주 방지: 같은 메시지는 쿨다운 동안 1회, 총량도 상한.
+// 시크릿·경로 전문이 섞이지 않게 message만 축약해 남긴다(§9-6).
+const SILENT_LOG_COOLDOWN_MS = 10_000
+const SILENT_LOG_MAX = 100
+const silentLogged = new Map<string, number>()
+let silentLogCount = 0
+function logSilentFailure(kind: string, message: string) {
+  if (silentLogCount >= SILENT_LOG_MAX) return
+  const now = Date.now()
+  const prev = silentLogged.get(message)
+  if (prev != null && now - prev < SILENT_LOG_COOLDOWN_MS) return
+  silentLogged.set(message, now)
+  silentLogCount++
+  console.error(`[renderer] ${kind}: ${message.slice(0, 300)}`)
+}
+
+window.addEventListener('unhandledrejection', (ev) => {
+  const reason = ev.reason as { message?: string } | undefined
+  logSilentFailure('unhandledrejection', String(reason?.message || ev.reason))
+})
+window.addEventListener('error', (ev) => {
+  logSilentFailure('error', String(ev.message || (ev.error as Error)?.message || ev.error))
+})
+
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ErrorBoundary>

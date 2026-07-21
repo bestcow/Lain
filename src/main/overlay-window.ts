@@ -23,10 +23,6 @@ export function setMainWindowGetter(fn: () => BrowserWindow | null): void {
   getMainWin = fn
 }
 
-export function getOverlayWindow(): BrowserWindow | null {
-  return overlayWin
-}
-
 // 커서가 있는 디스플레이 기준 — 보조 모니터에서 작업 중이면 그쪽에 뜬다(주모니터 고정 방지, B8).
 function cursorDisplay() {
   return screen.getDisplayNearestPoint(screen.getCursorScreenPoint())

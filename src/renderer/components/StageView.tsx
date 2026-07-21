@@ -21,7 +21,8 @@ export function naviStatus(
         return { cls: 'st-working', label: '명확화', prio: 3, kind: 'busy' }
       case 'queued':
         // D1 — 슬롯 대기(아직 미착수). busy 아닌 대기 상태라 낮은 주목도로 둔다.
-        return { cls: 'st-idle', label: '대기', prio: 6, kind: 'idle' }
+        // 라벨은 '큐 대기' — 작업이 아예 없는 유휴('대기')와 글자까지 같으면 구분이 안 된다.
+        return { cls: 'st-idle', label: '큐 대기', prio: 6, kind: 'idle' }
     }
   }
   const s = p.status

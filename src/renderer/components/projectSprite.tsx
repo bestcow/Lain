@@ -1,6 +1,11 @@
 // 프로젝트별 도트 캐릭터 — 규칙 기반 자동 생성.
 // ① 이름 키워드 → 테마 모티프(내용 연상). ② 매칭 없으면 id 해시 → 대칭 엠블럼(identicon).
-// → 지금 프로젝트뿐 아니라 "앞으로 생길 모든 프로젝트"도 같은 방식으로 고유·불변 아이콘을 받는다.
+// 규칙(정확히):
+//  - 키워드 경로의 '그림'은 테마 그룹핑이라 여러 프로젝트가 공유한다(중복이 정상 — 내용을 읽히게 하는 게 목적).
+//    대신 '주색'을 id 해시로 회전시켜 같은 테마끼리도 서로 구분된다(보조색은 유지 → 테마 색 계열은 남음).
+//  - identicon 경로의 그림은 프로젝트마다 사실상 고유하다.
+//  - 어느 경로든 같은 {id, name}이면 결과가 항상 같다(재스캔·재시작해도 아이콘 불변).
+// ※ 주색 회전이 도입되면서, 그 이전부터 있던 프로젝트는 키워드 테마 색이 한 번 바뀐다(이후로는 불변).
 // 키워드는 '이름'으로만 본다 — id의 카테고리 경로(apps/games/tools)는 false-positive를 낸다.
 // 상태(작업/질문/결재)는 스프라이트가 아니라 카드/무대 크롬(테두리·라벨·애니)이 계속 표시한다.
 import type { ReactNode } from 'react'
@@ -19,13 +24,15 @@ function renderRects(map: string[], colors: Record<string, string>): ReactNode[]
 }
 
 interface Motif {
+  // 키워드는 이름의 '토큰'과 정확히 같아야 매칭. 끝에 '*'를 붙이면 어간(접두) 매칭
+  // — 'secur*'는 security/secure까지 먹지만, 마커 없는 'auth'는 author를 먹지 않는다.
   keys: string[]
   map: string[]
   colors: Record<string, string>
 }
 
 // 키워드 → 모티프. 위에서부터 먼저 매칭되는 것 사용(구체적 키워드를 앞에).
-const THEMES: Motif[] = [
+export const THEMES: Motif[] = [
   {
     keys: ['chess'],
     colors: { '2': '#c9b6f3' },
@@ -37,12 +44,12 @@ const THEMES: Motif[] = [
     map: ['111111111', '1.......1', '1.2.....1', '1.22....1', '1.222...1', '1.22....1', '1.2.....1', '1.......1', '111111111'],
   },
   {
-    keys: ['secur', 'auth', 'lock', 'vault', 'crypt', 'guard'],
+    keys: ['secur*', 'auth', 'lock', 'vault', 'crypt*', 'guard'],
     colors: { '1': '#f0b46b', '2': '#f7d09a' },
     map: ['..22222..', '.2.....2.', '.2.....2.', '111111111', '111111111', '1111.1111', '111...111', '1111.1111', '111111111'],
   },
   {
-    keys: ['tarot', 'astro', 'mystic', 'fortune', 'divin', 'moon', 'luna'],
+    keys: ['tarot', 'astro*', 'mystic*', 'fortune', 'divin*', 'moon', 'luna'],
     colors: { '1': '#d96bff', '2': '#f0b46b' },
     map: ['..1111...', '.11......', '11.......', '11....2..', '11.......', '11.......', '.11......', '..1111...'],
   },
@@ -119,17 +126,92 @@ function hashStr(s: string): number {
   return h >>> 0
 }
 
+// 이름 → 토큰. 구분자(-, _, ., /, 공백)로만 쪼갠다 — 단어 한가운데 낀 문자열은 키워드가 아니다.
+function tokenize(name: string): string[] {
+  return name
+    .toLowerCase()
+    .split(/[-_./\\\s]+/)
+    .filter(Boolean)
+}
+
+// 토큰 하나가 키워드에 걸리는가. 기본은 완전일치, '*' 마커가 붙은 어간만 접두 허용.
+function matches(tokens: string[], key: string): boolean {
+  if (key.endsWith('*')) {
+    const stem = key.slice(0, -1)
+    return tokens.some((t) => t.startsWith(stem))
+  }
+  return tokens.includes(key)
+}
+
+// 색상(hue)만 돌리는 회전 단계(도) — 채도·명도는 보존해 테마의 톤(파스텔 CRT)을 유지한다.
+// ±36°로 묶은 이유: 색 계열(보라는 보라, 파랑은 파랑)은 남기면서 옆에 놓으면 구분되는 폭.
+const HUE_SHIFTS = [0, 12, -12, 24, -24, 36, -36]
+
 export function spriteFor(project: {
   id: string
   name: string
 }): { map: string[]; colors: Record<string, string> } {
   // 키워드 매칭은 '이름'만으로 — id 경로(apps/games/tools)가 false-positive(예: tools→'tool'→gear)를 낸다.
-  const n = project.name.toLowerCase()
+  const tokens = tokenize(project.name)
   for (const t of THEMES) {
-    if (t.keys.some((k) => n.includes(k))) return { map: t.map, colors: t.colors }
+    if (t.keys.some((k) => matches(tokens, k))) {
+      return { map: t.map, colors: rotateTheme(t.colors, project.id || project.name) }
+    }
   }
   // 폴백: 해시 기반 대칭 엠블럼(identicon) — 키워드 없는 프로젝트도 전부 고유·불변.
   return identicon(project.id || project.name)
+}
+
+// 같은 테마를 쓰는 프로젝트들을 색으로 갈라준다 — 주색만 회전하고 보조색은 테마 것 그대로 둔다.
+// (주색이 없는 테마는 '2'가 사실상 주색이라 그쪽을 돌린다.)
+function rotateTheme(colors: Record<string, string>, seed: string): Record<string, string> {
+  const primary = colors['1'] ? '1' : '2'
+  if (!colors[primary]) return colors
+  const shift = HUE_SHIFTS[hashStr(seed) % HUE_SHIFTS.length]
+  return { ...colors, [primary]: rotateHue(colors[primary], shift) }
+}
+
+// #rrggbb 의 hue만 deg 만큼 회전(S·L 보존).
+function rotateHue(hex: string, deg: number): string {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex)
+  if (!m || deg === 0) return hex
+  const int = parseInt(m[1], 16)
+  const r = ((int >> 16) & 255) / 255
+  const g = ((int >> 8) & 255) / 255
+  const b = (int & 255) / 255
+  const max = Math.max(r, g, b)
+  const min = Math.min(r, g, b)
+  const d = max - min
+  const l = (max + min) / 2
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1))
+  let h = 0
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6
+    else if (max === g) h = (b - r) / d + 2
+    else h = (r - g) / d + 4
+    h *= 60
+  }
+  h = (((h + deg) % 360) + 360) % 360
+  const c = (1 - Math.abs(2 * l - 1)) * s
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1))
+  const base = l - c / 2
+  const [r2, g2, b2] =
+    h < 60
+      ? [c, x, 0]
+      : h < 120
+        ? [x, c, 0]
+        : h < 180
+          ? [0, c, x]
+          : h < 240
+            ? [0, x, c]
+            : h < 300
+              ? [x, 0, c]
+              : [c, 0, x]
+  const hx = (v: number) =>
+    Math.round((v + base) * 255)
+      .toString(16)
+      .padStart(2, '0')
+  return `#${hx(r2)}${hx(g2)}${hx(b2)}`
 }
 
 // GitHub identicon식 — id 해시로 좌반면을 채우고 좌우 대칭 → 프로젝트마다 유일한 9×9 엠블럼.

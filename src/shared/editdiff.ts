@@ -7,7 +7,7 @@
 // 인코딩은 todoline.ts(A4)와 동일한 "접두사 + JSON" 패턴 — main이 tool 라인 content 하나에 실어
 // addMessage로 영속하고, renderer(markdown.tsx)가 같은 모듈로 디코딩해 접이식 diff 카드로 렌더한다.
 
-export type DiffLineKind = 'ctx' | 'add' | 'del'
+type DiffLineKind = 'ctx' | 'add' | 'del'
 export type DiffLine = { kind: DiffLineKind; text: string }
 
 export type EditDiffPayload = {

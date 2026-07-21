@@ -6,6 +6,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { DATA_DIR } from './paths'
+import { appendCapped } from './logfile'
 
 export type JournalMsg = {
   t: 'msg'
@@ -62,9 +63,25 @@ function appendLine(obj: JournalEntry): void {
     } finally {
       fs.closeSync(fd)
     }
-  } catch {
-    /* 저널 기록 실패는 치명적이지 않게 삼킨다 — 단 그만큼 내구성은 약해진다 */
+  } catch (e) {
+    /* 저널 기록 실패는 치명적이지 않게 삼킨다(DB 기록은 계속 진행) — 단 그만큼 내구성은 약해진다.
+       삼키더라도 '언제부터 저널이 안 남고 있었는지'는 알 수 있게 흔적만 남긴다. */
+    markJournalFailure(e)
   }
+}
+
+// 저널 append 실패 흔적 — 디스크 풀·권한 문제면 매 턴 실패하므로 첫 실패 1줄 + N분 쿨다운으로만 기록한다
+// (통지는 소음 대비 이득이 낮아 로그만). 경로·내용은 남기지 않는다(§9-6 — 에러 메시지만).
+let lastFailLogAt = 0
+const FAIL_LOG_COOLDOWN_MS = 10 * 60_000
+function markJournalFailure(e: unknown): void {
+  const now = Date.now()
+  if (lastFailLogAt && now - lastFailLogAt < FAIL_LOG_COOLDOWN_MS) return
+  lastFailLogAt = now
+  appendCapped(
+    path.join(DATA_DIR, 'recovery.log'),
+    `${new Date().toISOString()} journal append 실패: ${(e as Error)?.message ?? e}\n`,
+  )
 }
 
 export function journalMessage(rec: Omit<JournalMsg, 't'>): void {

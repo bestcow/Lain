@@ -46,7 +46,6 @@ const proj = {
   stack: 'node',
   isGit: true,
   verifyCmd: null,
-  enabled: true,
 }
 
 // 핵심 의도: '숨김'(muted)은 제거(hidden)와 달리 목록에 남는다 — 레인이 계속 관리(수집·작업)해야
@@ -60,7 +59,6 @@ describe('내비 숨김(muted) — 관리 유지 + 표시/선제언급만 억제
     const hidden = listProjects().find((p) => p.id === proj.id)
     expect(hidden).toBeDefined() // 제거(hidden)와 달리 목록에 존재 — 레인 관리 계속
     expect(hidden!.muted).toBe(true)
-    expect(hidden!.enabled).toBe(true) // 숨김이어도 감시(enabled)는 유지
 
     setProjectMuted(proj.id, false)
     expect(listProjects().find((p) => p.id === proj.id)?.muted).toBe(false)

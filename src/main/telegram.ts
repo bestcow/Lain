@@ -22,14 +22,18 @@ import {
   listLessons,
   searchChatHistory,
   ensureActiveConversation,
-  listPlanItems,
-  listPlanSections,
-  setPlanItemDone,
-  snoozePlanItem,
 } from './store'
 import { resolveApproval } from './worker'
-import { startTask, answerClarify, resolveReview, cancelTask } from './orchestrator'
+import { startTask, answerClarify, resolveReview, cancelTask, interruptTask } from './orchestrator'
 import { sendToNavi, sendToAllNavis } from './navichat'
+import { diffBody } from './worktree'
+import {
+  buildLiveCard,
+  liveActivityLine,
+  shouldEditLiveCard,
+  finalCardLabel,
+  diffDelivery,
+} from './telegramcards'
 import {
   sendToManager,
   buildDigest,
@@ -43,10 +47,9 @@ import { scanProjects } from './registry'
 import { collectStatus, runVerify } from './collectors'
 import { setNotifyHook } from './notify'
 import { generateBriefing } from './briefing'
-import { onPlanReminder } from './planner'
-import { occurrencesInRange, fmtLocal } from '../shared/planmath'
-import type { TelegramStatus, FileAttachment } from '../shared/types'
+import type { TelegramStatus, FileAttachment, Task, TaskEvent } from '../shared/types'
 import { isSupportedImageMime, pickLargestPhoto, checkAttachmentSize } from './telegram-attach'
+import { nextBackoff, shouldAnnounceReconnect, buildReconnectMessage } from './telegrampoll'
 
 const LOG = path.join(DATA_DIR, 'telegram.log')
 function tlog(m: string): void {
@@ -77,11 +80,18 @@ let authFailed = false // 401(무효 토큰) — 무한 재시도·재기동 방
 // 부트스트랩 대기 — 미허용 채팅이 마지막으로 보낸 chat id. telegramChatId 설정 시 null로 비움.
 let pendingChatId: string | null = null
 
-// 이미 폰으로 민 항목 (중복 푸시 방지) — 해소되면 정리
+// 이미 폰으로 민 항목 (중복 푸시 방지) — send() 성공 후에만 기록한다. 실패했는데 여기 먼저 남기면
+// 그 알림은 재시도 없이 영영 안 간다(dedup-before-send 버그) — 반드시 성공 후 기록.
 const sentApprovals = new Set<number>()
 const sentReview = new Set<string>()
 const sentBlocked = new Set<string>()
 const sentDone = new Set<string>()
+// send() 왕복 중(아직 성공/실패 결정 전)인 항목 — 동시 reconcile()(폴 루프 vs telegramReconcile 즉시 트리거)이
+// 같은 항목을 이중 전송하지 않게 하는 선점 마커. sent*와 달리 성공 여부 무관하게 완료 시 finally에서 해제.
+const approvalsInFlight = new Set<number>()
+const reviewInFlight = new Set<string>()
+const blockedInFlight = new Set<string>()
+const doneInFlight = new Set<string>()
 let lastDigestSig = '' // C — 결정 대기 다이제스트: 대기 집합이 바뀔 때만 1회 재공지
 /** Lain 기동 시각 — 이전 완료 작업을 재시작 때마다 재알림하지 않도록 비교 기준 */
 const tgStartMs = Date.now()
@@ -89,8 +99,85 @@ const tgStartMs = Date.now()
 // 모듈 상태라 프로세스 재시작 때 자연 리셋(=실행당 1회). 텔레그램 설정 토글엔 리셋 안 됨(진짜 재시작만).
 let briefedThisRun = false
 // 답장(reply)으로 답을 받을 봇 메시지 → 무엇에 대한 답인지
-type AskCtx = { kind: 'approval'; id: number } | { kind: 'clarify'; taskId: string }
+type AskCtx =
+  | { kind: 'approval'; id: number }
+  | { kind: 'clarify'; taskId: string }
+  | { kind: 'interrupt'; taskId: string } // P1 — 라이브 카드 '끼어들기' 버튼의 지시 입력
 const askByMsg = new Map<number, AskCtx>()
+
+// ── P1 라이브 카드 — 작업당 메시지 1개를 editMessageText로 계속 갱신(새 메시지 폭탄 없이 진행 관찰). ──
+// msgId 0 = 생성 중 마커(동시 reconcile이 카드를 이중 생성하지 않게 send 왕복 전에 선점).
+type LiveCard = { msgId: number; lastEditAt: number; lastText: string }
+const liveCards = new Map<string, LiveCard>()
+const liveActivity = new Map<string, string>() // taskId → 마지막 '지금' 줄(사람말)
+
+function liveCardMarkup(taskId: string): unknown {
+  return {
+    inline_keyboard: [
+      [
+        { text: '💬 끼어들기', callback_data: `i|${taskId}` },
+        { text: '⏹ 중지', callback_data: `x|${taskId}` },
+      ],
+    ],
+  }
+}
+
+async function ensureLiveCard(t: Task): Promise<void> {
+  if (liveCards.has(t.id)) return
+  liveCards.set(t.id, { msgId: 0, lastEditAt: 0, lastText: '' }) // 선점 — send 왕복 중 이중 생성 방지
+  const text = buildLiveCard(t, liveActivity.get(t.id) ?? null, Date.now())
+  const mid = await send(text, liveCardMarkup(t.id))
+  if (mid) liveCards.set(t.id, { msgId: mid, lastEditAt: Date.now(), lastText: text })
+  else liveCards.delete(t.id) // 전송 실패 — 다음 reconcile에서 재시도
+}
+
+async function updateLiveCard(taskId: string): Promise<void> {
+  const card = liveCards.get(taskId)
+  if (!card || card.msgId <= 0) return // 카드 없음/생성 중 — reconcile이 채운다
+  const t = getTask(taskId)
+  if (!t || t.state !== 'working') return finalizeLiveCard(taskId)
+  const next = buildLiveCard(t, liveActivity.get(taskId) ?? null, Date.now())
+  const now = Date.now()
+  if (!shouldEditLiveCard(card.lastText, next, card.lastEditAt, now)) return
+  card.lastText = next
+  card.lastEditAt = now
+  const chatId = getSettings().telegramChatId
+  if (!chatId) return
+  // 카드 본문은 플레인 텍스트(HTML 변환 없음 — 활동 줄의 특수문자로 parse 실패해 갱신이 끊기는 것 방지).
+  await api('editMessageText', {
+    chat_id: chatId,
+    message_id: card.msgId,
+    text: next,
+    reply_markup: liveCardMarkup(taskId), // editMessageText는 미지정 시 버튼이 사라진다 — 유지
+  }).catch((e: Error) => tlog(`live card edit fail: ${e.message}`))
+}
+
+async function finalizeLiveCard(taskId: string): Promise<void> {
+  const card = liveCards.get(taskId)
+  liveCards.delete(taskId)
+  liveActivity.delete(taskId)
+  if (!card || card.msgId <= 0) return
+  const chatId = getSettings().telegramChatId
+  if (!chatId) return
+  const t = getTask(taskId)
+  const head = card.lastText.split('\n')[0] ?? `작업 ${taskId}`
+  await api('editMessageText', {
+    chat_id: chatId,
+    message_id: card.msgId,
+    text: `${head}\n${finalCardLabel(t?.state ?? 'done')}`,
+    // reply_markup 미지정 = 버튼 제거(종료된 작업에 끼어들기/중지 잔존 방지)
+  }).catch(() => {})
+}
+
+/** 작업 이벤트 실시간 수신(ipc bindOrchestrator에서 호출) — '지금' 줄 갱신 + 카드 edit 시도(스로틀 내장). */
+export function telegramTaskEvent(ev: TaskEvent): void {
+  if (!running || !getSettings().telegramChatId) return
+  const line = liveActivityLine(ev)
+  if (line) {
+    liveActivity.set(ev.taskId, line)
+    void updateLiveCard(ev.taskId)
+  }
+}
 // B5 — 폰에 민 인라인 질문 카드: questionId → 텔레그램 message_id(답변/타임아웃 시 그 카드를 editMessageText로 정리).
 const questionCardMsg = new Map<string, number>()
 // B5(I-tg) — send() 왕복 중 이미 답변된 질문의 결과 텍스트를 임시 보관. resolve가 카드 등록 전에 오면
@@ -366,23 +453,31 @@ async function reconcile(): Promise<void> {
     try {
       const pending = listApprovals().filter((a) => a.state === 'pending')
       for (const a of pending) {
-        if (sentApprovals.has(a.id)) continue
-        sentApprovals.add(a.id)
-        if (a.kind === 'question') {
-          const mid = await send(
-            `❓ Navi 질문 — task ${a.taskId}\n${a.payload}\n\n↩ 이 메시지에 답장하면 Navi에 전달.`,
-            { inline_keyboard: [[{ text: '❌ 거절', callback_data: `a${a.id}n` }]] },
-          )
-          if (mid) askByMsg.set(mid, { kind: 'approval', id: a.id })
-        } else {
-          await send(`⚠ 승인 필요 [${a.kind}] — task ${a.taskId}\n${a.payload}`, {
-            inline_keyboard: [
-              [
-                { text: '✅ 승인', callback_data: `a${a.id}y` },
-                { text: '❌ 거절', callback_data: `a${a.id}n` },
+        if (sentApprovals.has(a.id) || approvalsInFlight.has(a.id)) continue
+        approvalsInFlight.add(a.id) // send 왕복 중 동시 reconcile()이 이중 전송하지 않게 선점
+        try {
+          if (a.kind === 'question') {
+            const mid = await send(
+              `❓ Navi 질문 — task ${a.taskId}\n${a.payload}\n\n↩ 이 메시지에 답장하면 Navi에 전달.`,
+              { inline_keyboard: [[{ text: '❌ 거절', callback_data: `a${a.id}n` }]] },
+            )
+            if (mid) {
+              askByMsg.set(mid, { kind: 'approval', id: a.id })
+              sentApprovals.add(a.id) // 성공 후에만 기록 — 실패면 다음 reconcile이 재시도
+            }
+          } else {
+            const mid = await send(`⚠ 승인 필요 [${a.kind}] — task ${a.taskId}\n${a.payload}`, {
+              inline_keyboard: [
+                [
+                  { text: '✅ 승인', callback_data: `a${a.id}y` },
+                  { text: '❌ 거절', callback_data: `a${a.id}n` },
+                ],
               ],
-            ],
-          })
+            })
+            if (mid) sentApprovals.add(a.id) // 성공 후에만 기록
+          }
+        } finally {
+          approvalsInFlight.delete(a.id)
         }
       }
       const pendingIds = new Set(pending.map((a) => a.id))
@@ -395,14 +490,21 @@ async function reconcile(): Promise<void> {
     try {
       const blocked = listTasks().filter((t) => t.state === 'blocked')
       for (const t of blocked) {
-        if (sentBlocked.has(t.id)) continue
-        sentBlocked.add(t.id)
-        const mid = await send(
-          // force_reply: 입력창이 자동으로 답장 모드로 열려 어느 프로젝트 질문인지 명확
-          `❓ **[${t.projectId}]** 명확화\n\n${t.questions.join('\n\n')}`,
-          { force_reply: true, selective: true, input_field_placeholder: `${t.projectId}에 답변` },
-        )
-        if (mid) askByMsg.set(mid, { kind: 'clarify', taskId: t.id })
+        if (sentBlocked.has(t.id) || blockedInFlight.has(t.id)) continue
+        blockedInFlight.add(t.id)
+        try {
+          const mid = await send(
+            // force_reply: 입력창이 자동으로 답장 모드로 열려 어느 프로젝트 질문인지 명확
+            `❓ **[${t.projectId}]** 명확화\n\n${t.questions.join('\n\n')}`,
+            { force_reply: true, selective: true, input_field_placeholder: `${t.projectId}에 답변` },
+          )
+          if (mid) {
+            askByMsg.set(mid, { kind: 'clarify', taskId: t.id })
+            sentBlocked.add(t.id) // 성공 후에만 기록
+          }
+        } finally {
+          blockedInFlight.delete(t.id)
+        }
       }
       for (const id of [...sentBlocked]) {
         const t = getTask(id)
@@ -416,24 +518,37 @@ async function reconcile(): Promise<void> {
     try {
       const review = listTasks().filter((t) => t.state === 'review')
       for (const t of review) {
-        if (sentReview.has(t.id)) continue
-        sentReview.add(t.id)
-        const lines = [
-          `📋 결재 대기 — ${t.projectId} (task ${t.id})`,
-          t.title,
-          t.summary ? `\n${t.summary.slice(0, 800)}` : '',
-          t.diffStat ? `diff: ${t.diffStat}` : '',
-          t.verifyResult ? `verify: ${t.verifyResult}` : '',
-        ].filter(Boolean)
-        await send(lines.join('\n'), {
-          inline_keyboard: [
-            [
-              { text: '🔀 병합', callback_data: `r|merge|${t.id}` },
-              { text: '🌿 브랜치만', callback_data: `r|keep|${t.id}` },
-              { text: '🗑 폐기', callback_data: `r|discard|${t.id}` },
+        if (sentReview.has(t.id) || reviewInFlight.has(t.id)) continue
+        reviewInFlight.add(t.id)
+        try {
+          const lines = [
+            `📋 결재 대기 — ${t.projectId} (task ${t.id})`,
+            t.title,
+            t.summary ? `\n${t.summary.slice(0, 800)}` : '',
+            t.diffStat ? `diff: ${t.diffStat}` : '',
+            t.verifyResult ? `verify: ${t.verifyResult}` : '',
+          ].filter(Boolean)
+          // P1 — 결재 전에 폰에서 변경 내용을 직접 볼 수 있게 diff·verify 버튼을 함께 단다(깜깜이 승인 방지).
+          const reviewProject = getProject(t.projectId)
+          const inspectRow: { text: string; callback_data: string }[] = [
+            { text: '📄 diff 보기', callback_data: `d|${t.id}` },
+          ]
+          if (reviewProject?.verifyCmd)
+            inspectRow.push({ text: '🧪 verify 재실행', callback_data: `act|verify|${t.projectId}` })
+          const mid = await send(lines.join('\n'), {
+            inline_keyboard: [
+              [
+                { text: '🔀 병합', callback_data: `r|merge|${t.id}` },
+                { text: '🌿 브랜치만', callback_data: `r|keep|${t.id}` },
+                { text: '🗑 폐기', callback_data: `r|discard|${t.id}` },
+              ],
+              inspectRow,
             ],
-          ],
-        })
+          })
+          if (mid) sentReview.add(t.id) // 성공 후에만 기록
+        } finally {
+          reviewInFlight.delete(t.id)
+        }
       }
       for (const id of [...sentReview]) {
         const t = getTask(id)
@@ -452,28 +567,48 @@ async function reconcile(): Promise<void> {
           !sentDone.has(t.id),
       )
       for (const t of finished) {
-        sentDone.add(t.id)
-        const emoji = t.state === 'done' ? '✅' : t.state === 'error' ? '❌' : '🚫'
-        const label = t.state === 'done' ? '완료' : t.state === 'error' ? '오류' : '취소됨'
-        const lines = [
-          `${emoji} ${label} — ${t.projectId}`,
-          t.title,
-          t.summary ? `\n${t.summary.slice(0, 400)}` : '',
-        ].filter(Boolean)
-        // 완료 시 후속 액션 버튼 — 새 작업 시작·verify
-        let markup: unknown
-        if (t.state === 'done') {
-          const p = getProject(t.projectId)
-          const btns: { text: string; callback_data: string }[] = [
-            { text: '▶ 새 작업', callback_data: `act|go|${t.projectId}` },
-          ]
-          if (p?.verifyCmd) btns.push({ text: '✅ verify', callback_data: `act|verify|${t.projectId}` })
-          markup = { inline_keyboard: [btns] }
+        if (doneInFlight.has(t.id)) continue
+        doneInFlight.add(t.id)
+        try {
+          const emoji = t.state === 'done' ? '✅' : t.state === 'error' ? '❌' : '🚫'
+          const label = t.state === 'done' ? '완료' : t.state === 'error' ? '오류' : '취소됨'
+          const lines = [
+            `${emoji} ${label} — ${t.projectId}`,
+            t.title,
+            t.summary ? `\n${t.summary.slice(0, 400)}` : '',
+          ].filter(Boolean)
+          // 완료 시 후속 액션 버튼 — 새 작업 시작·verify
+          let markup: unknown
+          if (t.state === 'done') {
+            const p = getProject(t.projectId)
+            const btns: { text: string; callback_data: string }[] = [
+              { text: '▶ 새 작업', callback_data: `act|go|${t.projectId}` },
+            ]
+            if (p?.verifyCmd) btns.push({ text: '✅ verify', callback_data: `act|verify|${t.projectId}` })
+            markup = { inline_keyboard: [btns] }
+          }
+          const mid = await send(lines.join('\n'), markup)
+          if (mid) sentDone.add(t.id) // 성공 후에만 기록 — 실패면 다음 reconcile이 재시도
+        } finally {
+          doneInFlight.delete(t.id)
         }
-        await send(lines.join('\n'), markup)
       }
     } catch (e) {
       tlog(`reconcile finished fail: ${(e as Error).message}`)
+    }
+
+    // 5) P1 라이브 카드 — working 작업마다 카드 1개 생성·갱신, working이 아니게 되면 확정(버튼 제거).
+    //    이벤트 피드(telegramTaskEvent)가 '지금' 줄을 실시간으로 채우고, 여기는 생성·경과시간 틱·정리를 맡는다.
+    try {
+      const working = listTasks().filter((t) => t.state === 'working')
+      for (const t of working) await ensureLiveCard(t)
+      for (const taskId of [...liveCards.keys()]) {
+        const t = getTask(taskId)
+        if (!t || t.state !== 'working') await finalizeLiveCard(taskId)
+        else await updateLiveCard(taskId)
+      }
+    } catch (e) {
+      tlog(`reconcile livecards fail: ${(e as Error).message}`)
     }
   } catch (e) {
     tlog(`reconcile fail: ${(e as Error).message}`)
@@ -507,18 +642,6 @@ async function handleCallback(cb: any): Promise<void> {
       })
       await ack(yes ? '승인됨' : '거절됨')
       await editDone(cb, yes ? '✅ 승인됨' : '❌ 거절됨')
-    } else if (/^p\d+[ds]$/.test(data)) {
-      const id = Number(data.slice(1, -1))
-      if (data.endsWith('d')) {
-        setPlanItemDone(id, true)
-        await ack('완료')
-        await editDone(cb, '✅ 완료')
-      } else {
-        const until = fmtLocal(new Date(Date.now() + 10 * 60_000))
-        snoozePlanItem(id, until)
-        await ack('+10분')
-        await editDone(cb, `⏰ ${until.slice(11)}에 다시`)
-      }
     } else if (data.startsWith('r|')) {
       const [, act, taskId] = data.split('|')
       const action = act === 'merge' ? 'merge' : act === 'keep' ? 'keep-branch' : 'discard'
@@ -527,12 +650,65 @@ async function handleCallback(cb: any): Promise<void> {
       const res = await resolveReview(taskId, action)
       await ack(res.slice(0, 180))
       await editDone(cb, `📋 ${action}: ${res.slice(0, 200)}`)
+    } else if (data.startsWith('i|')) {
+      // P1 라이브 카드 '끼어들기' — force_reply로 지시를 받아 interruptTask로 주입(같은 세션 즉시 반영).
+      const taskId = data.slice(2)
+      const t = getTask(taskId)
+      if (!t || t.state !== 'working') return void ack('작업이 실행 중이 아님')
+      const mid = await send(
+        `💬 [${t.projectId}] 작업에 끼어들기 — 이 메시지에 답장으로 지시를 입력해줘.`,
+        { force_reply: true, selective: true, input_field_placeholder: '끼어들 지시' },
+      )
+      if (mid) askByMsg.set(mid, { kind: 'interrupt', taskId })
+      await ack()
+    } else if (data.startsWith('xc|')) {
+      // 중지 확정 — 확인 카드의 2차 버튼(비가역: worktree 폐기).
+      const taskId = data.slice(3)
+      const t = getTask(taskId)
+      if (!t || ['done', 'error', 'cancelled'].includes(t.state)) return void ack('이미 종료됨')
+      await cancelTask(taskId)
+      await ack('중지됨')
+      await editDone(cb, `⏹ 중지됨 — ${taskId}`)
+    } else if (data === 'xa') {
+      await ack('계속 진행')
+      await editDone(cb, '계속 진행')
+    } else if (data.startsWith('x|')) {
+      // P1 라이브 카드 '중지' — 비가역이라 2차 확인 카드를 거친다.
+      const taskId = data.slice(2)
+      const t = getTask(taskId)
+      if (!t || ['done', 'error', 'cancelled'].includes(t.state)) return void ack('이미 종료됨')
+      await send(`⏹ [${t.projectId}] ${t.title.slice(0, 60)}\n정말 중지(취소)할까? 작업 폴더가 폐기된다.`, {
+        inline_keyboard: [
+          [
+            { text: '⏹ 중지 확정', callback_data: `xc|${taskId}` },
+            { text: '계속 진행', callback_data: 'xa' },
+          ],
+        ],
+      })
+      await ack()
+    } else if (data.startsWith('d|')) {
+      // P1 결재 카드 'diff 보기' — 짧으면 코드블록, 길면 .diff 파일 첨부.
+      const taskId = data.slice(2)
+      const t = getTask(taskId)
+      const p = t ? getProject(t.projectId) : null
+      if (!t || !p) return void ack('작업 없음')
+      await ack('diff 준비 중')
+      const diff = diffBody(p, taskId)
+      const d = diffDelivery(diff)
+      if (d.mode === 'empty') void send(`📄 ${t.projectId} — 변경 없음(diff 비어 있음)`)
+      else if (d.mode === 'text') void send(`📄 ${t.projectId} diff\n\`\`\`diff\n${d.text}\n\`\`\``)
+      else
+        void sendTelegramDocument(
+          `task-${taskId}.diff`,
+          diff,
+          `📄 ${t.projectId} diff (${Math.round(diff.length / 1024)}KB — 파일로 첨부)`,
+        )
     } else if (data.startsWith('act|')) {
       // 인라인 버튼 액션 — act|<action>[|<projectId>]
       const [, action, projectId = ''] = data.split('|')
       if (action === 'status') {
         await ack()
-        await send(buildDigest(listProjects()), {
+        await send(buildDigest(listProjects(), undefined, { onboarding: false }), {
           inline_keyboard: [[
             { text: '🔄 새로고침', callback_data: 'act|status' },
             { text: '📋 작업목록', callback_data: 'act|tasks' },
@@ -699,6 +875,10 @@ async function handleMessage(m: any): Promise<void> {
         resolveApproval(ctx.id, true, text)
         await send('↩ Navi에 전달됨')
       } else await send('이미 처리된 질문')
+    } else if (ctx.kind === 'interrupt') {
+      // P1 — 라이브 카드 '끼어들기' 지시. interruptTask가 세션을 끊고 같은 세션 resume으로 즉시 주입한다.
+      const okInj = interruptTask(ctx.taskId, text)
+      await send(okInj ? '⚡ 끼어들기 전달 — 지시 반영 후 작업을 이어간다' : '⚠ 작업이 이미 실행 중이 아니라 전달 못 함')
     } else {
       const t = getTask(ctx.taskId)
       if (t && t.state === 'blocked') {
@@ -713,7 +893,7 @@ async function handleMessage(m: any): Promise<void> {
 
   // ── '💬 현황' 버튼 인터셉트 — 현재 상태 다이제스트(/status와 동일). ('💬 현재 세션'은 옛 키보드 라벨 — 같이 흡수) ──
   if (text === '💬 현황' || text === '💬 현재 세션') {
-    return void send(buildDigest(listProjects()), {
+    return void send(buildDigest(listProjects(), undefined, { onboarding: false }), {
       inline_keyboard: [[
         { text: '🔄 새로고침', callback_data: 'act|status' },
         { text: '📋 작업목록', callback_data: 'act|tasks' },
@@ -810,13 +990,16 @@ Lain은 하나의 총괄 세션이다 (폰·PC가 같은 대화 공유). 나뉜 
 💬 현황 버튼 — 지금 맥락 보기.
 평문 → Lain과 그대로 대화(이어짐)
 
-@<프로젝트id> <메시지> → 해당 Navi에게 (idle만)
+@<프로젝트id> <메시지> → 해당 Navi에게 (작업 중이면 끼어들기로 즉시 주입)
 @all <메시지> → 전체 Navi broadcast
+
+작업이 실행 중이면 ⚙ 라이브 카드가 하나 떠서 진행(지금 뭐 하는 중·할일·경과)을
+계속 갱신한다 — 카드의 [💬 끼어들기]로 지시 주입, [⏹ 중지]로 취소.
+결재 카드의 [📄 diff 보기]로 병합 전 변경 내용을 직접 확인.
 
 /status  현황 다이제스트
 /tasks   진행 중 작업
 /projects  프로젝트 목록
-/plan  오늘·이번 주 일정 + 체크리스트
 /go <프로젝트id> [작업내용]  작업 시작 (작업내용 없으면 TASK.md)
 /cancel <taskId>  작업 취소
 /verify <프로젝트id>  검증 실행
@@ -839,17 +1022,9 @@ async function handleCommand(text: string): Promise<void> {
       return void send(HELP, REPLY_KEYBOARD)
     case '/help':
       return void send(HELP)
-    case '/sessions':
-    case '/session':
-    case '/new':
-      // Lain은 단일 총괄 세션 — 세션 목록·생성 개념 폐기. 그냥 평문을 보내면 그 하나에서 이어진다.
-      return void send(
-        'Lain은 하나의 총괄 세션이다 — 나뉜 세션·목록은 없다. 그냥 메시지를 보내면 이어서 대화한다.',
-        REPLY_KEYBOARD,
-      )
     case '/status':
     case '/s':
-      return void send(buildDigest(listProjects()), {
+      return void send(buildDigest(listProjects(), undefined, { onboarding: false }), {
         inline_keyboard: [[
           { text: '🔄 새로고침', callback_data: 'act|status' },
           { text: '📋 작업목록', callback_data: 'act|tasks' },
@@ -869,8 +1044,6 @@ async function handleCommand(text: string): Promise<void> {
     case '/lessons':
     case '/l':
       return void send(lessonsText())
-    case '/plan':
-      return void send(planText())
     case '/search':
     case '/find': {
       if (!arg) return void send('형식: /search <키워드> — 레인과의 지난 대화 전문 검색')
@@ -910,7 +1083,7 @@ async function handleCommand(text: string): Promise<void> {
     }
     case '/scan': {
       const n = scanProjects()
-      await Promise.all(listProjects().filter((p) => p.enabled).map((p) => collectStatus(p)))
+      await Promise.all(listProjects().map((p) => collectStatus(p)))
       return void send(`스캔 완료 — 새 프로젝트 ${n}건`)
     }
     case '/learn': {
@@ -965,7 +1138,7 @@ function tasksText(): string {
 }
 
 function projectsText(): string {
-  const ps = listProjects().filter((p) => p.enabled)
+  const ps = listProjects()
   if (ps.length === 0) return '등록된 프로젝트 없음 — /scan'
   return ps
     .map((p) => {
@@ -989,32 +1162,6 @@ function lessonsText(): string {
   })
   const more = all.length > top.length ? `\n… 외 ${all.length - top.length}건` : ''
   return `📚 학습 ${all.length}건 (사용 중 · 재사용순)\n\n${lines.join('\n')}${more}`
-}
-
-// /plan — 오늘~+7일 일정(반복 전개, 시각순) + 섹션별 미완료 todo. 결정론 즉답(레인 경유 없음).
-function planText(): string {
-  const items = listPlanItems().filter((i) => !i.done)
-  const now = new Date()
-  const from = fmtLocal(new Date(now.getFullYear(), now.getMonth(), now.getDate()))
-  const to = fmtLocal(new Date(now.getTime() + 7 * 86_400_000))
-  const evs = items
-    .flatMap((i) => occurrencesInRange(i, from, to).map((o) => ({ i, o })))
-    .sort((a, b) => a.o.localeCompare(b.o))
-    .map(({ i, o }) => `${o.replace('T', ' ')} ${i.title}${i.recur !== 'none' ? ' ↻' : ''}`)
-  const secs = new Map(listPlanSections().map((s) => [s.id, s.name]))
-  const todos = items.filter((i) => i.kind === 'todo')
-  const bySection = new Map<string, string[]>()
-  for (const t of todos) {
-    const name = t.sectionId ? secs.get(t.sectionId) ?? '기타' : '기타'
-    const list = bySection.get(name) ?? []
-    list.push(`☐ ${t.title}${t.startAt ? ` (마감 ${t.startAt.slice(0, 10)})` : ''}`)
-    bySection.set(name, list)
-  }
-  if (evs.length === 0 && bySection.size === 0) return '일정·할 일 없음'
-  const parts: string[] = []
-  if (evs.length) parts.push(`📅 일정\n${evs.join('\n')}`)
-  for (const [name, list] of bySection) parts.push(`📋 ${name}\n${list.join('\n')}`)
-  return parts.join('\n\n')
 }
 
 function stateGlyph(state: string): string {
@@ -1060,13 +1207,20 @@ async function dispatch(update: any): Promise<void> {
 }
 
 // ── 폴 루프 ──
+// once는 '발화했을 때만' 리스너를 뗀다 — 타이머가 정상 만료한 경우엔 그대로 남는다. 이 sleep의
+// 유일한 호출부가 실패 백오프(같은 세대의 signal을 실패 반복 내내 재사용)라, 네트워크 단절이 길어지면
+// 한 signal에 리스너가 계속 쌓였다(MaxListenersExceededWarning). 양쪽 경로에서 명시 해제한다.
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms)
-    signal?.addEventListener('abort', () => {
+    const onAbort = (): void => {
       clearTimeout(t)
       resolve()
-    }, { once: true })
+    }
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
   })
 }
 
@@ -1108,6 +1262,8 @@ function writeOffset(n: number): void {
 async function poll(gen: number, signal: AbortSignal): Promise<void> {
   let offset = readOffset()
   let backoff = 1000 // 지수 백오프 1s→30s, 성공 시 1s로 리셋
+  let consecutiveFails = 0 // 연속 poll 실패 횟수 — 재연결 공지 문턱 판정용(짧은 순단은 침묵)
+  let firstFailAt = 0 // 이번 연속 실패 구간의 시작 시각
   while (gen === genId && !signal.aborted) {
     // lastLoopTick·dispatchInFlight는 모듈 전역이지만, while 조건 직후(동기)라 여기 쓰는 건 항상 '활성 세대'다.
     lastLoopTick = Date.now() // 이 루프가 돌고 있음을 표시(헬스체크가 죽은 루프와 구분)
@@ -1121,6 +1277,15 @@ async function poll(gen: number, signal: AbortSignal): Promise<void> {
       // getUpdates 대기 중 재기동(genId 변경)됐으면 이 배치를 버린다 — offset 전진 금지(새 루프가 재수신).
       if (gen !== genId || signal.aborted) break
       lastError = null
+      // 연속 실패 후 회복 — 문턱(RECONNECT_FAIL_THRESHOLD) 이상이었을 때만 공지(짧은 순단엔 스팸 방지로 침묵).
+      // 그 사이 놓친 결정 대기는 reconcile()이 이어서 밀어준다.
+      if (consecutiveFails > 0) {
+        if (shouldAnnounceReconnect(consecutiveFails)) {
+          void send(buildReconnectMessage(firstFailAt, Date.now()))
+        }
+        consecutiveFails = 0
+        firstFailAt = 0
+      }
       backoff = 1000 // 성공 → 백오프 리셋
       // 처리(dispatch/reconcile)는 긴 Lain 턴을 포함할 수 있다(수 분). 이 구간엔 헬스체크가 '죽은 루프'로
       // 오판해 재기동하지 않도록 dispatchInFlight를 세운다. finally 리셋은 '이 세대가 아직 활성일 때만' —
@@ -1161,10 +1326,12 @@ async function poll(gen: number, signal: AbortSignal): Promise<void> {
         lastError = m
         break
       }
-      if (m !== lastError) tlog(`poll fail (${backoff}ms 후 재시도): ${m}`) // 변화 시에만 로깅
+      if (consecutiveFails === 0) firstFailAt = Date.now()
+      consecutiveFails++
+      if (m !== lastError) tlog(`poll fail (${backoff}ms 후 재시도, 연속 ${consecutiveFails}회): ${m}`) // 변화 시에만 로깅
       lastError = m
       await sleep(backoff, signal)
-      backoff = Math.min(backoff * 2, 30000) // 지수 증가, 30s 상한
+      backoff = nextBackoff(backoff) // 지수 증가, 30s 상한
     }
   }
 }
@@ -1177,7 +1344,6 @@ async function registerCommands(): Promise<void> {
         { command: 'status',    description: '현황 다이제스트' },
         { command: 'tasks',     description: '진행 중 작업 목록' },
         { command: 'projects',  description: '프로젝트 목록' },
-        { command: 'plan',      description: '오늘·이번 주 일정 + 체크리스트' },
         { command: 'approvals', description: '미해결 승인·결재 다시 보기' },
         { command: 'go',        description: '작업 시작: <프로젝트id> [작업내용]' },
         { command: 'cancel',    description: '작업 취소: <taskId>' },
@@ -1204,14 +1370,6 @@ export async function startTelegram(): Promise<void> {
     (q) => void pushQuestionToTelegram(q),
     (questionId, answerText) => resolveQuestionOnTelegram(questionId, answerText),
   )
-  onPlanReminder((item, occur) => {
-    void send(`⏰ ${occur.slice(11)} ${item.title}${item.body ? `\n${item.body.slice(0, 200)}` : ''}`, {
-      inline_keyboard: [[
-        { text: '✓ 완료', callback_data: `p${item.id}d` },
-        { text: '+10분', callback_data: `p${item.id}s` },
-      ]],
-    })
-  })
   const gen = ++genId
   running = true
   authFailed = false // 새 시도 — 이전 인증 실패 리셋
@@ -1294,11 +1452,14 @@ export function stopTelegram(): void {
     healthTimer = null
   }
   setNotifyHook(null)
-  onPlanReminder(null)
   sentApprovals.clear()
   sentReview.clear()
   sentBlocked.clear()
   sentDone.clear()
+  approvalsInFlight.clear()
+  reviewInFlight.clear()
+  blockedInFlight.clear()
+  doneInFlight.clear()
   askByMsg.clear()
   pendingChatId = null
 }
@@ -1345,6 +1506,29 @@ export async function sendTelegramPhoto(filePath: string, caption?: string): Pro
   } catch (e) {
     lastError = String((e as Error).message)
     tlog(`sendPhoto fail: ${lastError}`)
+    return false
+  }
+}
+
+/** P1 — 텍스트 내용을 문서 파일로 첨부 전송(sendDocument, multipart). 긴 diff 등 3800자 초과 텍스트용. */
+async function sendTelegramDocument(filename: string, content: string, caption?: string): Promise<boolean> {
+  const { telegramBotToken: token, telegramChatId: chatId } = getSettings()
+  if (!token || !chatId) return false
+  try {
+    const form = new FormData()
+    form.append('chat_id', chatId)
+    if (caption) form.append('caption', caption.slice(0, 1024))
+    form.append('document', new Blob([content], { type: 'text/plain' }), filename)
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+      method: 'POST',
+      body: form,
+    })
+    const json: any = await res.json()
+    if (!json.ok) throw new Error(json.description ?? String(res.status)) // 토큰 비노출
+    return true
+  } catch (e) {
+    lastError = String((e as Error).message)
+    tlog(`sendDocument fail: ${lastError}`)
     return false
   }
 }

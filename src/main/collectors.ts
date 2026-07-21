@@ -1,13 +1,13 @@
 // 현황 수집 (PLAN.md §10.1) — 읽기 전용, LLM 토큰 0. git/grep/verify를 셸로 직접.
-import { execFile, exec } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { Project, ProjectStatus } from '../shared/types'
 import { saveStatus } from './store'
+import { killTree } from './prockill'
 
 const execFileP = promisify(execFile)
-const execP = promisify(exec)
 
 async function git(cwd: string, ...args: string[]): Promise<string | null> {
   try {
@@ -67,25 +67,57 @@ export async function collectStatus(p: Project): Promise<void> {
 }
 
 const TAIL_CHARS = 2000
+const VERIFY_TIMEOUT = 5 * 60_000
+// 보관 버퍼 상한(구 maxBuffer 대체) — 프로세스는 죽이지 않고 꼬리만 유지해 메모리를 묶는다.
+const OUTPUT_CAP = 10 * 1024 * 1024
 
 /** 임의 디렉터리에서 verify 명령 실행 → pass/fail + 출력 꼬리. DB에 저장하지 않음(순수 실행).
- * D8 rebase 폴백이 worktree(project status와 별개)에서 검증을 다시 돌리는 데 재사용한다. */
-export async function verifyInDir(
-  cmd: string,
-  cwd: string,
-): Promise<{ pass: boolean; tail: string }> {
-  try {
-    const { stdout, stderr } = await execP(cmd, {
-      cwd,
-      windowsHide: true,
-      timeout: 5 * 60_000,
-      maxBuffer: 10 * 1024 * 1024,
+ * D8 rebase 폴백이 worktree(project status와 별개)에서 검증을 다시 돌리는 데 재사용한다.
+ *
+ * spawn(shell) 기반 — 타임아웃 시 Windows는 직속 자식(cmd.exe)만 죽이면 손자(node/vitest 등)가
+ * 고아로 남으므로 killTree로 프로세스 트리 전체를 종료한다(비 win32는 표준 kill). 반환 계약은
+ * 기존 execP 판정을 그대로 보존한다: pass = 종료코드 0(타임아웃/스폰오류 아님), tail = (stdout+stderr)
+ * 꼬리(TAIL_CHARS), 실패 시 출력이 비면 사유 문자열로 폴백. */
+export function verifyInDir(cmd: string, cwd: string): Promise<{ pass: boolean; tail: string }> {
+  return new Promise((resolve) => {
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const done = (pass: boolean, fallback: string): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      const combined = (stdout + stderr).slice(-TAIL_CHARS)
+      // 성공은 출력 그대로(빈 문자열도 원계약 유지), 실패는 출력이 비면 사유로 폴백.
+      resolve({ pass, tail: pass ? combined : combined || fallback.slice(-TAIL_CHARS) })
+    }
+
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(cmd, { cwd, shell: true, windowsHide: true })
+    } catch (e) {
+      done(false, String(e))
+      return
+    }
+
+    timer = setTimeout(() => {
+      killTree(child.pid) // 트리 전체 종료 — 손자 고아 방지
+      done(false, `verify 타임아웃(${VERIFY_TIMEOUT / 1000}s 초과): ${cmd}`)
+    }, VERIFY_TIMEOUT)
+
+    child.stdout?.on('data', (d: Buffer) => {
+      stdout += d.toString()
+      if (stdout.length > OUTPUT_CAP) stdout = stdout.slice(-OUTPUT_CAP)
     })
-    return { pass: true, tail: (stdout + stderr).slice(-TAIL_CHARS) }
-  } catch (e: any) {
-    const tail = (String(e?.stdout ?? '') + String(e?.stderr ?? '') || String(e)).slice(-TAIL_CHARS)
-    return { pass: false, tail }
-  }
+    child.stderr?.on('data', (d: Buffer) => {
+      stderr += d.toString()
+      if (stderr.length > OUTPUT_CAP) stderr = stderr.slice(-OUTPUT_CAP)
+    })
+    child.on('error', (e) => done(false, String(e)))
+    child.on('close', (code) => done(code === 0, `exit ${code}`))
+  })
 }
 
 /** verify_cmd 실행 → pass/fail + 출력 꼬리 저장. 수동 트리거 전용(Phase 0). */

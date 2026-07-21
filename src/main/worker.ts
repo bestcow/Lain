@@ -19,6 +19,7 @@ import {
   insertApproval,
   lessonsForProject,
   listTaskEvents,
+  rejectPendingApprovalsForTask,
   resolveApprovalRow,
   searchHistory,
   updateTask,
@@ -26,7 +27,7 @@ import {
 import { notifyUser } from './notify'
 import { runCodexNavi } from './codex'
 import { classifySystemDestructive } from './sysrisk'
-import { blocksSecretFile, blocksSecretPath, isTestFile, toolFilePath, SECRET_DENY_MESSAGE } from './safety'
+import { isTestFile } from './safety'
 import { shouldCompact, contextOccupancyTokens } from './compactgate'
 import { summarizeNaviHandoff, handoffBlock, taskEventsToDialogue } from './handoff'
 import type { ExitReason, Task, TaskEngine, TaskEvent } from '../shared/types'
@@ -36,7 +37,8 @@ import { capTaskImages, toImageBlocks } from './taskimages'
 import { NAVI_SENDER_LEGEND } from './navisender'
 import { conventionsBlock } from './conventions'
 import { naviSkillsBlock, isValidSkillName, readSkillBody } from './agentskills'
-import { thinkingOption, tierQueryOptions } from './agentopts'
+import { thinkingOption, tierQueryOptions, preToolUseGuard, secretDeny } from './agentopts'
+import type { PreToolDeny } from './agentopts'
 import { recordUsage } from './usage'
 import { parseTodoWriteInput, encodeTodoLine } from '../shared/todoline'
 import { shouldCheckpoint, formatCheckpoint } from './checkpoint'
@@ -72,6 +74,22 @@ export function sessionBaselineFor(
 /** baseline + 이 세션 cumulative = 라이프타임 누적. 동일세션 재갱신은 baseline이 고정이라 '교체', 새 세션은 가산. */
 export function lifetimeTokensFor(sessionBaseline: number, sessionCumulative: number): number {
   return sessionBaseline + sessionCumulative
+}
+
+/** #4 크래시 복원 갭 — 핸드오프 스왑은 (handoffMd 저장 · naviSessionId='') 를 원자적으로 쓰지만, 그 새 세션의
+ *  session_id가 init 메시지로 기록되기 전에 크래시하면 naviSessionId가 빈 채 handoffMd만 남는다. 복원(recoverTasks)은
+ *  resumePrompt로 재개하는데, naviSessionId가 비어 resume이 끊기고 스왑 블록(신규 handoff 생성)도 재개 경계가 아니라
+ *  안 타므로, 애써 써 둔 handoffMd가 프롬프트에 주입되지 않고 맥락이 유실된다. 이 경우 저장된 handoffMd를 다시
+ *  주입해야 새 세션이 진행 상황을 이어받는다.
+ *  조건: resume 못 함(naviSessionId 없음) · 재개 지시(resumePrompt) 있음 · 이번에 새 handoff를 만들지 않음(freshHandoff 아님)
+ *       · 저장된 handoffMd 존재. 브랜뉴 작업(resumePrompt·handoffMd 둘 다 없음)이나 정상 스왑(freshHandoff)은 제외. */
+export function shouldInjectStoredHandoff(
+  resuming: boolean,
+  hasResumePrompt: boolean,
+  hasFreshHandoff: boolean,
+  hasStoredHandoff: boolean,
+): boolean {
+  return !resuming && hasResumePrompt && !hasFreshHandoff && hasStoredHandoff
 }
 
 // 위험 분류 (§9-4) — best-effort 정규식. 진짜 방어선은 worktree 격리 + 병합 승인.
@@ -164,10 +182,16 @@ export interface ApprovalResult {
 
 interface PendingApproval {
   resolve: (res: ApprovalResult) => void
+  taskId?: string // A4 — 이 승인이 속한 작업(waitApproval opts.taskId). abort 시 함께 닫기 위한 역참조.
 }
 
 const pending = new Map<number, PendingApproval>()
 const abortControllers = new Map<string, AbortController>()
+
+// A4 — 실행 중인 Navi의 emit(task:event 채널). abortNavi가 승인 정리 후 기존 브로드캐스트 경로를
+// 한 번 태우는 데만 쓴다(ipc의 task:event 핸들러가 approvals:updated·트레이·폰 갱신을 묶어 처리).
+// abortControllers와 같은 지점에서 set/delete — 러너가 없으면 undefined라 emit은 생략된다.
+const naviEmitters = new Map<string, (ev: TaskEvent) => void>()
 
 // C1 — 무인 작업의 "승인/질문 대기 중"(D4 hold) task id 추적. 영속 상태·스키마 없음(인메모리 Set) —
 // 재부팅 시 비고, recoverTasks가 'working' 작업을 재개→도구 재시도→canUseTool이 다시 hold 진입하며
@@ -193,6 +217,24 @@ export function abortNavi(taskId: string): void {
   // C1 — abort로 대기가 끝나는 경로. waitApproval의 hold Promise는 abort 시 스스로 resolve하지 않으므로
   // (canUseTool이 중단돼 wrapped resolve가 안 불림) 여기서 확실히 clear한다(누수 방지).
   awaitingApprovalIds.delete(taskId)
+  // A4 — 이 작업의 pending 승인도 함께 닫는다. 그냥 두면 스트림은 죽었는데 승인함 카드·트레이 배지·
+  // 텔레그램 목록에 유령으로 남고, 눌러도 소비자 없는 promise만 깨운다.
+  // (a) 인메모리 대기자 — deny로 깨워 정리. 이미 abort된 스트림이라 반환 deny는 소비되지 않는다(동작 변화 없음).
+  for (const [id, p] of pending) {
+    if (p.taskId !== taskId) continue
+    pending.delete(id)
+    p.resolve({ approved: false })
+  }
+  // (b) DB 행 — 한 번에 rejected로 닫는다(부팅 스윕 clearOrphanApprovals의 작업 한정판).
+  // 실제로 닫은 행이 있을 때만 기존 브로드캐스트 경로를 한 번 태운다(ipc의 task:event 핸들러가
+  // 승인함·트레이·폰 갱신을 묶어 처리) — 그래야 유령 카드가 화면에서도 사라진다. 러너가 없으면 생략.
+  try {
+    const closed = rejectPendingApprovalsForTask(taskId)
+    if (closed > 0)
+      naviEmitters.get(taskId)?.({ taskId, kind: 'status', text: '중단 — 대기 중이던 승인을 닫았다' })
+  } catch {
+    /* 승인함 정리 실패는 무시 — 중단(abort) 자체는 이미 끝났고 되돌릴 수 없다 */
+  }
 }
 
 /** §5.7 인터럽트 가능 여부 — 현재 Navi가 실행 중(abort 등록됨)인지 */
@@ -325,6 +367,7 @@ export function waitApproval(id: number, opts: WaitApprovalOpts = {}): Promise<A
       }, APPROVAL_TIMEOUT_MS)
     }
     pending.set(id, {
+      taskId: opts.taskId, // A4 — abortNavi가 이 작업의 대기자를 찾아 함께 닫기 위한 역참조
       resolve: (v) => {
         if (timer) clearTimeout(timer)
         if (opts.taskId) awaitingApprovalIds.delete(opts.taskId) // C1 — 정상 응답/거절로 대기 종료
@@ -334,11 +377,11 @@ export function waitApproval(id: number, opts: WaitApprovalOpts = {}): Promise<A
   })
 }
 
-// §22 retrieval — 이 프로젝트에서 누적된 교훈을 프롬프트에 주입(fresh start만).
-// 주입된 교훈은 reuse_count++ (성장 추이). 임베딩 검색은 후속 — 지금은
+// §22 retrieval — 이 프로젝트에서 누적된 학습을 프롬프트에 주입(fresh start만).
+// 주입된 학습은 reuse_count++ (성장 추이). 임베딩 검색은 후속 — 지금은
 // 프로젝트 매칭 + 재사용·최신순 top-K로 시작.
 function lessonsBlock(task: Task, countInject = true): string {
-  // §24 — 작업 내용(TASK.md)을 질의로 줘 관련도 높은 교훈을 우선 주입(콘텐츠-인지 랭킹).
+  // §24 — 작업 내용(TASK.md)을 질의로 줘 관련도 높은 학습을 우선 주입(콘텐츠-인지 랭킹).
   const lessons = lessonsForProject(task.projectId, 8, task.content)
   if (lessons.length === 0) return ''
   // i10 — 프롬프트에 실제 주입 = inject_count++. 진짜 '재사용'(도움됨)은 reflect의
@@ -350,8 +393,19 @@ function lessonsBlock(task: Task, countInject = true): string {
     .join('\n')
   return `
 
-## 과거 작업에서 학습한 교훈 (§22 — 참고하되 맹신 말 것. 틀리거나 해로운 교훈은 mcp__lain__flag_lesson 으로 신고)
+## 과거 작업에서 학습한 학습 (§22 — 참고하되 맹신 말 것. 틀리거나 해로운 학습은 mcp__lain__flag_lesson 으로 신고)
 ${items}`
+}
+
+// L3(P6) — 완료 조건 체크리스트(DoD). elicit(§21.3)가 확정한 criteria를 Navi 프롬프트에 그대로 박아
+// 자기검증을 강제한다(순수 — worker.test.ts처럼 직접 import되는 함수라 SDK 의존 없이 테스트 가능).
+export function criteriaBlock(criteria: string[] | undefined): string {
+  if (!criteria?.length) return ''
+  return [
+    '## 완료 조건 체크리스트',
+    ...criteria.map((c) => `- [ ] ${c}`),
+    '완료 보고 전에 항목별로 스스로 검증하고, 모두 충족했을 때만 done으로 보고하라. 미충족 항목은 blocked 사유에 명시하라.',
+  ].join('\n')
 }
 
 // §24 Phase1 — 워크스페이스 스냅샷. 이미 결정론으로 수집된 프로젝트 메타(스택·검증 명령)를
@@ -386,6 +440,9 @@ function naviPrompt(task: Task, countInject = true): string {
   // 인터럽트/blocked 재개 텍스트는 navichat·orchestrator에서 이미 태깅돼 오고, 이 선두 블록은 세션 히스토리에 있어 재주입 안 한다.
   // 컨벤션은 worktree가 아니라 '원본 프로젝트 경로'에서 읽는다 — worktree 상위는 워크스페이스가 아니라 상위 컨벤션을 놓친다.
   const conventions = conventionsBlock(getProject(task.projectId)?.path ?? '')
+  // L3(P6) — 구조화 criteria(elicit 영속분)가 있으면 별도 블록으로 주입. 없으면 content의 '## 합격 기준'
+  // 텍스트(orchestrator append)만 남아 하위호환 유지.
+  const critBlock = criteriaBlock(task.criteria)
   return `${NAVI_SENDER_LEGEND}${conventions}너는 lain의 Navi다. 이 디렉터리는 전용 git worktree이고 현재 브랜치(${task.branch})가 네 작업 브랜치다.
 
 ## 작업 지시 (TASK.md)
@@ -395,7 +452,7 @@ ${task.content}
 - 이 worktree 안에서만 작업한다. 절대 다른 경로를 수정하지 않는다.
 - 브랜치 변경 금지, push 금지(승인제). 의미 있는 단위로 커밋해라(커밋은 자유).
 - 검증 명령이 명시돼 있으면 실행해 통과시켜라. 통과 못 하면 솔직히 보고해라.
-- **작업 중 판단이 필요한 모호함이 생기면 mcp__lain__ask_manager 도구로 질문해라** — 답을 받아 그 자리에서 이어갈 수 있다. 사소한 재량은 묻지 말고 보수적 기본값으로 진행. 비슷한 작업을 전에 어떻게 처리했는지 궁금하면 mcp__lain__search_history로 과거 기록을 먼저 검색해라.${autonomousNote}${workspaceSnapshot(task)}${lessonsBlock(task, countInject)}${naviSkillsBlock(task.content)}
+- **작업 중 판단이 필요한 모호함이 생기면 mcp__lain__ask_manager 도구로 질문해라** — 답을 받아 그 자리에서 이어갈 수 있다. 사소한 재량은 묻지 말고 보수적 기본값으로 진행. 비슷한 작업을 전에 어떻게 처리했는지 궁금하면 mcp__lain__search_history로 과거 기록을 먼저 검색해라.${autonomousNote}${workspaceSnapshot(task)}${lessonsBlock(task, countInject)}${naviSkillsBlock(task.content)}${critBlock ? `\n\n${critBlock}` : ''}
 - 작업을 끝내면(또는 ask_manager로도 해소가 안 되면) 마지막 메시지를 반드시 아래 JSON 한 블록으로 끝내라:
 
 \`\`\`json
@@ -462,15 +519,18 @@ export async function runNavi(
   if (externalRunner) {
     const cac = new AbortController()
     abortControllers.set(task.id, cac)
+    naviEmitters.set(task.id, emit) // A4 — abort 시 승인 정리 브로드캐스트용
     try {
       return await externalRunner(task, emit, opts, cac.signal)
     } finally {
       abortControllers.delete(task.id)
+      naviEmitters.delete(task.id)
     }
   }
 
   const ac = new AbortController()
   abortControllers.set(task.id, ac)
+  naviEmitters.set(task.id, emit) // A4 — abort 시 승인 정리 브로드캐스트용
   let lastText = ''
   let aborted = false
   // D6 체크포인트 상태(이 run 동안만) — SDK는 turns/tokens를 result(세션 종료)에만 준다. 세션 중엔
@@ -495,6 +555,33 @@ export async function runNavi(
   //  - warnedSigs: 무진전 warn을 이미 1회 준 sig. warn이 deny로 나가면 도구가 안 돌아 repeats가
   //    안 오르므로, 같은 sig가 또 오면 이 플래그로 하드 deny로 점층한다(warn→deny 단조 진행 보장).
   const warnedSigs = new Set<string>()
+
+  // 결정론 차단(기계적 거부) — PreToolUse 훅과 canUseTool이 공유하는 순수 판정.
+  // canUseTool은 auto-allow된 도구 호출에서 아예 불리지 않으므로(실측) 실발동은 훅이 담당한다.
+  // 범위는 종전 canUseTool 가드와 동일: ① autonomous 테스트 파일 수정(§21.6 spec-gaming 방어)
+  // ② 시크릿 파일/명령/경로(§24 Phase1 + §3 i15s). 그 이상은 넓히지 않는다(과차단 금지).
+  const denyCheck = (toolName: string, input: unknown): PreToolDeny | null => {
+    if (task.mode === 'autonomous') {
+      const fp = String((input as any)?.file_path ?? (input as any)?.path ?? '')
+      const isTestEdit =
+        (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') && isTestFile(fp)
+      if (isTestEdit) {
+        return {
+          kind: 'spec_gaming',
+          detail: `테스트 파일 수정 거부 (${fp})`,
+          message:
+            '테스트 파일은 수정할 수 없다(§21.6). 테스트가 틀렸다고 판단되면 고치지 말고 blocked로 보고해라.',
+        }
+      }
+    }
+    return secretDeny(toolName, input)
+  }
+  // 차단 1건을 glass-box에 남긴다(종전 canUseTool 경로와 동일한 exitReason/denyDetail 계약).
+  const recordDeny = (_toolName: string, d: PreToolDeny): void => {
+    exitReason = 'blocked'
+    denyDetail = `${d.kind}: ${d.detail}`
+    log('status', `${d.kind === 'spec_gaming' ? 'spec-gaming' : 'secret'} 차단: ${d.detail}`)
+  }
 
   // ask_manager: in-process MCP 툴 (§5.2 작업 중간 인터럽트)
   const lainServer = createSdkMcpServer({
@@ -546,27 +633,27 @@ export async function runNavi(
           return { content: [{ type: 'text', text: body }] }
         },
       ),
-      // §24 Phase3 patch-on-use — 주입된 교훈이 틀렸으면 Navi가 신고 → 즉시 soft-archive(품질 폐루프).
+      // §24 Phase3 patch-on-use — 주입된 학습이 틀렸으면 Navi가 신고 → 즉시 soft-archive(품질 폐루프).
       tool(
         'flag_lesson',
-        '주입된 과거 교훈([L<번호>])이 이 작업에서 틀렸거나 해로웠으면 신고한다. 즉시 보관되어 다음 작업에 더는 주입되지 않는다.',
+        '주입된 과거 학습([L<번호>])이 이 작업에서 틀렸거나 해로웠으면 신고한다. 즉시 보관되어 다음 작업에 더는 주입되지 않는다.',
         {
-          lesson_id: z.number().describe('교훈 번호([L 뒤의 숫자])'),
+          lesson_id: z.number().describe('학습 번호([L 뒤의 숫자])'),
           reason: z.string().optional().describe('왜 틀렸는지 한 줄'),
         },
         async ({ lesson_id, reason }) => {
           const archived = flagLesson(lesson_id)
           log(
             'status',
-            `교훈 신고 L${lesson_id}: ${archived ? '보관됨' : '대상아님(핀/이미보관/없음)'}${reason ? ` — ${reason.slice(0, 80)}` : ''}`,
+            `학습 신고 L${lesson_id}: ${archived ? '보관됨' : '대상아님(핀/이미보관/없음)'}${reason ? ` — ${reason.slice(0, 80)}` : ''}`,
           )
           return {
             content: [
               {
                 type: 'text',
                 text: archived
-                  ? `교훈 L${lesson_id}을 보관했다 — 다음 작업엔 주입되지 않는다.`
-                  : `교훈 L${lesson_id}은 신고 대상이 아니다(핀 고정/이미 보관/없는 번호).`,
+                  ? `학습 L${lesson_id}을 보관했다 — 다음 작업엔 주입되지 않는다.`
+                  : `학습 L${lesson_id}은 신고 대상이 아니다(핀 고정/이미 보관/없는 번호).`,
               },
             ],
           }
@@ -605,6 +692,14 @@ export async function runNavi(
     }
   }
 
+  // #4 크래시 복원 갭 — 스왑 도중(handoffMd 저장 · naviSessionId='') 크래시 후 복원되면 resume은 끊겼는데
+  // 위 스왑 블록도 안 타(재개 경계 미도달) handoffInject가 비어, 저장된 핸드오프가 프롬프트에 안 실린다.
+  // 이 경우 저장된 handoffMd를 다시 주입해 새 세션이 진행 상황을 이어받게 한다(맥락 유실 방지).
+  if (shouldInjectStoredHandoff(!!resume, !!opts.resumePrompt, !!handoffInject, !!task.handoffMd)) {
+    handoffInject = handoffBlock(task.handoffMd)
+    log('status', '🔄 복원 — 저장된 핸드오프 md로 맥락 이어감(스왑 중 크래시 복구)')
+  }
+
   // I4 — 라이프타임 토큰 누적 baseline 확정(resume 여부가 이제 최종이라 여기서 정한다).
   //  - resume 있음(동일 세션 이어가기): 저장된 baseline(session_base_tokens)을 그대로 쓴다. 이 세션의 result는
   //    세션 cumulative를 보고하므로 tokens_total = baseline + cumulative가 되어 동일세션 재갱신은 '교체'다(중복 없음).
@@ -618,7 +713,7 @@ export async function runNavi(
 
   // 프롬프트 3분기: ①진짜 resume(세션에 규칙·히스토리 있음) ②핸드오프 스왑(새 세션 — 규칙 재공급 + 핸드오프)
   // ③신규 작업. 스왑은 resume이 끊겼지만 opts.resumePrompt는 살아있어 '이어가기'로 이어붙인다.
-  // naviPrompt(task, false) — 스왑은 같은 작업의 연속이라 교훈 inject_count를 다시 올리지 않는다(적합도 신호 보존).
+  // naviPrompt(task, false) — 스왑은 같은 작업의 연속이라 학습 inject_count를 다시 올리지 않는다(적합도 신호 보존).
   const promptText = resume
     ? `${opts.resumePrompt}\n\n(이건 이어가는 작업이다 — 이미 끝낸 단계를 처음부터 다시 하지 말고 남은 것만 진행해라. 끝나면 동일한 JSON 보고 형식으로 마무리.)`
     : handoffInject
@@ -666,6 +761,8 @@ export async function runNavi(
         // B4 fast-mode — 작업별 Opus 빠른 출력 모드. SDK는 settings(inline Settings)로 받는다(settingSources와 별개라 정체성 오염 0).
         ...(task.fastMode ? { settings: { fastMode: true } } : {}),
         ...skillOptions(task.skills, getSettings().skillsEnabled, getSettings().curatedPlugins),
+        // 결정론 차단(시크릿·spec-gaming)의 실발동 지점 — auto-allow된 호출도 PreToolUse는 반드시 거친다.
+        ...preToolUseGuard(denyCheck, recordDeny),
 
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
@@ -736,39 +833,12 @@ export async function runNavi(
             }
           }
 
-          // §21.6 spec-gaming 방어 (autonomous 전용) — 테스트 파일 수정 거부.
-          // autonomous는 테스트가 판사이므로 Navi가 판사를 못 고치게 막는다.
-          if (task.mode === 'autonomous') {
-            const fp = String((input as any)?.file_path ?? (input as any)?.path ?? '')
-            const isTestEdit =
-              (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') &&
-              isTestFile(fp)
-            if (isTestEdit) {
-              exitReason = 'blocked'
-              denyDetail = `spec_gaming: 테스트 파일 수정 거부 (${fp})`
-              log('status', `spec-gaming 차단: 테스트 파일 수정 거부 (${fp})`)
-              return {
-                behavior: 'deny',
-                message:
-                  '테스트 파일은 수정할 수 없다(§21.6). 테스트가 틀렸다고 판단되면 고치지 말고 blocked로 보고해라.',
-              }
-            }
-          }
-
-          // 비밀 파일 데노리스트 (§24 Phase1) — 파일 도구가 시크릿을 모델 컨텍스트로 끌어오는 것 차단.
-          if (blocksSecretFile(toolName, input)) {
-            exitReason = 'blocked'
-            denyDetail = `secret_denied: 비밀 파일 접근 (${path.basename(toolFilePath(input))})`
-            log('status', `secret 차단: 비밀 파일 접근 거부 (${path.basename(toolFilePath(input))})`)
-            return { behavior: 'deny', message: SECRET_DENY_MESSAGE }
-          }
-          // i15s — 셸 명령/인자에 박힌 절대경로가 비밀 파일·디렉터리를 가리키면 차단.
-          // blocksSecretFile은 파일도구 input 전용이라 Bash/PowerShell 명령은 못 막는다 — 그 빈틈을 blocksSecretPath로 메운다.
-          if (blocksSecretPath(cmd) || blocksSecretPath(toolFilePath(input))) {
-            exitReason = 'blocked'
-            denyDetail = `secret_denied: 명령/경로에 비밀 파일 참조 (${toolName})`
-            log('status', `secret 차단: 명령/경로에 비밀 파일 참조 (${toolName})`)
-            return { behavior: 'deny', message: SECRET_DENY_MESSAGE }
+          // 결정론 차단(spec-gaming §21.6 · 시크릿 §24 Phase1/§3 i15s)은 PreToolUse 훅이 모든 호출에서
+          // 이미 판정했다. 여기 한 번 더 보는 것은 훅이 등록되지 않았을 때를 위한 이중 방어 — 순수 판정.
+          const mechanical = denyCheck(toolName, input)
+          if (mechanical) {
+            recordDeny(toolName, mechanical)
+            return { behavior: 'deny', message: mechanical.message }
           }
 
           // 경로 가둠 (§9-2): 워크스페이스 루트 밖 절대경로가 명령에 보이면 승인 대상. 루트는 E6 설정
@@ -997,6 +1067,7 @@ export async function runNavi(
     }
   } finally {
     abortControllers.delete(task.id)
+    naviEmitters.delete(task.id)
   }
 
   // i9 — 종료 사유 1회 적재. 보고 유무로 done/blocked 보강(canUseTool가 막지 않았을 때만).

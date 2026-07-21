@@ -44,11 +44,6 @@ export function todoProgress(todos: TodoItem[]): { done: number; total: number }
   return { done: todos.filter((t) => t.status === 'completed').length, total: todos.length }
 }
 
-/** 지금 진행 중인 항목(activeForm 표시용) — 여럿이면 첫 번째. 없으면 null. */
-export function currentTodo(todos: TodoItem[]): TodoItem | null {
-  return todos.find((t) => t.status === 'in_progress') ?? null
-}
-
 // ── 인코딩 — task_events.content / ChatMessage.content 한 문자열에 todos를 실어 나른다 ──
 // toolline.ts와 동일한 "표시 라인 + 구분자 + 원문" 형태이되, 원문은 JSON(todos 배열)이다.
 const TODO_PREFIX = '§todo§'

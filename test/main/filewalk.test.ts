@@ -58,6 +58,34 @@ describe('isIgnored — 규칙 적용', () => {
   })
 })
 
+// 클론 관점 감사(요청 4번) — glob→정규식 변환이 백트래킹 기반이던 시절, '*a*a*a*...*!' 같은 패턴이
+// 담긴 .gitignore(공급망 공격면: 리포에 커밋된 파일)에서 그 패턴에 매치 실패하는 긴 파일명을 만나면
+// 지수 시간 백트래킹으로 @파일 자동완성이 통째로 멈췄다(수정 전 실측: 아래와 동일한 40자 내외 입력에서
+// 수 초~수십 초). DP 기반 재작성 후 동일 입력이 밀리초 단위로 끝나는지 검증한다.
+describe('isIgnored — ReDoS 방어(적대적 별표 연쇄 패턴, DP 재작성 회귀)', () => {
+  it('별표·리터럴이 교대로 반복되는 패턴 + 매치 실패하는 긴 파일명 — 지수 폭발 없이 즉시 판정', () => {
+    // 인접한 [^/]* 구간들이 같은 문자를 나눠 가지는 조합을 지수적으로 재시도하게 만드는 전형적 ReDoS 패턴.
+    const evilPattern = Array.from({ length: 30 }, () => '*a').join('') + '*!'
+    const rules = parseGitignore(evilPattern)
+    // 끝이 '!'가 아니라 매치가 최종 실패해야 최악의 백트래킹 경로를 탄다.
+    const evilFilename = 'x' + 'a'.repeat(60) + 'x'
+    const t0 = Date.now()
+    const result = isIgnored(evilFilename, false, rules)
+    const elapsed = Date.now() - t0
+    expect(result).toBe(false) // 매치 실패(끝이 '!' 아님)
+    expect(elapsed).toBeLessThan(1000) // 수정 전엔 이 크기에서도 수 초~수십 초 걸렸다
+  })
+
+  it('별표 100개 연쇄 + 10만자 파일명도 상한 시간 안에 끝난다', () => {
+    const evilPattern = '*b'.repeat(100) + '!'
+    const rules = parseGitignore(evilPattern)
+    const evilFilename = 'b'.repeat(100_000) + 'x'
+    const t0 = Date.now()
+    expect(() => isIgnored(evilFilename, false, rules)).not.toThrow()
+    expect(Date.now() - t0).toBeLessThan(2000)
+  })
+})
+
 describe('walkProjectFiles — 실제 디렉터리 순회', () => {
   let root: string
 

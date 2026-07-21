@@ -182,8 +182,10 @@ export function diffBody(project: Project, taskId: string): string {
 }
 
 /** 변경 파일 목록 (merge-base..작업트리, name-only). 커밋·미커밋 추적변경 모두 포함 —
- * §24 spec-gaming 사후검증(테스트 파일이 Bash sed 등으로 바뀌었는지)에 쓴다. */
-export function changedFiles(project: Project, taskId: string): string[] {
+ * §24 spec-gaming 사후검증(테스트 파일이 Bash sed 등으로 바뀌었는지)에 쓴다.
+ * git 조회 실패 시 null — '변경 파일 없음'([])과 '조회 불능'을 호출부가 구분해야
+ * 사후검증이 조용히 fail-open 되지 않는다. */
+export function changedFiles(project: Project, taskId: string): string[] | null {
   const wtPath = path.join(WT_ROOT, taskId)
   try {
     const mainHead = git(project.path, 'rev-parse', 'HEAD')
@@ -191,7 +193,7 @@ export function changedFiles(project: Project, taskId: string): string[] {
     const out = git(wtPath, 'diff', '--name-only', base)
     return out ? out.split(/\r?\n/).filter(Boolean) : []
   } catch {
-    return []
+    return null
   }
 }
 
@@ -205,12 +207,6 @@ export function mergeTargetRef(project: Project): string | null {
   } catch {
     return null
   }
-}
-
-/** D8 — 되돌릴 병합 범위. base=병합 직전 main tip(exclusive), head=병합 후 main tip(inclusive). */
-export interface MergeSha {
-  baseSha: string
-  headSha: string
 }
 
 /** 병합 시도: 메인 체크아웃이 clean하고 ff 가능할 때만 (PLAN.md §17 merge-back 보수적 버전)

@@ -27,23 +27,38 @@ function sidecarDir(): string {
     : path.join(PROJECT_ROOT, 'sidecar', 'supertonic')
 }
 
-async function health(): Promise<{ ready: boolean; downloading?: boolean; progress?: number } | null> {
+// 헬스체크 타임아웃 — dead handle 판정(아래 ensureSupertonic)의 근거라 짧게 잡는다. 이게 무한 대기하면
+// '핸들은 안 죽었는데 응답이 없는' 프로세스를 영영 dead로 판정 못 해 재기동이 막힌다.
+const HEALTH_TIMEOUT_MS = 3000
+async function health(): Promise<{ ready: boolean } | null> {
+  const ac = new AbortController()
+  const t = setTimeout(() => ac.abort(), HEALTH_TIMEOUT_MS)
   try {
-    const r = await fetch(`http://127.0.0.1:${PORT}/health`)
+    const r = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: ac.signal })
     if (!r.ok) return null
     return (await r.json()) as { ready: boolean }
   } catch {
     return null
+  } finally {
+    clearTimeout(t)
   }
-}
-
-export function supertonicPort(): number {
-  return PORT
 }
 
 /** 사이드카를 보장(이미 떠 있으면 그대로). 스폰만 하고 모델 준비 완료는 기다리지 않는다 — 준비 전 /tts는 503. */
 export async function ensureSupertonic(): Promise<number> {
-  if (child && !child.killed) return PORT
+  if (child && !child.killed) {
+    // dead handle 방어 — child.killed는 우리가 kill()을 호출했을 때만 true가 된다. 프로세스가 멎어(응답
+    // 불가) 있는데 OS상 아직 살아 있으면(exit 이벤트 미발생) 이 가드만으로는 영영 재기동을 못 한다.
+    // 짧은 헬스체크로 실제 응답 여부를 확인하고, 무응답이면 죽은 것으로 간주해 정리 후 재기동한다.
+    if (await health()) return PORT
+    slog('dead handle 감지(헬스체크 무응답) — 기존 프로세스 정리 후 재기동')
+    try {
+      child.kill()
+    } catch {
+      /* ignore */
+    }
+    child = null
+  }
   if (starting) return starting
   starting = (async () => {
     const h = await health()
@@ -91,11 +106,6 @@ export async function ensureSupertonic(): Promise<number> {
   } finally {
     starting = null
   }
-}
-
-/** 현재 모델 준비/다운로드 상태(설정 UI 표시용). 미기동이면 null. */
-export async function supertonicStatus(): Promise<{ ready: boolean; downloading?: boolean; progress?: number } | null> {
-  return health()
 }
 
 export function stopSupertonic(): void {

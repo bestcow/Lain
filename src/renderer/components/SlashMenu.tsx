@@ -21,7 +21,6 @@ export const SLASH_COMMANDS: SlashCmd[] = [
   { cmd: '/verify', label: '검증 실행', arg: '<프로젝트id>' },
   { cmd: '/cancel', label: '작업 취소', arg: '<taskId>' },
   { cmd: '/learn', label: '절차를 스킬로 학습·저장', arg: '<주제·URL·경로·"방금 한 작업">' },
-  { cmd: '/plan', label: '플래너 열기' },
   { cmd: '/compact', label: '컨텍스트 수동 압축(임계 도달 전에도)' }, // A5
 ]
 

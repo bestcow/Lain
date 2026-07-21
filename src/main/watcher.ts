@@ -10,12 +10,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getSettings } from './store'
 import { overlayCooldownScale } from './quips'
+import { isDevForeground, parseDevApps } from './devfocus'
 import { DATA_DIR } from './paths'
 import { appendCapped } from './logfile'
 
 export type ObservationReason = 'idle' | 'app-switch' | 'title-change'
 export type Observation = {
-  app: string // 프로세스 이름 (예: WINWORD, Code, FL64)
+  app: string // 프로세스 이름 (예: Code, chrome, WindowsTerminal)
   title: string // 창 제목 (시크릿일 수 있어 로그엔 남기지 않는다 §9-6)
   idleSec: number
   reason: ObservationReason
@@ -57,7 +58,8 @@ function isSensitive(app: string, title: string, blacklist: string[]): boolean {
 }
 
 // 단일 상주 PowerShell 스크립트 — Add-Type 1회 후 루프하며 "프로세스명\t제목"을 interval마다 출력.
-function buildPsScript(pollMs: number): string {
+// export는 테스트에서 이 본문을 실제로 실행해 출력 형식을 검증하기 위한 것(동작은 동일).
+export function buildPsScript(pollMs: number): string {
   return [
     "$ErrorActionPreference = 'SilentlyContinue'",
     'Add-Type @"',
@@ -106,6 +108,15 @@ function handleLine(raw: string): void {
   }
   // 민감 앱이 포그라운드면 콘텐츠·반응 일절 스킵 (상태만 갱신)
   if (isSensitive(app, title, s.monitorSensitiveApps)) {
+    lastApp = app
+    lastTitle = title
+    wasIdle = false
+    return
+  }
+  // 개발 컨텍스트 밖이면 캡처·관찰 자체를 하지 않는다 (비용·프라이버시) — isSensitive와 동형으로
+  // 상태(lastApp/lastTitle/wasIdle)를 갱신하고 return: 안 그러면 비개발 앱 위에 오래 머무는 동안
+  // 값이 정체되어, 개발 컨텍스트로 복귀한 첫 줄의 appChanged/justWentIdle 판정이 오염된다.
+  if (!isDevForeground(app, title, parseDevApps(s.overlayDevApps))) {
     lastApp = app
     lastTitle = title
     wasIdle = false
@@ -201,8 +212,12 @@ async function emitObservation(base: Observation): Promise<void> {
   }
 }
 
-export function startWatcher(): void {
+export function startWatcher(isAutoRestart = false): void {
   if (psProc) return
+  // 신규(외부) 기동은 재시작 카운터를 리셋한다 — 소진(5회) 후 감시 토글/오버레이 재평가로 다시 켜진
+  // 건강한 세션이 단 1번의 크래시에 영구 정지하던 회귀 차단. 자동 재시작(exit 핸들러)은 리셋하지 않아
+  // 크래시 루프 누적 판정을 유지한다.
+  if (!isAutoRestart) restartCount = 0
   let pollMs = 1500
   try {
     pollMs = Math.max(500, getSettings().monitorPollMs)
@@ -252,7 +267,7 @@ export function startWatcher(): void {
         restartCount++
         log(`watcher auto-restart #${restartCount} in 5s`)
         setTimeout(() => {
-          if (!psProc && !intentionalStop) startWatcher()
+          if (!psProc && !intentionalStop) startWatcher(true)
         }, 5000)
       }
     })
@@ -276,10 +291,6 @@ export function stopWatcher(): void {
     }
     log('watcher stopped')
   }
-}
-
-export function isWatcherRunning(): boolean {
-  return psProc != null
 }
 
 // 본체 레인 채팅 주입용 — 사용자가 지금 보고 있는 앱/창. 민감 앱은 노출 안 함(§9-6), watcher 꺼짐·자기 창이면 null.

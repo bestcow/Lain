@@ -50,36 +50,35 @@ const proj = {
   stack: 'node',
   isGit: true,
   verifyCmd: null,
-  enabled: true,
 }
 
-// 핵심 의도: '제거'는 하드 삭제가 아니라 숨김 — 레인이 쌓은 교훈/대화가 날아가지 않아야 한다.
+// 핵심 의도: '제거'는 하드 삭제가 아니라 숨김 — 레인이 쌓은 학습/대화가 날아가지 않아야 한다.
 describe('내비 제거 = 숨김(데이터 보존)', () => {
-  it('hideProject: 보드 목록에서만 빠지고 교훈은 보존, unhide로 복원', () => {
+  it('hideProject: 보드 목록에서만 빠지고 학습은 보존, unhide로 복원', () => {
     upsertProject(proj)
     insertLesson({
       projectId: proj.id,
       taskId: '',
       scope: 'project',
       trigger: '결제 모듈',
-      lesson: '쌓인 교훈 — 사라지면 안 됨',
+      lesson: '쌓인 학습 — 사라지면 안 됨',
       origin: 'user',
     })
 
-    // 초기: 목록에 있고 교훈도 있음
+    // 초기: 목록에 있고 학습도 있음
     expect(listProjects().some((p) => p.id === proj.id)).toBe(true)
-    expect(lessonsForProject(proj.id).some((l) => l.lesson === '쌓인 교훈 — 사라지면 안 됨')).toBe(true)
+    expect(lessonsForProject(proj.id).some((l) => l.lesson === '쌓인 학습 — 사라지면 안 됨')).toBe(true)
 
-    // 제거 = 숨김: 목록에서 빠지지만 행은 존재(getProject), 교훈도 보존
+    // 제거 = 숨김: 목록에서 빠지지만 행은 존재(getProject), 학습도 보존
     hideProject(proj.id)
     expect(listProjects().some((p) => p.id === proj.id)).toBe(false)
     expect(getProject(proj.id)).not.toBeNull()
-    expect(lessonsForProject(proj.id).some((l) => l.lesson === '쌓인 교훈 — 사라지면 안 됨')).toBe(true)
+    expect(lessonsForProject(proj.id).some((l) => l.lesson === '쌓인 학습 — 사라지면 안 됨')).toBe(true)
 
-    // 같은 폴더 재추가(숨김 해제) → 목록 복원 + 교훈 그대로
+    // 같은 폴더 재추가(숨김 해제) → 목록 복원 + 학습 그대로
     unhideProject(proj.id)
     expect(listProjects().some((p) => p.id === proj.id)).toBe(true)
-    expect(lessonsForProject(proj.id).some((l) => l.lesson === '쌓인 교훈 — 사라지면 안 됨')).toBe(true)
+    expect(lessonsForProject(proj.id).some((l) => l.lesson === '쌓인 학습 — 사라지면 안 됨')).toBe(true)
   })
 
   it('upsertProject(스캔 재등록)는 hidden을 보존 — 숨긴 내비를 되살리지 않음', () => {

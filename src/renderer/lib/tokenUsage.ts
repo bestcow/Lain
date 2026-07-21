@@ -5,7 +5,7 @@
 import type { TaskUsageRow } from '../../shared/types'
 
 /** 로컬 날짜 키 'YYYY-MM-DD' — created_at(UTC 'YYYY-MM-DD HH:MM:SS' 또는 ISO)을 로컬 타임존 날짜로. */
-export function localDayKey(createdAt: string, now = new Date()): string {
+export function localDayKey(createdAt: string): string {
   const d = parseUtcStamp(createdAt)
   if (!d) return ''
   return fmtLocalDay(d)
@@ -69,7 +69,7 @@ export function summarizeUsage(
   let todayCost = 0
   let todayCount = 0
   for (const r of rows) {
-    const key = localDayKey(r.createdAt, now)
+    const key = localDayKey(r.createdAt)
     if (!key) continue
     const tok = r.tokens || 0
     const cost = r.costUsd || 0

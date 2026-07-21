@@ -1,19 +1,19 @@
 // 채팅 턴 자기개선 리뷰 (학습루프 T3, hermes background_review 대응 — 메커니즘만 lain 고유 재구현).
 // 현 reflect는 작업(A) 완료 시만 배운다 — 채팅에서의 교정("그게 아니라…")·반복 선호를 여기서 배운다.
 // 매니저 채팅 한 턴이 끝난 직후(sendToManager 루프 밖) fire-and-forget으로 격리 judge를 1회 불러,
-// 최근 대화 다이제스트에서 0~2건 교훈(+ 스킬 후보 힌트)을 뽑는다.
+// 최근 대화 다이제스트에서 0~2건 학습(+ 스킬 후보 힌트)을 뽑는다.
 //
 // 회귀 0 불변식(전부 selfimprove 내부에서 자기게이트):
 //   - settings.turnReviewEnabled(기본 on) off면 즉시 return — 호출돼도 아무 일도 안 일어난다(휴면).
 //   - 결정론 스킵 게이트(shouldSkipTurnReview): 원문 6턴 미만(단 교정 신호는 통과)/직전 리뷰 후 무변화/
 //     도구만 쓴 중간 턴(마지막이 assistant 아님). 작업(working) 중에도 스킵(consolidate 패턴).
 //   - 격리 judge는 reflect/title과 동일: allowedTools:[], judgeModel, 60s abort, 실패 전부 무해.
-//     출력 누적은 try 밖 변수 + 여유 maxTurns([[lain-sdk-maxturns-error-max-turns]]).
+//     출력 누적은 try 밖 변수 + 여유 maxTurns(SDK maxTurns 함정).
 //   - judge 프롬프트에 anti-capture rubric 명시 — 환경의존 실패·도구 부정주장·일회성 서사를 버리게.
 //   - 리뷰 워터마크는 judge 호출 *전에* 전진(curator 해시가드 동형) — 실패 반복 호출 차단.
 //
 // 입력은 listConversationDialogue(user/assistant 원문 — tool 라인은 계수·입력 모두 제외해 재귀 방지).
-// 출력 교훈은 insertLesson(origin:'agent') + 💾 채팅 라인(emitChat — 호출부가 채널 주입).
+// 출력 학습은 insertLesson(origin:'agent') + 💾 채팅 라인(emitChat — 호출부가 채널 주입).
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { AGENT_CWD, CLAUDE_BIN } from './paths'
 import {
@@ -32,7 +32,7 @@ import { redactSecrets, scanLessonInjection } from './safety'
 import { buildSkillsIndex } from './agentskills'
 import type { ChatMessage } from '../shared/types'
 
-// manager-chat 교훈은 특정 프로젝트에 매이지 않는다(scope는 대개 global). lessons.project_id는
+// manager-chat 학습은 특정 프로젝트에 매이지 않는다(scope는 대개 global). lessons.project_id는
 // NOT NULL이라 sentinel이 필요하고, lessonsForProject는 scope='global'을 project_id와 무관하게
 // 고르므로 이 값은 선택에 영향 없다(글래스박스 추적용 식별자일 뿐).
 const LAIN_SCOPE_PROJECT = '__lain__'
@@ -90,7 +90,7 @@ export function shouldSkipTurnReview(
   return { skip: false }
 }
 
-// judge 출력 파싱(순수·테스트 용이) — 교훈 0~MAX건 + 스킬 후보 0~1건. json 블록 없음/파싱 실패면 null.
+// judge 출력 파싱(순수·테스트 용이) — 학습 0~MAX건 + 스킬 후보 0~1건. json 블록 없음/파싱 실패면 null.
 // 스킬 name은 ascii kebab 검증, reason은 인젝션 스캔(blocked면 reason만 비움 — name은 정규식으로 안전).
 export interface TurnReviewParsed {
   lessons: { scope: 'global' | 'project'; trigger: string; lesson: string }[]
@@ -125,8 +125,8 @@ export function parseTurnReview(raw: string): TurnReviewParsed | null {
 
 /**
  * 학습루프 T3 — 매니저 채팅 한 턴 종료 직후 호출(sendToManager 루프 밖, fire-and-forget).
- * turnReviewEnabled(기본 on) off면 휴면. 최근 대화 다이제스트 + 기존 교훈/스킬 인덱스를 격리 judge에
- * 줘 0~2건 교훈을 뽑아 insertLesson(origin:'agent')하고, 💾 라인을 emitChat으로 알린다(자동 저장 = 알림 필수).
+ * turnReviewEnabled(기본 on) off면 휴면. 최근 대화 다이제스트 + 기존 학습/스킬 인덱스를 격리 judge에
+ * 줘 0~2건 학습을 뽑아 insertLesson(origin:'agent')하고, 💾 라인을 emitChat으로 알린다(자동 저장 = 알림 필수).
  * 스킬 후보는 저장하지 않고 💡 힌트 라인 + onSkillSuggestion 콜백만 — 호출부(manager)가 다음 턴에
  * 레인에게 1회 힌트로 주입해 레인이 사용자에게 "저장할까요?"라고 먼저 제안할 수 있게 한다(선제 /learn).
  * 반환 없음·실패 무해(off거나 게이트 미통과거나 judge 실패면 조용히 종료 — 회귀 0).
@@ -170,7 +170,7 @@ export async function reviewManagerTurn(
 ${digest}
 </recent-dialogue>
 
-이미 저장된 교훈(중복이면 새로 만들지 마라):
+이미 저장된 학습(중복이면 새로 만들지 마라):
 <existing-lessons>
 ${existingLessons || '(없음)'}
 </existing-lessons>
@@ -181,12 +181,12 @@ ${skillsIdx || '(없음)'}
 </existing-skills>
 
 규칙(anti-capture — 어기면 빈 배열을 내라):
-- 환경의존·일회성 실패에서 교훈을 만들지 마라(이 머신·이 순간에만 맞는 사실).
-- 도구가 무엇을 했다/못 했다는 부정확한 주장으로 교훈을 만들지 마라(과정-트레이스 금지).
+- 환경의존·일회성 실패에서 학습을 만들지 마라(이 머신·이 순간에만 맞는 사실).
+- 도구가 무엇을 했다/못 했다는 부정확한 주장으로 학습을 만들지 마라(과정-트레이스 금지).
 - 이 대화 한정 서사·맥락("아까 그 파일")을 일반 규칙으로 격상하지 마라.
 - **사실 진술과 행동 지시를 구분해라**: 사용자가 무언가를 알려준 것(정보)은 규칙이 아니다. 사용자가 명시적으로 지시·교정한 것만 규칙이 된다.
-- **사용자 정체 정보(이름·신원·직업·소속 등)는 교훈으로 만들지 마라** — 그건 프로필(user_profile) 영역이다. 특히 사용자가 이름을 밝혔다고 "그 이름으로 호칭하라"는 규칙으로 격상하지 마라 — 호칭은 "나를 OO라고 불러"라는 명시 지시가 있을 때만, 그것도 교훈이 아니라 set_user_title의 몫이다.
-- 진짜 사용자 선호/규칙이 아니면(단순 질문·지시·잡담) 빈 배열. 기존 교훈과 중복이어도 빈 배열.
+- **사용자 정체 정보(이름·신원·직업·소속 등)는 학습으로 만들지 마라** — 그건 프로필(user_profile) 영역이다. 특히 사용자가 이름을 밝혔다고 "그 이름으로 호칭하라"는 규칙으로 격상하지 마라 — 호칭은 "나를 OO라고 불러"라는 명시 지시가 있을 때만, 그것도 학습이 아니라 set_user_title의 몫이다.
+- 진짜 사용자 선호/규칙이 아니면(단순 질문·지시·잡담) 빈 배열. 기존 학습과 중복이어도 빈 배열.
 - 확신이 없으면 빈 배열. ${MAX_LESSONS_PER_REVIEW}건을 초과해 뽑지 마라.
 - skill_suggestion은 '여러 단계 절차'가 대화에 실제로 등장했고 재사용 가치가 분명할 때만. name은 ascii kebab.
 
@@ -242,7 +242,7 @@ JSON 한 블록만 출력:
       savedLines.push(l.lesson.replace(/\s+/g, ' '))
     }
     if (savedLines.length > 0)
-      emitChat?.(`💾 교훈 저장 — ${savedLines.join(' / ')}`)
+      emitChat?.(`💾 학습 저장 — ${savedLines.join(' / ')}`)
     if (parsed.suggestion) {
       const { name, reason } = parsed.suggestion
       emitChat?.(`💡 스킬 후보 — ${name}${reason ? `: ${reason}` : ''} (저장하려면 "/learn ${name}" 또는 레인에게 지시)`)

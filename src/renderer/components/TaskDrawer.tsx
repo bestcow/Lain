@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   Approval,
   FileAttachment,
@@ -12,6 +12,7 @@ import { MODEL_TIERS, MODEL_NAME } from '../../shared/models'
 import { TODO_STATUS_ICON, todoProgress, decodeTodoLine } from '../../shared/todoline'
 import { fmtTokens } from '../App'
 import { fmtElapsed, isImageMime } from '../lib/chat'
+import { TASK_STATE_LABEL } from '../lib/taskHistory'
 import { useStickyScroll } from '../lib/useStickyScroll'
 import { parseDiffFiles, fileStatLabel, totalDiffStat, type DiffFile } from '../lib/diffParse'
 import { ConfirmWindow } from './ConfirmWindow'
@@ -34,16 +35,35 @@ function fileToImageAttachment(file: File): Promise<FileAttachment | null> {
   })
 }
 
+// 메인(taskimages.capTaskImages)과 같은 상한 — 초과분은 main이 조용히 버리므로 화면에서도 같은 기준으로
+// 세어 '제외 N장'을 알린다(상한 값 자체는 main이 단일 출처, 여기선 안내용 계산에만 쓴다).
+const MAX_TASK_IMAGES_UI = 6
+const MAX_IMAGE_B64_CHARS_UI = 5_000_000 // base64 문자수 ≈ 원본 3.7MB
+
+function countKeptImages(list: FileAttachment[]): number {
+  return list.filter((a) => a.isImage && !!a.data && a.data.length <= MAX_IMAGE_B64_CHARS_UI).slice(0, MAX_TASK_IMAGES_UI)
+    .length
+}
+
 // B17 — 작업 입력 이미지 첨부(드로어 직접첨부, 옵션3). 단일 출처 = task.images(로컬 중복 보관 금지).
 // 메인(ipc tasks:setImages)이 cap(최대 6장·크기·이미지만)을 강제 → 화면은 task.images를 그대로 비춤.
 function ImageAttachSection({ task }: { task: Task }) {
   const fileRef = useRef<HTMLInputElement>(null)
+  const [dropNote, setDropNote] = useState<string | null>(null)
   const imgs = task.images ?? []
   const add = async (files: File[]) => {
     const conv = (await Promise.all(files.map(fileToImageAttachment))).filter(
       (a): a is FileAttachment => a !== null,
     )
-    if (conv.length) window.lain.setTaskImages(task.id, [...imgs, ...conv])
+    const nonImage = files.length - conv.length // 이미지 4종이 아니라 변환 단계에서 빠진 것
+    const next = [...imgs, ...conv]
+    const dropped = nonImage + (next.length - countKeptImages(next))
+    setDropNote(
+      dropped > 0
+        ? `${dropped}개 제외 — png/jpeg/gif/webp · 최대 ${MAX_TASK_IMAGES_UI}장 · 장당 3.7MB 상한`
+        : null,
+    )
+    if (conv.length) window.lain.setTaskImages(task.id, next)
   }
   const removeAt = (idx: number) =>
     window.lain.setTaskImages(
@@ -70,6 +90,7 @@ function ImageAttachSection({ task }: { task: Task }) {
           e.target.value = ''
         }}
       />
+      {dropNote && <span className="dim">{dropNote}</span>}
       {imgs.length > 0 && (
         <span className="task-img-tiles">
           {imgs.map((a, i) => (
@@ -91,6 +112,8 @@ interface Props {
   approvals: Approval[]
   // B15 — null=아직 로드 전(작업 열자마자), []=로드 완료했지만 이벤트가 아직 없음. 구분해서 빈 공백 방지.
   events: TaskEvent[] | null
+  // UI③ — '지금 뭐 하는 중' 사람말 한 줄(App이 taskActivity에서 변환해 전달). working일 때만 표시.
+  activity?: string | null
   onClose: () => void
 }
 
@@ -128,6 +151,30 @@ function extractCriteria(content: string): string[] {
     .map((l) => l.trim())
     .filter((l) => l.startsWith('- '))
     .map((l) => l.slice(2).trim())
+}
+
+// T15 — 독립 심사(T14) 판정 JSON에서 미충족 사유(issues)를 뽑아 rework 입력칸 프리필에 쓴다. 손상 JSON은 빈 배열.
+function auditIssues(auditResult?: string): string[] {
+  if (!auditResult) return []
+  try {
+    const v = JSON.parse(auditResult) as { pass?: boolean; issues?: unknown }
+    return Array.isArray(v.issues) ? v.issues.map(String) : []
+  } catch {
+    return []
+  }
+}
+
+// L3(P6) — 결재 패널 체크리스트: 기준 문구가 심사(T14) issues 중 하나에라도 포함되면 미충족(✗) 추정, 아니면
+// 충족(✓) 추정. 순수 includes 매칭(과공학 금지) — 정확한 근거 대조가 아니라 참고용 표시.
+function criterionMet(criterion: string, issues: string[]): boolean {
+  return !issues.some((issue) => issue.includes(criterion))
+}
+
+// L4 — 심사가 아예 안 돌면(depth=light로 생략, judge 무응답, git 실패) auditResult가 비어 issues도 빈 배열이라
+// 위 criterionMet은 전 항목 ✓를 준다 — '통과'와 '미심사'가 구분되지 않는다. 판정 근거가 없을 땐 '—'로 그린다.
+function criterionMark(criterion: string, audited: boolean, issues: string[]): '✓' | '✗' | '—' {
+  if (!audited) return '—'
+  return criterionMet(criterion, issues) ? '✓' : '✗'
 }
 
 // P2 금지 도구(블랙리스트) 입력 — 쉼표 구분. blur/Enter에 커밋(키스트로크마다 IPC 방지). 다음 재개부터 적용.
@@ -197,7 +244,9 @@ function diffLineClass(line: string, inHunk: boolean): string {
 }
 
 // diff 줄 배열 → 색상 렌더. keyBase로 파일 블록 간 key 충돌 방지.
-function DiffLines({ lines, keyBase }: { lines: string[]; keyBase: string }) {
+// memo — 펼친 파일 블록은 줄마다 span이라 수천 줄이면 재조정이 비싸다. props가 lines(파싱 결과 배열, 호출부에서
+// useMemo로 참조 안정)와 keyBase 문자열뿐이라 얕은 비교로 충분.
+const DiffLines = memo(function DiffLines({ lines, keyBase }: { lines: string[]; keyBase: string }) {
   // 헝크 진입 여부를 줄 순서대로 추적해 diffLineClass에 넘긴다(파일별 블록은 diff --git으로 시작하지만,
   // 폴백 전문 렌더는 여러 파일이 이어지므로 diff --git마다 리셋). @@ 이후 본문의 ---/+++ 오색 방지.
   let inHunk = false
@@ -214,7 +263,7 @@ function DiffLines({ lines, keyBase }: { lines: string[]; keyBase: string }) {
       })}
     </>
   )
-}
+})
 
 // C9 — 파일 단위 접이식 섹션. 파일명 + +N/-M 배지 헤더 클릭으로 그 파일의 diff 본문을 토글.
 function DiffFileBlock({ file, defaultOpen }: { file: DiffFile; defaultOpen: boolean }) {
@@ -307,8 +356,10 @@ function TaskDiffSection({ task }: { task: Task }) {
     if (!open) setBody(await window.lain.taskDiff(task.id))
     setOpen((v) => !v)
   }
-  const files = body ? parseDiffFiles(body) : []
-  const total = totalDiffStat(files)
+  // body는 한 번 채워지면 닫아도 남는다 — 접은 상태에서도 매 렌더 전문을 재파싱하지 않게 useMemo(순수 함수라 결과 동일).
+  const files = useMemo(() => (body ? parseDiffFiles(body) : []), [body])
+  const total = useMemo(() => totalDiffStat(files), [files])
+  const rawLines = useMemo(() => (body ? body.split('\n') : []), [body])
   const defaultOpen = files.length <= DIFF_COLLAPSE_THRESHOLD
   return (
     <div className="task-diff-wrap">
@@ -337,7 +388,7 @@ function TaskDiffSection({ task }: { task: Task }) {
           ) : files.length === 0 ? (
             // diff --git 헤더가 없는 비정상/특수 출력(log 폴백 등) — 통짜로 색상만 입혀 보여준다.
             <pre className="task-diff-body">
-              <DiffLines lines={body.split('\n')} keyBase="raw" />
+              <DiffLines lines={rawLines} keyBase="raw" />
             </pre>
           ) : (
             <>
@@ -379,6 +430,20 @@ function TodoChecklist({ task }: { task: Task }) {
   )
 }
 
+// 이벤트 로그 한 줄. memo — 로그는 append가 대부분이라(앞 행들의 ev 참조가 그대로) 부모 리렌더 때 기존 행의
+// 재조정을 통째로 건너뛴다. ev 객체는 App이 배열에 넣은 원본 참조라 얕은 비교로 충분.
+const EventRow = memo(function EventRow({ ev }: { ev: TaskEvent }) {
+  const sp = ev.speaker
+  const prefix =
+    sp === 'worker' ? 'navi>' : sp === 'lain' ? 'Lain' : sp === 'user' ? 'User' : KIND_PREFIX[ev.kind] ?? '·'
+  return (
+    <div className={`ev ev-${ev.kind}${sp ? ` ev-sp-${sp}` : ''}${isExecFailure(ev) ? ' ev-exec-fail' : ''}`}>
+      <span className="ev-prefix">{prefix}</span>
+      <span className="ev-text">{ev.kind === 'todo' ? todoLogText(ev.text) : ev.text}</span>
+    </div>
+  )
+})
+
 // ask_manager 에스컬레이션 — Navi가 답변을 기다리며 멈춰 있다
 function QuestionCard({ approval }: { approval: Approval }) {
   const [text, setText] = useState('')
@@ -407,12 +472,19 @@ function QuestionCard({ approval }: { approval: Approval }) {
   )
 }
 
-export function TaskDrawer({ task, approvals, events, onClose }: Props) {
+function TaskDrawerInner({ task, approvals, events, activity, onClose }: Props) {
   const [answer, setAnswer] = useState('')
   const [answers, setAnswers] = useState<string[]>([])
   const [verifyOpen, setVerifyOpen] = useState(false)
   const [confirmDiscard, setConfirmDiscard] = useState(false)
   const [confirmRevert, setConfirmRevert] = useState(false) // D8 — 병합 되돌리기 확인창
+  const [reworkText, setReworkText] = useState('') // T15 — 결재 수정요청(rework) 지적사항 입력
+  // C2 — 결재(resolveReview) 결과 문자열. main은 병합 실패('rebase 후 verify 실패' 등)도 문자열로만 알려주는데
+  // 지금까지 버려져 '완료'와 구분이 안 됐다 — GroupReviewPanel의 msg 패턴을 개별 결재에도 그대로 쓴다.
+  const [reviewMsg, setReviewMsg] = useState<string | null>(null)
+  const [reviewBusy, setReviewBusy] = useState(false)
+  // 스킬 킬스위치(기본 off) — off면 task.skills가 있어도 SDK에 안 붙는다(skills.ts). 배지가 거짓말하지 않게 읽는다.
+  const [skillsEnabled, setSkillsEnabled] = useState(true)
   const [, setNow] = useState(Date.now())
   // B2 — ChatPanel의 near-bottom 스티키 스크롤 이식: 바닥 근처일 때만 추종, 벗어나면 '↓ 최신' 점프 버튼.
   const { bottomRef, showJump, jumpToBottom } = useStickyScroll([events?.length ?? 0])
@@ -425,6 +497,30 @@ export function TaskDrawer({ task, approvals, events, onClose }: Props) {
     const id = setInterval(() => setNow(Date.now()), 30000)
     return () => clearInterval(id)
   }, [])
+
+  // 스킬 킬스위치 — 마운트 시 1회 조회 + 설정 변경 라이브 반영(환경설정에서 켜면 배지도 바로 정확해진다).
+  useEffect(() => {
+    void window.lain.getSettings().then((s) => setSkillsEnabled(s.skillsEnabled))
+    return window.lain.onSettingsUpdated((s) => setSkillsEnabled(s.skillsEnabled))
+  }, [])
+
+  // 결재 결과 줄은 다른 작업으로 넘어가면 남기지 않는다(이전 작업의 사유가 새 작업 화면에 붙는 오해 방지).
+  useEffect(() => {
+    setReviewMsg(null)
+  }, [task.id])
+
+  // 결재 실행 — 반환 사유를 화면에 남긴다. rework 입력은 접수 응답을 받은 뒤에만 비운다(상한 도달 시 입력 유실 방지).
+  const runReview = async (action: 'merge' | 'keep-branch' | 'discard' | 'rework', comment?: string) => {
+    setReviewBusy(true)
+    setReviewMsg(null)
+    try {
+      const msg = await window.lain.resolveReview(task.id, action, comment)
+      setReviewMsg(msg)
+      return msg
+    } finally {
+      setReviewBusy(false)
+    }
+  }
 
   // 질문별 입력칸을 'Q1: …' 줄바꿈 결합해 기존 answerClarify로 전달
   const multiReady = multiQ && task.questions.every((_, i) => (answers[i] ?? '').trim() !== '')
@@ -441,7 +537,16 @@ export function TaskDrawer({ task, approvals, events, onClose }: Props) {
   return (
     <div className="drawer panel">
       <div className="drawer-head">
-        <span className={`drawer-state st-task-${task.state}`}>[{task.state}]</span>
+        {/* 상태 라벨은 화면 전체와 같은 한국어 표(TASK_STATE_LABEL) — 보드·이력과 용어를 일치시킨다. */}
+        <span className={`drawer-state st-task-${task.state}`} title={task.state}>
+          [{TASK_STATE_LABEL[task.state] ?? task.state}]
+        </span>
+        {/* UI③ — 결론이 안 난 진행 중에도 '지금 뭐 하는 중'을 사람말 한 줄로 공유 */}
+        {task.state === 'working' && activity && (
+          <span className="drawer-activity" title={activity}>
+            {activity}
+          </span>
+        )}
         {task.mode === 'autonomous' && (
           <span className="task-mode-badge" title="autonomous (glass-box, §21)">
             ⚡auto
@@ -512,8 +617,17 @@ export function TaskDrawer({ task, approvals, events, onClose }: Props) {
           {task.projectId} — {task.title}
         </span>
         {task.skills && task.skills.length > 0 && (
-          <span className="task-skills dim" title="이 작업에 할당된 스킬">
+          <span
+            className={`task-skills dim${skillsEnabled ? '' : ' task-skills-off'}`}
+            style={skillsEnabled ? undefined : { textDecoration: 'line-through', opacity: 0.55 }}
+            title={
+              skillsEnabled
+                ? '이 작업에 할당된 스킬'
+                : '스킬 사용이 꺼져 있어 이 작업엔 적용되지 않았다 (환경설정 → 스킬 사용)'
+            }
+          >
             🧩 {task.skills.join(' · ')}
+            {!skillsEnabled && ' (미적용)'}
           </span>
         )}
         {task.dependsOn.length > 0 && (
@@ -657,21 +771,85 @@ export function TaskDrawer({ task, approvals, events, onClose }: Props) {
               )}
             </div>
           )}
+
+          {/* L3(P6) — 완료 조건 체크리스트(구조화 criteria). 심사(auditResult) issues와 대조해 ✓/✗ 표시 */}
+          {task.criteria && task.criteria.length > 0 && (
+            <div className="criteria-box">
+              <div className="criteria-label">
+                완료 조건 체크리스트 (L3)
+                {!task.auditResult && <span className="dim"> · 미심사(독립 심사 없음)</span>}
+              </div>
+              {task.criteria.map((c, i) => {
+                const mark = criterionMark(c, !!task.auditResult, auditIssues(task.auditResult))
+                return (
+                  <div
+                    key={i}
+                    className={`criteria-item${mark === '✗' ? ' criteria-unmet' : ''}${mark === '—' ? ' dim' : ''}`}
+                    title={
+                      mark === '—'
+                        ? '독립 심사가 돌지 않아 충족 여부를 확인하지 못했다(심사 생략 또는 심사 불능)'
+                        : undefined
+                    }
+                  >
+                    {mark} {c}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
           {/* D13 — 그룹 소속이면 개별 병합 불가. 그룹 일괄 결재 패널로 대체(병합은 all-or-nothing). */}
           {task.groupId ? (
             <GroupReviewPanel groupId={task.groupId} />
           ) : (
-            <div className="review-actions">
-              <button onClick={() => window.lain.resolveReview(task.id, 'merge')}>
-                <Icon name="check" size={14} /> 병합 승인 (clean+ff일 때만)
-              </button>
-              <button onClick={() => window.lain.resolveReview(task.id, 'keep-branch')}>
-                <Icon name="branch" size={14} /> 브랜치만 남기고 완료
-              </button>
-              <button onClick={() => setConfirmDiscard(true)}>
-                <Icon name="trash" size={14} /> 폐기
-              </button>
-            </div>
+            <>
+              <div className="review-actions">
+                <button disabled={reviewBusy} onClick={() => void runReview('merge')}>
+                  <Icon name="check" size={14} /> 병합 승인 (clean+ff일 때만)
+                </button>
+                <button disabled={reviewBusy} onClick={() => void runReview('keep-branch')}>
+                  <Icon name="branch" size={14} /> 브랜치만 남기고 완료
+                </button>
+                <button disabled={reviewBusy} onClick={() => setConfirmDiscard(true)}>
+                  <Icon name="trash" size={14} /> 폐기
+                </button>
+              </div>
+              {/* 결재 결과(병합 실패 사유·재작업 상한 등) — 지금까지 버려지던 main 반환 문자열 */}
+              {reviewMsg && <pre className="group-review-msg">{reviewMsg}</pre>}
+              {/* T15 — 수정 요청(rework): 반려 대신 지적사항을 담아 같은 worktree에서 재작업(상한 2회). */}
+              <div className="rework-box">
+                <textarea
+                  className="rework-input"
+                  placeholder="수정 요청 사항 (rework) — 지적사항을 적으면 같은 worktree에서 재작업"
+                  value={reworkText}
+                  onChange={(e) => setReworkText(e.target.value)}
+                />
+                <div className="rework-actions">
+                  {task.reworkCount > 0 && (
+                    <span className="rework-count dim">재작업 {task.reworkCount}/2회</span>
+                  )}
+                  {auditIssues(task.auditResult).length > 0 && (
+                    <button
+                      className="rework-prefill"
+                      title="독립 심사(T14)가 남긴 미충족 사유를 입력칸에 채운다"
+                      onClick={() => setReworkText(auditIssues(task.auditResult).join('\n'))}
+                    >
+                      <Icon name="restore" size={14} /> 심사 사유 불러오기
+                    </button>
+                  )}
+                  <button
+                    disabled={reviewBusy || !reworkText.trim()}
+                    onClick={async () => {
+                      const msg = await runReview('rework', reworkText)
+                      // 접수된 경우에만 입력칸을 비운다 — 재작업 상한 도달 등 거절 응답에서 지적사항이 사라지지 않게.
+                      if (msg.startsWith('수정 요청 접수')) setReworkText('')
+                    }}
+                  >
+                    <Icon name="refresh" size={14} /> 수정 요청
+                  </button>
+                </div>
+              </div>
+            </>
           )}
         </div>
       )}
@@ -688,7 +866,7 @@ export function TaskDrawer({ task, approvals, events, onClose }: Props) {
           confirmLabel="폐기"
           onCancel={() => setConfirmDiscard(false)}
           onConfirm={() => {
-            window.lain.resolveReview(task.id, 'discard')
+            void runReview('discard')
             setConfirmDiscard(false)
           }}
         />
@@ -769,20 +947,7 @@ export function TaskDrawer({ task, approvals, events, onClose }: Props) {
         ) : events.length === 0 ? (
           <div className="dim">아직 이벤트 없음 — Navi 시작 대기</div>
         ) : (
-          events.map((ev, i) => {
-            const sp = ev.speaker
-            const prefix =
-              sp === 'worker' ? 'navi>' : sp === 'lain' ? 'Lain' : sp === 'user' ? 'User' : KIND_PREFIX[ev.kind] ?? '·'
-            return (
-              <div
-                key={i}
-                className={`ev ev-${ev.kind}${sp ? ` ev-sp-${sp}` : ''}${isExecFailure(ev) ? ' ev-exec-fail' : ''}`}
-              >
-                <span className="ev-prefix">{prefix}</span>
-                <span className="ev-text">{ev.kind === 'todo' ? todoLogText(ev.text) : ev.text}</span>
-              </div>
-            )
-          })
+          events.map((ev, i) => <EventRow key={i} ev={ev} />)
         )}
         <div ref={bottomRef} />
         {/* B2 — ChatPanel/NaviChatPanel과 동일한 chat-jump 스타일 재사용(near-bottom 스티키 이식) */}
@@ -795,3 +960,7 @@ export function TaskDrawer({ task, approvals, events, onClose }: Props) {
     </div>
   )
 }
+
+// B1 — 드로어는 채팅·입력창과 같은 열에 공존해 App이 리렌더될 때마다(키 입력 포함) 최대 2000행 로그가 재조정된다.
+// props가 안 바뀌면 통째로 스킵. 얕은 비교라 App 쪽에서 onClose·activity·approvals 참조가 안정돼야 실효한다.
+export const TaskDrawer = memo(TaskDrawerInner)

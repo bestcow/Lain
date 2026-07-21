@@ -23,14 +23,18 @@ import {
   listDueRoutines,
   listProjects,
   listTasks,
+  loopStats,
   markRoutineRan,
   setSetting,
 } from './store'
 import { judgeQueryOptions } from './agentopts'
-import { buildDigest, sendToManager, setStartupBriefing } from './manager'
+import { runAutoBackupIfDue } from './autobackup'
+import { cleanupCheckpoints } from './rewind'
+import { buildDigest, pushManagerNotice, sendToManager, setStartupBriefing } from './manager'
 import { notifyUser } from './notify'
 import { shouldAutoStartTask, startTask, hasActiveWork, drainQueue } from './orchestrator'
 import type { ChatEvent, TestState } from '../shared/types'
+import { formatLoopStatsReport, isoWeekOf } from '../shared/loopstats'
 
 let timer: ReturnType<typeof setInterval> | null = null
 let running = false
@@ -138,7 +142,7 @@ function collectWakeSnapshot(): WakeSnapshot {
     if (pid) pendingByProject.set(pid, (pendingByProject.get(pid) ?? 0) + 1)
   }
   const snap: WakeSnapshot = {}
-  for (const p of listProjects().filter((x) => x.enabled)) {
+  for (const p of listProjects()) {
     snap[p.id] = {
       test: p.status?.testState ?? 'unknown',
       hasTaskMd: p.status?.hasTaskMd ?? false,
@@ -272,7 +276,7 @@ JSON 한 블록만 출력:
 
 const CURATOR_HASH_KEY = 'lesson_curator_last_hash'
 
-// §24 Phase3 — idle judge curator: 중복 교훈을 semantic 병합(미사용 폐기는 lifecycle이 결정론으로 처리).
+// §24 Phase3 — idle judge curator: 중복 학습을 semantic 병합(미사용 폐기는 lifecycle이 결정론으로 처리).
 // L0의 두 번째 LLM 예외 — autoPriority와 동일 격리: opt-in·해시가드(변화 없으면 skip)·60s abort·실패 무해.
 // 보수적: agent·비핀 후보만, 그룹당 2건 이상, 한 틱 최대 3병합, 전부 soft-archive(하드삭제 없음).
 async function consolidateLessons(): Promise<void> {
@@ -295,13 +299,13 @@ async function consolidateLessons(): Promise<void> {
       .join('\n')
     let last = ''
     const stream = query({
-      prompt: `너는 lain의 교훈 큐레이터다. 아래는 Navi들이 검증된 작업에서 누적한 교훈 목록이다(use=재사용 횟수, last=마지막 주입일).
-**같은 project**의 **같은 작업 클래스**(빌드·테스트·배포·도구 사용 등) 안에서, 한쪽이 다른 쪽의 하위집합이거나 같은 함정을 가리키는 교훈 군만 umbrella 후보다.
+      prompt: `너는 lain의 학습 큐레이터다. 아래는 Navi들이 검증된 작업에서 누적한 학습 목록이다(use=재사용 횟수, last=마지막 주입일).
+**같은 project**의 **같은 작업 클래스**(빌드·테스트·배포·도구 사용 등) 안에서, 한쪽이 다른 쪽의 하위집합이거나 같은 함정을 가리키는 학습 군만 umbrella 후보다.
 규칙:
-- 정말 중복·하위집합·같은 함정일 때만 통합한다. 작업 클래스가 다르거나 무관한 교훈은 **절대** 합치지 마라.
-- **모순 감지**: 교훈들이 서로 모순되면(한쪽이 다른 쪽을 정정·부정) 절대 한 umbrella로 합치지 마라 — 모순 내용을 병합하면 이미 정정된 틀린 주장이 umbrella 안에서 되살아난다. 더 최신 교훈이 사용자 정정으로 옛 교훈을 명백히 무효화할 때만 옛 교훈 번호를 retires에 넣어라(보관 처리됨). 불확실하면 합치지도 retire하지도 마라.
-- umbrella는 합쳐지는 모든 교훈의 핵심을 잃지 않게 구체적으로 써라. 각 그룹은 2건 이상. 합칠 게 없으면 merges는 빈 배열.
-- use=0이거나 last가 오래됨은 **폐기 근거가 아니다**(미사용 폐기는 lifecycle이 결정론으로 담당한다). 효과성 신호는 어느 교훈을 umbrella의 본문 기준으로 삼을지 참고용으로만 써라.
+- 정말 중복·하위집합·같은 함정일 때만 통합한다. 작업 클래스가 다르거나 무관한 학습은 **절대** 합치지 마라.
+- **모순 감지**: 학습들이 서로 모순되면(한쪽이 다른 쪽을 정정·부정) 절대 한 umbrella로 합치지 마라 — 모순 내용을 병합하면 이미 정정된 틀린 주장이 umbrella 안에서 되살아난다. 더 최신 학습이 사용자 정정으로 옛 학습을 명백히 무효화할 때만 옛 학습 번호를 retires에 넣어라(보관 처리됨). 불확실하면 합치지도 retire하지도 마라.
+- umbrella는 합쳐지는 모든 학습의 핵심을 잃지 않게 구체적으로 써라. 각 그룹은 2건 이상. 합칠 게 없으면 merges는 빈 배열.
+- use=0이거나 last가 오래됨은 **폐기 근거가 아니다**(미사용 폐기는 lifecycle이 결정론으로 담당한다). 효과성 신호는 어느 학습을 umbrella의 본문 기준으로 삼을지 참고용으로만 써라.
 
 <lessons>
 ${list}
@@ -309,7 +313,7 @@ ${list}
 
 JSON 한 블록만 출력:
 \`\`\`json
-{"merges": [{"archive_ids": [번호…], "umbrella": {"project_id": "<합쳐지는 교훈들의 project>", "scope": "project|global", "trigger": "<적용 힌트>", "lesson": "<통합 교훈>"}}], "retires": [정정으로 무효화된 옛 교훈 번호…]}
+{"merges": [{"archive_ids": [번호…], "umbrella": {"project_id": "<합쳐지는 학습들의 project>", "scope": "project|global", "trigger": "<적용 힌트>", "lesson": "<통합 학습>"}}], "retires": [정정으로 무효화된 옛 학습 번호…]}
 \`\`\``,
       options: {
         cwd: AGENT_CWD,
@@ -356,7 +360,7 @@ JSON 한 블록만 출력:
         mergeCount++
       }
     }
-    // 모순 정정 retire — 최신 정정이 무효화한 옛 교훈을 보관(병합 대신). flagLesson이 핀/user/이미보관을 재검증.
+    // 모순 정정 retire — 최신 정정이 무효화한 옛 학습을 보관(병합 대신). flagLesson이 핀/user/이미보관을 재검증.
     const retireIds: number[] = (Array.isArray(obj.retires) ? obj.retires : [])
       .map(Number)
       .filter((id: number) => candidateIds.has(id))
@@ -366,8 +370,8 @@ JSON 한 블록만 출력:
     if (mergeCount > 0 || retiredCount > 0) {
       const parts: string[] = []
       if (mergeCount > 0) parts.push(`${mergeCount}개 그룹·${archivedTotal}건 통합`)
-      if (retiredCount > 0) parts.push(`정정으로 무효화된 교훈 ${retiredCount}건 보관`)
-      const text = `[교훈 정비] ${parts.join(', ')}(§24 curator) — 다음 작업 주입을 정조준한다.`
+      if (retiredCount > 0) parts.push(`정정으로 무효화된 학습 ${retiredCount}건 보관`)
+      const text = `[학습 정비] ${parts.join(', ')}(§24 curator) — 다음 작업 주입을 정조준한다.`
       addMessage('manager', 'assistant', text)
       emitChat({ kind: 'assistant', text })
       // 병합·보관으로 후보가 바뀌었으니 새 상태 해시로 갱신 — umbrella를 즉시 재병합하는 churn 방지.
@@ -380,7 +384,7 @@ JSON 한 블록만 출력:
   }
 }
 
-/** 전체 enabled 프로젝트 현황 재수집 + 변화 알림. 수동(트레이)·주기 공용. */
+/** 등록 프로젝트 전체 현황 재수집 + 변화 알림. 수동(트레이)·주기 공용. */
 export async function runScanOnce(): Promise<void> {
   if (running) return // 겹침 방지 — 이전 스캔이 길어지면 이번 틱은 건너뜀
   running = true
@@ -389,15 +393,21 @@ export async function runScanOnce(): Promise<void> {
     // 사용량 가드가 창 소진으로 풀린 경우(P4-4 #2), 이벤트성 드레인 트리거(finish/cancel/resolve)가 없어도
     // 대기 큐가 자동으로 열린 자리를 채우게 한다. drainQueue는 cap 여유·사용량 가드를 자체 판정하므로 무해.
     drainQueue()
-    const before = new Map(
-      listProjects()
-        .filter((p) => p.enabled)
-        .map((p) => [p.id, p.status?.hasTaskMd ?? false]),
-    )
-    const targets = listProjects().filter((p) => p.enabled)
+    // E8 확장 — 하루 1회 자동 백업(결정론·LLM 없음). 날짜 비교라 밀린 백업은 첫 틱에서 자동으로 돈다.
+    // 자체 try — 실패해도 스캔을 깨지 않는다.
+    runAutoBackupIfDue()
+    // 편집 체크포인트 보존 정리 — 부팅 1회(index.ts bootStep)만으로는 상주 중에 14일/200MB 상한이
+    // 적용되지 않았다. now 주입형 결정론 함수라 주기 호출에 안전. 자체 try — 정리 실패는 스캔을 깨지 않는다.
+    try {
+      cleanupCheckpoints()
+    } catch {
+      /* 정리 실패는 스캔을 깨지 않는다 */
+    }
+    const before = new Map(listProjects().map((p) => [p.id, p.status?.hasTaskMd ?? false]))
+    const targets = listProjects()
     await Promise.all(targets.map((p) => collectStatus(p)))
     const autoStartEnabled = getSettings().autoStartTaskMd
-    for (const p of listProjects().filter((x) => x.enabled)) {
+    for (const p of listProjects()) {
       // muted(숨김) 내비는 선제 알림도 억제 — 수집은 위에서 정상 수행됨.
       if (!before.get(p.id) && p.status?.hasTaskMd && !p.muted) {
         // D5 — opt-in 자동 착수. 3중 게이트(설정 ON·autonomous 마커·verify_cmd)를 통과해야만 착수하고,
@@ -426,7 +436,7 @@ export async function runScanOnce(): Promise<void> {
     }
     onUpdated()
     void refreshBriefing() // B — Groq 비서 보고(한가하면 농담). throttle·키 없으면 no-op.
-    // 교훈 자동 만료는 폐지(계속 쌓여야 개인화) — 정리는 flag·curator만. (이전: applyLessonLifecycle)
+    // 학습 자동 만료는 폐지(계속 쌓여야 개인화) — 정리는 flag·curator만. (이전: applyLessonLifecycle)
     const s = getSettings()
     // i14 — autoPriority(채팅 끼어듦)는 idle일 때만. urgent 알림은 게이트 밖(notifyUser)이라 영향 없음.
     if (s.autoPriority && isIdle(s.idleMin)) await autoPriority()
@@ -436,6 +446,18 @@ export async function runScanOnce(): Promise<void> {
       applySkillLifecycle()
     } catch {
       /* 스킬 정리 실패는 무해 — 다음 스캔에 재시도 */
+    }
+    // L6(P6) — 주간 루프 성적표: autoPriority 해시가드(:216 인근) 동형이나 워터마크는 다이제스트 해시
+    // 대신 ISO 주차 문자열('YYYY-Www') — 주가 바뀔 때 1회만 pushManagerNotice. 실패해도 스캔을 깨지 않는다.
+    try {
+      const week = isoWeekOf(new Date())
+      if (getSetting('loop_stats_week') !== week) {
+        const rep = formatLoopStatsReport(loopStats(7))
+        if (rep) pushManagerNotice(`[주간 루프 성적표]\n${rep}`)
+        setSetting('loop_stats_week', week)
+      }
+    } catch {
+      /* 무해 — 다음 스캔에 재시도 */
     }
     // i16 — 선언적 routines 디스패치(opt-in). due 루틴을 markRoutineRan(중복 차단) 후 fire-and-forget.
     if (s.routinesEnabled) dispatchDueRoutines()
@@ -463,4 +485,10 @@ export function rearmScheduler(): void {
   timer = null
   const min = getSettings().scanIntervalMin
   if (min > 0) timer = setInterval(() => void runScanOnce(), min * 60_000)
+}
+
+/** 앱 종료 시 주기 스캔 타이머 정지 — 닫히는 DB에 스캔 결과를 쓰려는 늦은 tick 차단(종료 시퀀스). */
+export function stopScheduler(): void {
+  if (timer) clearInterval(timer)
+  timer = null
 }

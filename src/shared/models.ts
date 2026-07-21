@@ -5,8 +5,10 @@
 // 명시 ID로 박아 항상 일치시킨다 — 모델 세대가 올라가면 여기 한 곳만 갱신한다(로컬 앱이라 통제 가능).
 import type { ModelTier } from './types'
 
-/** 모델 티어 목록 — 설정 UI·검증 공용. 미출시 티어(fable)는 여기서 제외해 선택 UI·검증에 노출하지 않는다(출시 시 재추가). */
-export const MODEL_TIERS = ['haiku', 'sonnet', 'opus', 'local'] as const
+/** 모델 티어 목록 — 설정 UI·검증 공용. 미출시(fable)·보류(local: CC 하네스 prefill로 34분/턴 실측,
+ *  하드웨어 개선이나 직접 fetch 경로 착수 전까지 숨김) 티어는 여기서 제외해 선택 UI·검증에 노출하지
+ *  않는다. 재개 시 배열에 다시 넣으면 자동 노출 — 라우팅 배관(agentopts.tierQueryOptions)은 보존. */
+export const MODEL_TIERS = ['haiku', 'sonnet', 'opus'] as const
 
 /** 티어 → 고정 모델 ID. */
 export const MODEL_IDS: Record<ModelTier, string> = {
@@ -26,10 +28,12 @@ export function modelId(tier: string): string {
 
 /** 티어 → 사용자 표시 라벨(설정 UI 공용 단일출처). 입력창 바(InputModeBar)·작업 드로어(TaskDrawer)가 공유 —
  *  '설정 표시=실제 일치' 원칙상 별칭이 아니라 세대 고정 표기(위 MODEL_IDS와 짝). */
+// 'Claude_' 접두는 뗀다 — 입력창 바가 '모델' 이름표를 값 앞에 병기하므로 브랜드 접두가 중복이고 폭만 먹는다.
+// 세대 표기(4.8 등)는 유지 — 별칭 표류를 막는 '설정 표시=실제 일치' 원칙은 그대로다.
 export const MODEL_NAME: Record<ModelTier, string> = {
-  haiku: 'Claude_Haiku_4.5',
-  sonnet: 'Claude_Sonnet_4.6',
-  opus: 'Claude_Opus_4.8',
-  fable: 'Claude_Fable_5',
-  local: 'Qwen_로컬(실험적)', // llama-server 필요(환경설정 모델 탭) — 서버 꺼져 있으면 응답 실패
+  haiku: 'Haiku 4.5',
+  sonnet: 'Sonnet 4.6',
+  opus: 'Opus 4.8',
+  fable: 'Fable 5',
+  local: 'Qwen 로컬(실험적)', // llama-server 필요(환경설정 모델 탭) — 서버 꺼져 있으면 응답 실패
 }

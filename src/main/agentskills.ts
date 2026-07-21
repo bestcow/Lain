@@ -1,5 +1,5 @@
 // 레인 스킬 자가 생성 (학습루프 T1, hermes skill_manage 대응 — 메커니즘만 lain 고유 재구현).
-// 교훈(한두 문장)이 못 담는 여러 단계 절차를 md로 저장한다. 본문은 %APPDATA%\lain\skills\<name>\SKILL.md,
+// 학습(한두 문장)이 못 담는 여러 단계 절차를 md로 저장한다. 본문은 %APPDATA%\lain\skills\<name>\SKILL.md,
 // 메타·사용 추적은 SQLite agent_skills(store.ts). 주입은 점진 공개 — 다이제스트 seam에 name+설명 인덱스만,
 // 본문은 mcp__lain__skill_view로. CC Skill 도구(settingSources) 안 씀 — 정체성 오염 회피(§18).
 // L0: 파일 IO·인덱스 조립·관련도 스코어링(결정론). "무엇을 저장할까"는 L1(레인/judge)이 결정.
@@ -15,7 +15,7 @@ export function isValidSkillName(name: string): boolean {
   return SKILL_NAME_RE.test(name)
 }
 
-export function skillsDir(): string {
+function skillsDir(): string {
   return path.join(DATA_DIR, 'skills')
 }
 
@@ -63,7 +63,7 @@ export function applyPatch(body: string, old: string, next: string): string | nu
 }
 
 // ── 인덱스 주입(점진 공개) — 매 메시지 다이제스트 seam에 name+설명만. 본문은 skill_view로. ──
-const INDEX_CAP = 30 // 다이제스트 비대화 방지 — use_count·최신순 상위만(교훈 top-K와 합산 토큰 감시)
+const INDEX_CAP = 30 // 다이제스트 비대화 방지 — use_count·최신순 상위만(학습 top-K와 합산 토큰 감시)
 
 /** 순수 — 메타 목록을 인덱스 줄로 조립. 정렬은 store가 이미 use_count·최신순으로 준다. */
 export function buildSkillsIndex(metas: AgentSkillMeta[], cap = INDEX_CAP): string {

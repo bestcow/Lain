@@ -46,7 +46,7 @@ describe('aggregate — bench_runs 그룹 요약 집계(C10)', () => {
     expect(summary.regression).toBeNull()
   })
 
-  it('교훈 ON이 성공률을 악화시키면 회귀 경보를 만든다', () => {
+  it('학습 ON이 성공률을 악화시키면 회귀 경보를 만든다', () => {
     const results: BenchTaskResult[] = [
       r({ condition: 'no-lessons', success: true, verifyFirstPass: true, turns: 2, costUsd: 0.1 }),
       r({ condition: 'with-lessons', success: false, verifyFirstPass: false, turns: 2, costUsd: 0.1 }),

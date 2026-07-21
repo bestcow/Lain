@@ -12,9 +12,11 @@ import {
   getActiveConversation,
   listConversationDialogue,
   getConversationWorldState,
+  loopStats,
 } from './store'
 import { judgeQueryOptions } from './agentopts'
 import { AGENT_CWD, CLAUDE_BIN, DATA_DIR } from './paths'
+import { formatLoopStatsLine } from '../shared/loopstats'
 
 // 진단 — 브리핑이 왜 비는지 침묵 실패를 파일에 남긴다(DATA_DIR/briefing-debug.log). 원인 확정 후 제거.
 function blog(m: string): void {
@@ -30,7 +32,7 @@ function blog(m: string): void {
  *  주기 갱신(활동 중)은 false — '최근 대화'가 현재 세션이라 '종료 전' 프레이밍이 틀리므로 현황만. */
 export async function generateBriefing(opts: { includePrior?: boolean } = {}): Promise<string | null> {
   // muted(숨김) 제외 — 브리핑은 레인의 선제 발화라, 유저가 먼저 언급하기 전엔 숨김 내비를 꺼내지 않는다.
-  const projects = listProjects().filter((p) => p.enabled && !p.muted)
+  const projects = listProjects().filter((p) => !p.muted)
   const tasks = listTasks()
   const approvals = listApprovals()
   const working = tasks.filter((t) => t.state === 'working' || t.state === 'clarifying')
@@ -54,6 +56,7 @@ export async function generateBriefing(opts: { includePrior?: boolean } = {}): P
     approvals.length ? `승인 대기 ${approvals.length}건` : '',
     fail.length ? `검증 실패: ${nameList(fail)}` : '',
     dirty.length ? `미커밋 변경: ${nameList(dirty)}` : '미커밋 없음',
+    formatLoopStatsLine(loopStats(7)), // L6 — 최근 7일 루프 성적표(집계할 게 없으면 빈 문자열 → filter(Boolean)로 제외)
   ].filter(Boolean)
 
   // 직전 맥락(재시작 연속성) — 레인은 단일 연속 대화(무한세션)라 '지난 세션'이 아니라 '종료 전 이어지던 대화'다.
@@ -92,6 +95,10 @@ ${status.join('\n')}
   // Claude judge 티어 1회 query(title.ts 동형) — 도구 없이 텍스트만. 매니저 무한세션과 분리된 일회성 세션.
   // 누적은 try 밖 변수로(maxTurns 초과 throw에도 받은 텍스트 보존), maxTurns 여유로 error_max_turns 회피.
   let text = ''
+  // 판정 SDK 무응답(네트워크 정체 등)에 60초 abort — 없으면 브리핑 생성이 영원히 안 끝난다(부팅 시
+  // fire-and-forget으로 호출돼 앱 자체는 안 막히지만, 좀비 Promise가 남고 브리핑도 영영 안 나온다).
+  const ac = new AbortController()
+  const killTimer = setTimeout(() => ac.abort(), 60_000)
   try {
     const stream = query({
       prompt,
@@ -102,6 +109,7 @@ ${status.join('\n')}
         ...judgeQueryOptions(), // §9b 판정/요약류(local 라우팅 + D7 사용량 가드 강등)
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
+        abortController: ac,
       },
     })
     for await (const msg of stream) {
@@ -115,6 +123,8 @@ ${status.join('\n')}
     }
   } catch (e) {
     blog(`query throw: ${(e as Error)?.message ?? e}`)
+  } finally {
+    clearTimeout(killTimer)
   }
   const out = text.trim()
   if (!out) {

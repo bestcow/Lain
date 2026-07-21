@@ -80,7 +80,6 @@ describe('buildDigest — muted [숨김] 태그', () => {
     stack: 'node',
     isGit: true,
     verifyCmd: null,
-    enabled: true,
     muted,
     status: null,
   })

@@ -1,7 +1,7 @@
 ﻿# 로컬 Qwen 서버 기동 — llama-server(Anthropic /v1/messages 네이티브)로 Qwen3.6-35B-A3B를 서빙.
 # 사전 조건: scripts\setup-qwen.ps1 1회 실행. lain의 'local' 티어가 이 서버(기본 :8080)로 라우팅된다.
 #
-# 플래그 근거(2026-07-02 조사, 메모리 lain-local-model-plan):
+# 플래그 근거(2026-07-02 조사, 로컬 모델 트랙 조사 기록):
 #  --jinja       : Anthropic/OpenAI tool calling에 필수(채팅 템플릿 엔진).
 #  --ctx-size    : Claude Code 하네스는 컨텍스트가 커서 64K 권장(기본값은 부족).
 #  -ngl 99 + --n-cpu-moe : MoE 하이브리드 — 어텐션·공유가중치는 GPU, 라우팅 전문가는 RAM.

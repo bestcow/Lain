@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react'
 import type { Lesson, Project } from '../../shared/types'
 import { isCleanupCandidate } from '../lib/lessonDerive'
+import { lineageLayout } from '../lib/lessonGraph'
 import { Icon } from './icons'
 
 export function LessonsPanel({ onClose }: { onClose: () => void }) {
@@ -35,7 +36,7 @@ export function LessonsPanel({ onClose }: { onClose: () => void }) {
   // 범위 표기 — global=레인 자신(Lain), project=그 프로젝트 이름. 내부 sentinel(__lain__)·raw id는 노출 안 함.
   const scopeLabel = (l: Lesson) =>
     l.scope === 'global' ? 'Lain' : projects.find((p) => p.id === l.projectId)?.name ?? l.projectId
-  // 상태 — 실질 2상태(사용/미사용). stale은 사용으로 합침(교훈 시간만료 폐지).
+  // 상태 — 실질 2상태(사용/미사용). stale은 사용으로 합침(학습 시간만료 폐지).
   const statusLabel = (l: Lesson) => (l.status === 'archived' ? '미사용' : '사용')
   // 등록자 — 이 학습을 누가 추가했나. agent=레인이 자동 추출, user=사용자가 직접 입력.
   const originLabel = (l: Lesson) => (l.origin === 'user' ? 'User' : 'Lain')
@@ -175,9 +176,62 @@ export function LessonsPanel({ onClose }: { onClose: () => void }) {
           originLabel={originLabel(selected)}
           fmtDate={fmtDate}
           onClose={() => setSelectedId(null)}
+          onSelect={(id) => {
+            // 계보 노드 클릭 → 그 학습 상세로 이동. 목록(all)에 없는 id면 무시(상세가 조용히 닫히지 않게).
+            if (all.some((x) => x.id === id)) setSelectedId(id)
+          }}
         />
       )}
     </div>
+  )
+}
+
+// 병합 계보 그래프 — 중심 umbrella(통합본) + 방사형 원본. 좌표 산술은 lessonGraph.ts 순수 함수,
+// 여기는 SVG 렌더만(외부 라이브러리 없음, CRT 테마 CSS 변수로 채색). 원본 노드 클릭=그 학습 상세로 이동,
+// '+N' 노드 클릭=접힘 펼침. key={umbrella.id}로 마운트돼 학습이 바뀌면 접힘 상태가 초기화된다.
+function LessonLineageGraph({
+  umbrella,
+  originals,
+  onSelect,
+}: {
+  umbrella: Lesson
+  originals: Lesson[]
+  onSelect: (id: number) => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const lay = lineageLayout(umbrella, originals, expanded)
+  if (!lay) return null
+  return (
+    <svg
+      className="lesson-lineage-svg"
+      viewBox={`0 0 ${lay.width} ${lay.height}`}
+      role="img"
+      aria-label={`병합 계보 — 흡수된 원본 ${originals.length}건`}
+    >
+      {lay.edges.map((e, i) => (
+        <line key={i} className="lesson-lineage-edge" x1={e.x1} y1={e.y1} x2={e.x2} y2={e.y2} />
+      ))}
+      {lay.satellites.map((nd) => (
+        <g
+          key={nd.lessonId ?? 'more'}
+          className={`lesson-lineage-node lesson-lineage-${nd.kind}`}
+          onClick={() => (nd.kind === 'more' ? setExpanded(true) : nd.lessonId != null && onSelect(nd.lessonId))}
+        >
+          <title>{nd.title}</title>
+          <circle cx={nd.x} cy={nd.y} r={nd.kind === 'more' ? 12 : 8} />
+          <text x={nd.x} y={nd.y + (nd.kind === 'more' ? 3 : 21)} textAnchor="middle">
+            {nd.label}
+          </text>
+        </g>
+      ))}
+      <g className="lesson-lineage-node lesson-lineage-umbrella">
+        <title>{lay.umbrella.title}</title>
+        <circle cx={lay.cx} cy={lay.cy} r={13} />
+        <text x={lay.cx} y={lay.cy + 28} textAnchor="middle">
+          {lay.umbrella.label}
+        </text>
+      </g>
+    </svg>
   )
 }
 
@@ -189,6 +243,7 @@ function LessonDetail({
   originLabel,
   fmtDate,
   onClose,
+  onSelect,
 }: {
   lesson: Lesson
   scopeLabel: string
@@ -196,11 +251,12 @@ function LessonDetail({
   originLabel: string
   fmtDate: (iso: string | null) => string
   onClose: () => void
+  onSelect: (id: number) => void // 계보 그래프 노드 클릭 → 그 학습 상세로 전환
 }) {
   const archived = l.status === 'archived'
   const isCurator = l.taskId === 'curator'
   const cleanup = isCleanupCandidate(l)
-  // C7 — 병합 통합본(umbrella)이면 흡수된 원본 교훈 목록을 역참조로 로드(absorbed_into). 큐레이터 산물만.
+  // C7 — 병합 통합본(umbrella)이면 흡수된 원본 학습 목록을 역참조로 로드(absorbed_into). 큐레이터 산물만.
   const [absorbed, setAbsorbed] = useState<Lesson[]>([])
   useEffect(() => {
     if (isCurator) window.lain.lessonsAbsorbedInto(l.id).then(setAbsorbed)
@@ -275,18 +331,14 @@ function LessonDetail({
               </div>
             )}
           </dl>
-          {/* C7 — 병합 계보: 이 통합본에 흡수된 원본 교훈 목록(absorbed_into 역참조). */}
+          {/* 병합 계보 그래프 — 이 통합본(umbrella)에 흡수된 원본 학습을 방사형으로 시각화(absorbed_into 역참조).
+              노드 클릭=해당 학습 상세로 이동, 많으면 '+N' 노드로 접힘(lessonGraph.ts). */}
           {isCurator && absorbed.length > 0 && (
             <div className="lesson-absorbed">
-              <div className="lesson-absorbed-head dim">흡수된 원본 {absorbed.length}건</div>
-              <ul className="lesson-absorbed-list">
-                {absorbed.map((a) => (
-                  <li key={a.id} className="lesson-absorbed-item" title={a.lesson}>
-                    <span className="dim lesson-absorbed-date">{fmtDate(a.createdAt)}</span>{' '}
-                    {a.lesson}
-                  </li>
-                ))}
-              </ul>
+              <div className="lesson-absorbed-head dim">
+                병합 계보 — 흡수된 원본 {absorbed.length}건 (노드 클릭=해당 학습으로 이동)
+              </div>
+              <LessonLineageGraph key={l.id} umbrella={l} originals={absorbed} onSelect={onSelect} />
             </div>
           )}
           <div className="lesson-detail-actions">

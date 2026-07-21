@@ -1,5 +1,5 @@
 // 앱 진입 (PLAN.md §14) — BrowserWindow 생성, 스토어/IPC 초기화
-import { app, BrowserWindow, dialog, screen } from 'electron'
+import { app, BrowserWindow, crashReporter, dialog, screen } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -25,7 +25,7 @@ import { registerIpc } from './ipc'
 import { notifyUser } from './notify'
 import { scanProjects, addProject } from './registry'
 import { collectStatus } from './collectors'
-import { sendToManager, reactToObservation } from './manager'
+import { sendToManager, reactToObservation, pushManagerNotice } from './manager'
 import { setObserveHandler, stopWatcher } from './watcher'
 import { sendToNavi } from './navichat'
 import { startTask, answerClarify, recoverTasks, recoverGroups, cancelTask } from './orchestrator'
@@ -38,16 +38,17 @@ import {
   setMainWindowGetter,
   syncOverlayMode,
 } from './overlay-window'
-import { rearmScheduler, runScanOnce, briefNow } from './scheduler'
-import { applyCcHooks } from './cchooks'
+import { rearmScheduler, runScanOnce, briefNow, stopScheduler } from './scheduler'
+import { runAutoBackupIfDue } from './autobackup'
+import { applyCcHooks, stopCcHooks } from './cchooks'
 import { cleanupCheckpoints } from './rewind'
-import { startPlannerTick } from './planner'
 import { startTelegram, stopTelegram } from './telegram'
 import { startDiscord, stopDiscord } from './discord'
 import { DATA_DIR } from './paths'
 import { appendCapped } from './logfile'
 import { initUpdater } from './updater'
 import { stopSupertonic } from './supertonic-proc'
+import { createShutdown } from './shutdown'
 
 // 최후 안전망 — 메인은 텔레그램 폴러·스케줄러·Navi·watcher 등 fire-and-forget 비동기가 많다.
 // 그 중 하나라도 미처리 거부/예외로 새면 Node 기본 동작상 데몬 전체(트레이·작업·승인큐)가 죽는다.
@@ -70,7 +71,51 @@ process.on('uncaughtException', (err) => {
 // UI는 CSS뿐이라 소프트웨어 렌더링으로 충분하다.
 app.disableHardwareAcceleration()
 
+// 렌더러 반복 크래시 원인 규명 — 네이티브 크래시 minidump를 로컬에만 수집한다(업로드 없음).
+// 덤프 위치: app.getPath('crashDumps') (%APPDATA%\lain\Crashpad). 크래시가 나면 renderer-crash.log의
+// reason/exitCode와 함께 덤프를 WinDbg/minidump 도구로 열어 스택을 확인한다. 자식 프로세스 생성 전 호출 필수.
+// 주의(2026-07-20 로그 실측): 마지막 render-process-gone은 2026-06-26이고 그 뒤로는 0건 —
+// 그러니 덤프 폴더가 비어 있는 건 고장이 아니라 정상이다(열 대상이 애초에 없다). 최근의 '빈 화면'은
+// 프로세스 크래시가 아니라 JS 계층 실패(렌더 예외·미처리 거부·상태 리셋)로 봐야 한다.
+crashReporter.start({ uploadToServer: false })
+
+// GPU·유틸리티 등 자식 프로세스 사망도 기록 — 렌더러 크래시의 숨은 선행 원인(GPU 프로세스 사망 →
+// 렌더러 연쇄)이 흔해서, 어떤 프로세스가 먼저 죽었는지 시간순으로 남긴다. 시크릿 없음(타입·사유·코드만).
+app.on('child-process-gone', (_e, details) => {
+  appendCapped(
+    path.join(DATA_DIR, 'renderer-crash.log'),
+    `${new Date().toISOString()} child-process-gone: ${JSON.stringify(details)}\n`,
+  )
+})
+
 let mainWin: BrowserWindow | null = null
+
+// recovery.log 1줄 기록(격리) — 부팅 실패·종료 순서 이상 등 흐름을 막지 않는 진단을 드러낸다.
+function logRecovery(line: string): void {
+  try {
+    fs.appendFileSync(path.join(DATA_DIR, 'recovery.log'), `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    /* 로그 실패 무시 */
+  }
+}
+
+// 종료 시퀀스(shutdown.ts) — ① 배경활동 정지(before-quit) → ② 창 bounds 등 마지막 쓰기(Electron이 그 뒤
+// 창 close 핸들러에서 수행) → ③ closeStore(will-quit, 가장 마지막). DB를 쓰는 주기 타이머(스케줄러·
+// cc훅 감시)를 먼저 정지해 닫히는 DB로의 늦은 쓰기를 줄이고, 각 단계를 격리해 하나가 throw해도 closeStore를
+// 스킵하지 않는다(기존 before-quit은 격리가 없어 stopTelegram이 터지면 closeStore까지 못 갔다).
+const shutdown = createShutdown({
+  stops: {
+    scheduler: stopScheduler,
+    ccHooks: stopCcHooks,
+    telegram: stopTelegram,
+    discord: stopDiscord,
+    watcher: stopWatcher,
+    overlay: destroyOverlayWindow,
+    supertonic: stopSupertonic,
+  },
+  closeStore,
+  onError: (phase, step, e) => logRecovery(`종료 단계 '${phase}:${step}' 실패(격리·계속): ${e}`),
+})
 
 // B8 — 저장된 창 bounds 복원. 화면 밖(모니터 해제 등)이면 기본값으로 보정(window-bounds.ts 순수 로직).
 function loadWindowBounds(): { x?: number; y?: number; width: number; height: number } {
@@ -143,13 +188,19 @@ function createWindow(): void {
   // getSettings()가 손상 DB에서 throw해도 close 핸들러가 깨져 '종료 불능'이 되지 않게 가드(기본=트레이 상주).
   win.on('close', (e) => {
     // B8 — 디바운스 타이머가 미처 못 돈 채 닫히는 경우 대비, 마지막 bounds를 즉시 확정 저장.
-    try {
-      if (boundsSaveTimer) clearTimeout(boundsSaveTimer)
-      // 최대화/전체화면 rect를 정상 복원 크기로 저장하지 않는다(위 saveBounds와 동일 이유).
-      if (!win.isMinimized() && !win.isMaximized() && !win.isFullScreen())
-        setSetting('window_bounds', JSON.stringify(win.getBounds()))
-    } catch {
-      /* 손상 DB 등 — 저장 실패해도 종료/숨김 흐름은 계속 */
+    if (boundsSaveTimer) clearTimeout(boundsSaveTimer)
+    // 종료 순서 불변식: closeStore(will-quit)는 이 close 핸들러 '뒤'라야 한다. 여기서 이미 닫혀 있으면
+    // 순서가 어긋난 회귀 → 조용히 삼키지 말고 드러낸다(흐름은 막지 않음). 정상 흐름에선 DB가 열려 있어 저장된다.
+    if (shutdown.isStoreClosed()) {
+      logRecovery('닫힌 DB에 window_bounds 쓰기 시도 — 종료 순서 회귀')
+    } else {
+      try {
+        // 최대화/전체화면 rect를 정상 복원 크기로 저장하지 않는다(위 saveBounds와 동일 이유).
+        if (!win.isMinimized() && !win.isMaximized() && !win.isFullScreen())
+          setSetting('window_bounds', JSON.stringify(win.getBounds()))
+      } catch {
+        /* 손상 DB 등 — 저장 실패해도 종료/숨김 흐름은 계속 */
+      }
     }
     let closeToTray = true
     try {
@@ -168,16 +219,46 @@ function createWindow(): void {
   // 스핀으로 CPU를 태우지 않게. 리로드 후 5분 살아 있었으면 일시 장애로 보고 카운터 리셋.
   let crashCount = 0
   let lastCrashAt = 0
+  // 원인 판별용 최소 계측 — RenderProcessGoneDetails는 reason/exitCode뿐이라 지금까지의 로그가 전부
+  // 같은 문자열({"reason":"crashed","exitCode":-1})이었다. 마지막 로드 시각·렌더러 pid를 잡아두면
+  // 다음 크래시 1건만으로 OOM/비OOM·즉사/장시간구동을 가를 수 있다. 순수 추가 계측(동작 불변).
+  let lastLoadAt = 0
+  let lastRendererPid = 0
+  win.webContents.on('did-finish-load', () => {
+    lastLoadAt = Date.now()
+    try {
+      lastRendererPid = win.webContents.getOSProcessId()
+    } catch {
+      lastRendererPid = 0
+    }
+  })
   win.webContents.on('render-process-gone', (_e, details) => {
+    // 죽은 pid는 getAppMetrics에서 이미 빠졌을 수 있다 — 잡히면 메모리(OOM 판별), 아니면 mem=none.
+    let mem = 'none'
+    try {
+      const m = app.getAppMetrics().find((x) => x.pid === lastRendererPid)
+      if (m?.memory) mem = `${m.memory.workingSetSize}/${m.memory.peakWorkingSetSize}KB`
+    } catch {
+      /* 계측 실패는 로그 한 줄이 덜 유익해질 뿐 — 흐름은 계속 */
+    }
     appendCapped(
       path.join(DATA_DIR, 'renderer-crash.log'),
-      `${new Date().toISOString()} ${JSON.stringify(details)}\n`,
+      `${new Date().toISOString()} ${JSON.stringify(details)} pid=${lastRendererPid} uptimeMs=${lastLoadAt ? Date.now() - lastLoadAt : -1} prevCrashes=${crashCount} mem=${mem}\n`,
     )
     if (details.reason !== 'clean-exit' && details.reason !== 'killed') {
       const now = Date.now()
       if (now - lastCrashAt > 5 * 60_000) crashCount = 0
       lastCrashAt = now
       crashCount++
+      // 3연속이면 일시 장애가 아니다 — 사용자에게 알리고 덤프 위치를 로그에 남긴다(진단 유도).
+      if (crashCount === 3) {
+        const dumps = app.getPath('crashDumps')
+        appendCapped(
+          path.join(DATA_DIR, 'renderer-crash.log'),
+          `${new Date().toISOString()} 반복 크래시 3회 — minidump: ${dumps}\n`,
+        )
+        notifyUser('lain', '화면이 반복적으로 재시작되고 있어. 크래시 덤프를 수집해뒀다.')
+      }
       const delay = Math.min(1000 * 2 ** (crashCount - 1), 60_000)
       setTimeout(() => {
         if (!win.isDestroyed()) win.webContents.reload()
@@ -271,18 +352,48 @@ app.whenReady().then(async () => {
   // 부팅 단계 격리 — 한 단계가 throw해도 나머지(특히 텔레그램 원격 lifeline·트레이·스케줄러)를 막지 않는다.
   // 손상 DB 부팅(quick_check 실패→REINDEX 후 잔여 손상)에서 getSettings 등이 터져 텔레그램까지 못 가
   // '반쪽 초기화'로 응답 불능이 되던 회귀를 차단(2026-06-22 사고). 실패 단계는 recovery.log에 남긴다.
-  const bootStep = (name: string, fn: () => void) => {
+  // A1 — 실패가 recovery.log에만 남으면 서브시스템이 통째로 안 떠도 사용자는 '정상'으로 인식한다
+  // (rearmScheduler 실패 = 주기 스캔·자동 백업·성적표 전멸인데 화면엔 아무 표시가 없다).
+  // 개별 단계를 되살리려 하지 않고 '무엇이 안 떴는지'만 창 준비 후 1회 표면화한다.
+  const failedBootSteps: string[] = []
+  let bootReportTimer: NodeJS.Timeout | null = null
+  let reportedBootSteps = 0
+  const reportBootFailures = () => {
+    bootReportTimer = null
+    const fresh = failedBootSteps.slice(reportedBootSteps)
+    reportedBootSteps = failedBootSteps.length
+    if (fresh.length === 0) return
+    const list = fresh.join(', ')
     try {
-      fn()
+      notifyUser(
+        'lain — 일부 기능 미기동',
+        `부팅 단계 실패: ${list}. 이번 세션 동안 해당 기능은 꺼져 있다 — 재시작하면 복구될 수 있다.`,
+      )
+    } catch {
+      /* 통지 실패는 무시 */
+    }
+    try {
+      pushManagerNotice(
+        `[부팅 경고] 다음 부팅 단계가 실패해 이번 세션 동안 그 기능이 꺼져 있다: ${list}`,
+      )
+    } catch {
+      /* 맥락 주입 실패는 무시 */
+    }
+  }
+  const bootStep = (name: string, fn: () => unknown) => {
+    const failed = (e: unknown) => {
+      failedBootSteps.push(name)
+      logRecovery(`부팅 단계 '${name}' 실패(격리·계속): ${e}`)
+      // 창·notify가 준비된 뒤로 미룬다(아래 db_corrupt 지연 통지와 같은 자리). 여러 단계가 터져도 묶어서 1회.
+      if (!bootReportTimer) bootReportTimer = setTimeout(reportBootFailures, 2500)
+    }
+    try {
+      const r = fn()
+      // async 단계(startTelegram 등)는 throw가 아니라 거부로 샌다 — 같은 경로로 흘려 침묵을 막는다.
+      if (r && typeof (r as PromiseLike<unknown>).then === 'function')
+        void (r as PromiseLike<unknown>).then(undefined, failed)
     } catch (e) {
-      try {
-        fs.appendFileSync(
-          path.join(DATA_DIR, 'recovery.log'),
-          `${new Date().toISOString()} 부팅 단계 '${name}' 실패(격리·계속): ${e}\n`,
-        )
-      } catch {
-        /* 로그 실패 무시 */
-      }
+      failed(e)
     }
   }
 
@@ -307,7 +418,7 @@ app.whenReady().then(async () => {
   // 개발용: LAIN_AUTOSCAN=1이면 창 띄우기 전에 스캔+현황 수집 (검증용)
   if (process.env.LAIN_AUTOSCAN) {
     scanProjects()
-    await Promise.all(listProjects().filter((p) => p.enabled).map((p) => collectStatus(p)))
+    await Promise.all(listProjects().map((p) => collectStatus(p)))
   }
 
   bootStep('createWindow', () => createWindow())
@@ -321,21 +432,22 @@ app.whenReady().then(async () => {
   })
 
   // §20.3 텔레그램 — 원격 제어 lifeline을 트레이·스케줄러보다 '먼저' 확보(앞 단계 실패에 가장 취약하던 위치 교정).
-  bootStep('startTelegram', () => void startTelegram())
+  bootStep('startTelegram', () => startTelegram())
   // §20.3 디스코드 음성 통화 어댑터 — 설정 활성 시에만 로그인(미설정이면 즉시 no-op)
-  bootStep('startDiscord', () => void startDiscord())
+  bootStep('startDiscord', () => startDiscord())
 
   // Phase 3: 트레이 상주 + 주기 스캔 (§15, §12.5b) — 각각 격리
   bootStep('setupTray', () => setupTray(() => mainWin, createWindow))
   bootStep('rearmScheduler', () => rearmScheduler())
+  // E8 확장 — 부팅 시 밀린 자동 백업 1회(날짜 비교). 주기 스캔이 꺼져 있어도(scanIntervalMin=0)
+  // 하루 1회는 여기서 보장한다 — 설정 토글 표시=실제 적용 일치.
+  bootStep('autoBackup', () => runAutoBackupIfDue())
   // 자동 업데이트 엔진 — 패키징본만 동작(dev no-op). 부팅 8초 후 1회 + 6시간 주기 체크.
   bootStep('updater', () => initUpdater())
   // 클로드코드 연동(개선 #2) — 켜져 있으면 훅 설치 + inbox 감시 시작(꺼졌으면 잔여 훅 제거). 격리.
   bootStep('ccHooks', () => applyCcHooks())
   // D15 되감기 — 편집 체크포인트 보존 정리(14일/200MB 초과·고아 디렉터리). 격리.
   bootStep('rewindCleanup', () => cleanupCheckpoints())
-  // 플래너 리마인드 1분 틱(§21b) — 스캔(10분 단위)과 독립된 자체 타이머.
-  bootStep('planner', () => startPlannerTick())
   // 시작 시 레인 브리핑 1회 생성(프로덕션엔 startup 스캔이 없어 주기 스캔 전까지 브리핑이 비던 것 교정).
   // 약간 지연 — 렌더러가 onBriefingUpdated 리스너를 등록한 뒤 push가 닿도록(생성 결과는 setting에도 영속).
   setTimeout(() => void briefNow(), 2500)
@@ -655,14 +767,15 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  // §20.3 텔레그램 폴 루프 정리 (abort)
-  stopTelegram()
-  stopDiscord()
-  // 어깨너머 상주 PowerShell·오버레이 정리 — 안 죽이면 종료/배포 반복마다 고아 PS가 쌓인다.
-  stopWatcher()
-  destroyOverlayWindow()
-  // Supertonic 사이드카(node 자식) 정리 — 안 죽이면 고아 node 프로세스가 쌓인다.
-  stopSupertonic()
-  // WAL을 메인에 합치고 DB를 닫는다 — WAL이 비대한 채 방치되다 다음 강제종료에 손상되는 경로를 줄인다.
-  closeStore()
+  // ① 타이머·폴러·감시 전부 정지(격리·멱등) — 스케줄러/cc훅 감시(§20.3 텔레그램·디스코드 폴,
+  //    어깨너머 상주 PowerShell·오버레이, Supertonic 사이드카). 안 죽이면 종료/배포 반복마다 고아
+  //    프로세스가 쌓이고, DB 쓰는 tick이 곧 닫힐 DB에 늦게 쓴다. closeStore는 여기서 하지 않는다 —
+  //    Electron이 이 뒤에 창 close 핸들러(window_bounds 마지막 쓰기)를 돌리므로, 그 다음 will-quit에서 닫는다.
+  shutdown.stopBackground()
+})
+
+app.on('will-quit', () => {
+  // ③ 모든 창이 닫히고(=창 close 핸들러의 마지막 쓰기 완료) 종료 직전 — WAL을 메인에 합치고 DB를 닫는다.
+  //    WAL이 비대한 채 방치되다 다음 강제종료에 손상되는 경로를 줄인다. 이 시점이 '모든 쓰기 뒤 가장 마지막'.
+  shutdown.finalize()
 })

@@ -16,3 +16,16 @@ data/
 # UI 목업·제안 작업 산출물 — 레포 추적 제외(배포 가드가 미추적 dirty로 잡지 않게)
 /ui-proposals.html
 /uimock/
+
+# 개인 작업 기록 — 내용은 각자의 것이라 추적하지 않는다(틀만 *.example.md로 공개).
+# postinstall(scripts/init-local-docs.mjs)이 클론 직후 example에서 만들어 준다.
+/HANDOFF.md
+/UPDATE.md
+/CLAUDE.local.md
+
+# 로컬 도구 상태 — 클론에 존재해선 안 됨
+.claude/
+.remember/
+
+# 전환 시 보존한 이전 .git 백업(로컬 롤백 수단)
+/.git-private-backup/

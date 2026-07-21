@@ -6,14 +6,14 @@
 //   실행 dispatch는 worker.runNavi가 이 capability를 보고 codex 러너로 위임할지 정한다.
 import type { TaskEngine } from '../shared/types'
 
-// 엔진 능력 — 승인 큐·ask_manager·autonomous·교훈/스킬 주입 지원 여부.
+// 엔진 능력 — 승인 큐·ask_manager·autonomous·학습/스킬 주입 지원 여부.
 // claude는 lain 네이티브라 전부 지원, codex는 비대화형 exec라 전부 미지원(codex.ts:14-16 주석 근거:
-// 승인 큐·ask_manager 없음, 교훈/스킬 미주입, autonomous의 테스트 보호 게이트가 canUseTool 기반이라 불가).
+// 승인 큐·ask_manager 없음, 학습/스킬 미주입, autonomous의 테스트 보호 게이트가 canUseTool 기반이라 불가).
 export interface NaviEngineCapabilities {
   approvals: boolean // 위험 행위 승인 큐(canUseTool 게이트)
   askManager: boolean // 작업 중 관리자 질문(in-process MCP 툴)
   autonomous: boolean // 무개입(hands-off) 모드 — spec-gaming 방어가 canUseTool 기반
-  lessons: boolean // 교훈/스킬 주입(자기개선 retrieval)
+  lessons: boolean // 학습/스킬 주입(자기개선 retrieval)
 }
 
 // 레지스트리 — 새 엔진 추가 시 여기 엔트리 1개 + types.TaskEngine 유니언 + start_task enum만 늘리면 된다.

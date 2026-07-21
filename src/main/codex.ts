@@ -13,13 +13,14 @@
 //
 // ⚠ 승인 큐 미적용: codex exec는 비대화형이라 사람에게 못 묻는다. 방어선은 codex 자체
 // 샌드박스(workspace-write: worktree 밖 쓰기 차단)다. lain의 RISKY/시스템 게이트·ask_manager·
-// 교훈/스킬 주입은 claude 엔진 전용 — 이 차이는 start_task 도구 설명에 명시한다.
+// 학습/스킬 주입은 claude 엔진 전용 — 이 차이는 start_task 도구 설명에 명시한다.
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
 import { addTaskEvent, updateTask, getProject } from './store'
+import { killTree } from './prockill'
 import { conventionsBlock } from './conventions'
 import type { ExitReason, Task, TaskEvent } from '../shared/types'
 import { parseReport, type NaviReport, type RunNaviOpts } from './worker'
@@ -49,7 +50,8 @@ function codexJs(): string | null {
 export function codexStatus(): { ok: boolean; reason?: string } {
   if (!codexJs())
     return { ok: false, reason: 'Codex CLI 미설치 — `npm install -g @openai/codex` 후 다시 시도' }
-  if (!fs.existsSync(path.join(os.homedir(), '.codex', 'auth.json')))
+  // 인증 파일 경로는 env로 오버라이드 가능(e2e에서 가짜 codex를 물릴 때만 씀 — 기본은 홈 경로 그대로).
+  if (!fs.existsSync(process.env.LAIN_CODEX_AUTH ?? path.join(os.homedir(), '.codex', 'auth.json')))
     return { ok: false, reason: 'Codex 미로그인 — 터미널에서 `codex login` 후 다시 시도' }
   return { ok: true }
 }
@@ -124,15 +126,8 @@ ${task.content}
 \`\`\``
 }
 
-/** Windows 프로세스 트리 종료 — codex.js가 네이티브 codex.exe를 자식으로 두므로 /T 필수. */
-function killTree(pid: number | undefined): void {
-  if (!pid) return
-  try {
-    spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { timeout: 5000 })
-  } catch {
-    /* 이미 죽었으면 무시 */
-  }
-}
+// 프로세스 트리 종료(taskkill /T)는 prockill.killTree로 공용화 — codex.js가 네이티브 codex.exe를
+// 자식으로 두므로 /T 필수(collectors verify의 셸 손자 고아 문제와 동일 메커니즘).
 
 /** Codex 엔진 Navi 실행 — runNavi와 동일한 NaviReport 계약. worker.runNavi가 위임 호출한다. */
 export async function runCodexNavi(
@@ -184,6 +179,10 @@ export async function runCodexNavi(
   })
   const onAbort = (): void => killTree(child.pid)
   signal.addEventListener('abort', onAbort, { once: true })
+  // 경합(#3) — spawn 직전/직후에 이미 abort된 signal이면 'abort' 이벤트는 이미 발화가 끝나(late listener는
+  // 다시 불리지 않음) onAbort가 영영 안 돈다 → 방금 띄운 codex 자식이 고아로 남는다. 등록 직후 동기 재확인으로
+  // 즉시 트리 종료한다(아래 close 대기 후 signal.aborted 분기가 aborted 보고로 정상 반환).
+  if (signal.aborted) killTree(child.pid)
 
   let stderrTail = ''
   child.stderr.on('data', (d: Buffer) => {

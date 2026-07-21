@@ -111,7 +111,7 @@ describe('shouldSkipTurnReview — 결정론 스킵 게이트(순수)', () => {
 })
 
 describe('parseTurnReview — judge 출력 파싱(순수)', () => {
-  it('교훈+스킬 후보를 파싱한다', () => {
+  it('학습+스킬 후보를 파싱한다', () => {
     const raw = `설명 텍스트\n\`\`\`json
 {"lessons": [{"scope": "global", "trigger": "커밋", "lesson": "커밋 메시지는 한국어로"}],
  "skill_suggestion": {"name": "lain-deploy", "reason": "배포 절차 반복됨"}}
@@ -126,7 +126,7 @@ describe('parseTurnReview — judge 출력 파싱(순수)', () => {
     expect(parseTurnReview('```json\n{broken\n```')).toBeNull()
   })
 
-  it('교훈은 최대 2건으로 캡, 빈 lesson은 걸러짐', () => {
+  it('학습은 최대 2건으로 캡, 빈 lesson은 걸러짐', () => {
     const raw = `\`\`\`json
 {"lessons": [{"lesson": "a"}, {"lesson": ""}, {"lesson": "b"}, {"lesson": "c"}], "skill_suggestion": null}
 \`\`\``

@@ -9,9 +9,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "onnxruntime-node": "^1.19.2",
-    "fft.js": "^4.0.3",
-    "js-yaml": "^4.1.0"
+    "onnxruntime-node": "^1.19.2"
   },
   "engines": {
     "node": ">=18"

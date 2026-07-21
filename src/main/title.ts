@@ -22,17 +22,24 @@ export async function summarizeConversationTitle(
   if (!needsAutoTitle(conversationId)) return
   const seed = firstUserText.trim().slice(0, 500)
   if (!seed) return
+  // 누적 텍스트는 try 밖에 둔다 — maxTurns 도달 시 SDK가 error_max_turns를 throw해도(실측, briefing.ts/
+  // handoff.ts 동형) 이미 받은 제목 텍스트를 버리지 않는다. maxTurns:1은 도구 없는 호출도 모델이 추가 턴을
+  // 쓰면 걸려 산출물을 통째로 날린다(SDK maxTurns 함정) — 2로 여유 확보.
+  let last = ''
+  // 판정 SDK 무응답(네트워크 정체 등)에 60초 abort — 없으면 이 fire-and-forget 호출이 영영 안 끝난다.
+  const ac = new AbortController()
+  const killTimer = setTimeout(() => ac.abort(), 60_000)
   try {
-    let last = ''
     const stream = query({
       prompt: `다음 대화 첫 메시지를 한국어 20~30자 제목 한 줄로 요약. 따옴표·마침표·접두어 없이 제목만 출력.\n\n${seed}`,
       options: {
         cwd: AGENT_CWD,
         allowedTools: [],
-        maxTurns: 1,
+        maxTurns: 2,
         ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
         executable: 'node',
         pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
+        abortController: ac,
       },
     })
     for await (const msg of stream) {
@@ -44,8 +51,10 @@ export async function summarizeConversationTitle(
         if (t) last = t
       }
     }
-    if (setAutoTitle(conversationId, last)) titleRefresh?.(target)
   } catch {
-    /* 요약 실패 → 기존 절단 제목 유지 */
+    /* 요약 실패/타임아웃/error_max_turns → 아래에서 누적 텍스트 처리(있으면 살리고, 없으면 기존 제목 유지) */
+  } finally {
+    clearTimeout(killTimer)
   }
+  if (setAutoTitle(conversationId, last)) titleRefresh?.(target)
 }

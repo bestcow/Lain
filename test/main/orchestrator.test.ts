@@ -77,7 +77,6 @@ import {
   shouldPauseForBudget,
   rerunTask,
   resolveReview,
-  activeWorkingCount,
   hasActiveWorkAmong,
   slotOccupyingCount,
   capRoom,
@@ -177,23 +176,11 @@ describe('nextAutoRetry — D3 error 자동 재개 카운트·상한(순수)', (
 
 // C1 — D4 hold(무인 승인/질문 대기) 작업을 슬롯·유휴 게이트에서 제외하는 순수 판정.
 // held 작업은 state='working' 고정이지만 compute 슬롯을 안 쓰고 사람을 기다리는 중이라 활성으로 세면 안 된다.
-describe('activeWorkingCount / hasActiveWorkAmong — C1 held 제외(순수)', () => {
+describe('hasActiveWorkAmong — C1 held 제외(순수)', () => {
   const t = (id: string, state: Task['state']): Task =>
     ({ id, state } as unknown as Task)
   const held = new Set(['h1', 'h2'])
   const isHeld = (id: string) => held.has(id)
-
-  it('held 아닌 working만 센다 — cap 계산에서 held 제외', () => {
-    const tasks = [t('a', 'working'), t('h1', 'working'), t('b', 'working'), t('h2', 'working')]
-    expect(activeWorkingCount(tasks, isHeld)).toBe(2) // a, b만
-  })
-  it('working 아닌 상태는 애초에 세지 않는다', () => {
-    const tasks = [t('a', 'review'), t('b', 'blocked'), t('c', 'done'), t('d', 'working')]
-    expect(activeWorkingCount(tasks, isHeld)).toBe(1) // d만
-  })
-  it('모든 working이 held면 count 0 (cap 자리를 비운다)', () => {
-    expect(activeWorkingCount([t('h1', 'working'), t('h2', 'working')], isHeld)).toBe(0)
-  })
 
   it('hasActiveWorkAmong — held만 있으면 false(유휴 허용)', () => {
     expect(hasActiveWorkAmong([t('h1', 'working'), t('h2', 'working')], isHeld)).toBe(false)
@@ -206,17 +193,13 @@ describe('activeWorkingCount / hasActiveWorkAmong — C1 held 제외(순수)', (
     expect(hasActiveWorkAmong([], isHeld)).toBe(false)
   })
 
-  // C3 — idle 게이트(hasActiveWorkAmong)는 activeWorkingCount 기준 그대로여야 한다(behavior 불변).
+  // C3 — idle 게이트(hasActiveWorkAmong)는 working-only(held 제외) 기준 그대로여야 한다(behavior 불변).
   // slotOccupyingCount에 clarifying을 더한 것과 별개로, clarifying만 있을 땐 여전히 유휴(false)로 판정돼야 한다.
   it('hasActiveWorkAmong — clarifying만 있으면 여전히 유휴(false) — idle 게이트 불변', () => {
     expect(hasActiveWorkAmong([t('c', 'clarifying')], isHeld)).toBe(false)
     expect(hasActiveWorkAmong([t('c1', 'clarifying'), t('c2', 'clarifying')], isHeld)).toBe(false)
     // working이 함께 있으면 clarifying 유무와 무관하게 true(기존과 동일).
     expect(hasActiveWorkAmong([t('c', 'clarifying'), t('w', 'working')], isHeld)).toBe(true)
-  })
-  it('activeWorkingCount — clarifying은 여전히 세지 않는다(idle 계수 불변)', () => {
-    expect(activeWorkingCount([t('c', 'clarifying')], isHeld)).toBe(0)
-    expect(activeWorkingCount([t('c', 'clarifying'), t('w', 'working')], isHeld)).toBe(1)
   })
 })
 
@@ -231,9 +214,8 @@ describe('slotOccupyingCount — C3 cap 슬롯 점유(순수)', () => {
     // w(working) + c(clarifying) = 2. h1은 held라 제외, queued/review는 슬롯 아님.
     expect(slotOccupyingCount(tasks, isHeld)).toBe(2)
   })
-  it('clarifying만 있어도 슬롯으로 센다(activeWorkingCount와 다른 점)', () => {
+  it('clarifying만 있어도 슬롯으로 센다(idle 계수와 다른 점)', () => {
     expect(slotOccupyingCount([t('c', 'clarifying')], isHeld)).toBe(1)
-    expect(activeWorkingCount([t('c', 'clarifying')], isHeld)).toBe(0) // 대조: idle 계수는 0
   })
   it('held working은 슬롯을 안 쓴다(제외)', () => {
     expect(slotOccupyingCount([t('h1', 'working')], isHeld)).toBe(0)
@@ -348,7 +330,6 @@ beforeAll(() => {
     stack: '',
     verifyCmd: null,
     isGit: true,
-    enabled: true,
   })
 })
 
@@ -472,7 +453,6 @@ describe('startTask — autonomous 미지원 엔진 거절(capability 일반화)
       stack: '',
       verifyCmd: 'npm test', // autonomous 전제(테스트=판사) 충족 — 그래야 엔진 capability 게이트까지 도달
       isGit: true,
-      enabled: true,
     })
   })
 
@@ -510,7 +490,6 @@ describe('rerunTask — D11 종결 작업의 content 복제 재실행', () => {
       stack: '',
       verifyCmd: null,
       isGit: true,
-      enabled: true,
     })
   })
 
@@ -575,7 +554,6 @@ describe('D1 대기 큐 — activeTaskForProject 제외 / startTask 적재 / dra
       stack: '',
       verifyCmd: null,
       isGit: true,
-      enabled: true,
     })
   })
 
@@ -615,7 +593,7 @@ describe('D1 대기 큐 — activeTaskForProject 제외 / startTask 적재 / dra
     // cap을 넉넉히 올려 앞 테스트들의 잔여 working 슬롯에 무관하게 둘 다 착수되게 한다(결정론).
     saveSettings({ concurrencyCap: 20 })
     const PB = 'test-proj-queue-b'
-    upsertProject({ id: PB, path: os.tmpdir(), name: 'qb', stack: '', verifyCmd: null, isGit: true, enabled: true })
+    upsertProject({ id: PB, path: os.tmpdir(), name: 'qb', stack: '', verifyCmd: null, isGit: true })
     insertTask({ id: 'drain-lo', projectId: P, title: '먼저', state: 'queued', content: 'c', priority: -5 })
     insertTask({ id: 'drain-hi', projectId: PB, title: '나중', state: 'queued', content: 'c', priority: 10 })
 
@@ -645,11 +623,19 @@ describe('D1 대기 큐 — activeTaskForProject 제외 / startTask 적재 / dra
 // runNavi(mock)가 실제 worker처럼 tokensTotal을 갱신하도록 per-test로 덮어써 finishWork의 예산 판정을 태운다.
 describe('finishWork 예산 게이트 — C1+I5 통합(done 통과 / blocked 질문 보존)', () => {
   const BP = 'test-proj-budget'
-  const flush = async () => {
+  // taskId를 주면 'working'을 벗어날 때까지 실시간으로 폴링(최대 3s)한다 — verify_cmd 없는 작업도
+  // 이제 T14 심사 게이트를 타 실제 git 서브프로세스(비동기 IO)가 끼어들어 마이크로태스크 5틱만으론
+  // 부족하다(finding #2: verify_cmd 없음도 audit 게이트 포함). taskId 없으면 기존 마이크로태스크 플러시.
+  const flush = async (taskId?: string) => {
     for (let i = 0; i < 5; i++) await Promise.resolve()
+    if (!taskId) return
+    const start = Date.now()
+    while (getTask(taskId)?.state === 'working' && Date.now() - start < 3000) {
+      await new Promise((res) => setTimeout(res, 20))
+    }
   }
   beforeAll(() => {
-    upsertProject({ id: BP, path: os.tmpdir(), name: 'budget', stack: '', verifyCmd: null, isGit: true, enabled: true })
+    upsertProject({ id: BP, path: os.tmpdir(), name: 'budget', stack: '', verifyCmd: null, isGit: true })
   })
   afterEach(() => {
     saveSettings({ taskTokenBudget: 0 }) // off로 복원
@@ -665,7 +651,7 @@ describe('finishWork 예산 게이트 — C1+I5 통합(done 통과 / blocked 질
       return { status: 'done', summary: '완료', questions: [] }
     })
     const r = await startTask(BP, { content: 'done 예산초과 작업', skipClarify: true })
-    await flush()
+    await flush(r.taskId!)
     const task = getTask(r.taskId!)!
     expect(task.state).toBe('review') // done은 예산 초과여도 막히지 않는다(무한 루프 방지)
     updateTask(r.taskId!, { state: 'done' }) // 프로젝트 busy 해제
@@ -711,7 +697,7 @@ describe('resolveReview — I6 동시 호출 이중 병합 방지', () => {
     upsertProject({
       id: RP, path: os.tmpdir(), name: 'resolve-lock', stack: '',
       verifyCmd: 'npm test', // rebase 후 verifyInDir을 태우려면 verify_cmd 필요
-      isGit: true, enabled: true,
+      isGit: true,
     })
     saveSettings({ autoRebaseOnMerge: true }) // ff 불가(tryMerge mock) → rebase 폴백 진입 → verifyInDir await
   })
@@ -747,7 +733,7 @@ describe('cancelTask — 인터럽트 in-flight 취소 레이스(#3)', () => {
   beforeAll(() => {
     upsertProject({
       id: IP, path: os.tmpdir(), name: 'interrupt-cancel', stack: '',
-      verifyCmd: null, isGit: true, enabled: true,
+      verifyCmd: null, isGit: true,
     })
   })
 

@@ -13,6 +13,7 @@ import type {
   TaskEvent,
   NaviChatEvent,
   DiscordStateEvent,
+  TtsChunkEvent,
   UpdateStatus,
 } from '../shared/types'
 
@@ -28,16 +29,16 @@ const api: LainApi = {
   addProjectDialog: () => ipcRenderer.invoke('projects:addDialog'),
   setMuted: (id, muted) => ipcRenderer.invoke('projects:setMuted', id, muted),
   removeProject: (id) => ipcRenderer.invoke('projects:remove', id),
-  pushProject: (id) => ipcRenderer.invoke('projects:push', id),
   refreshStatus: (id) => ipcRenderer.invoke('status:refresh', id ?? null),
   runVerify: (id) => ipcRenderer.invoke('verify:run', id),
   listFiles: (projectId) => ipcRenderer.invoke('files:list', projectId),
+  listCcSessions: (projectId) => ipcRenderer.invoke('cc:sessions', projectId),
+  ccSessionDigest: (projectId, sessionId) => ipcRenderer.invoke('cc:sessionDigest', projectId, sessionId),
   sendChat: (text, attachments, conversationId) =>
     ipcRenderer.invoke('chat:send', text, attachments, conversationId),
   stopChat: () => ipcRenderer.invoke('chat:stop'),
   resetManager: () => ipcRenderer.invoke('chat:reset'),
   compactNow: (conversationId) => ipcRenderer.invoke('chat:compact', conversationId),
-  chatHistory: () => ipcRenderer.invoke('chat:history'),
   onProjectsUpdated: (cb) => subscribe<ProjectView[]>('projects:updated', cb),
   onChatEvent: (cb) => subscribe<ChatEvent>('chat:event', cb),
   getBriefing: () => ipcRenderer.invoke('briefing:get'),
@@ -49,7 +50,8 @@ const api: LainApi = {
   recentActivity: (limit) => ipcRenderer.invoke('activity:recent', limit),
   startTask: (projectId) => ipcRenderer.invoke('tasks:start', projectId),
   answerClarify: (taskId, answers) => ipcRenderer.invoke('tasks:answer', taskId, answers),
-  resolveReview: (taskId, action) => ipcRenderer.invoke('tasks:resolveReview', taskId, action),
+  resolveReview: (taskId, action, comment) =>
+    ipcRenderer.invoke('tasks:resolveReview', taskId, action, comment),
   revertMerge: (taskId) => ipcRenderer.invoke('tasks:revertMerge', taskId),
   cancelTask: (taskId) => ipcRenderer.invoke('tasks:cancel', taskId),
   resumeTask: (taskId) => ipcRenderer.invoke('tasks:resume', taskId),
@@ -80,6 +82,7 @@ const api: LainApi = {
   workspaceInfo: () => ipcRenderer.invoke('workspace:info'),
   openDataFolder: () => ipcRenderer.invoke('data:openFolder'),
   backupData: () => ipcRenderer.invoke('data:backup'),
+  autoBackupStatus: () => ipcRenderer.invoke('data:autoBackupStatus'),
   onSettingsUpdated: (cb) => subscribe<LainSettings>('settings:updated', cb),
   onQuip: (cb) => subscribe<{ text: string }>('quip:show', cb),
   // D15 되감기
@@ -88,16 +91,6 @@ const api: LainApi = {
   // D13 크로스레포 그룹
   taskGroupInfo: (groupId) => ipcRenderer.invoke('groups:info', groupId),
   resolveGroup: (groupId, action) => ipcRenderer.invoke('groups:resolve', groupId, action),
-  // 플래너
-  plannerList: () => ipcRenderer.invoke('planner:list'),
-  plannerUpsertItem: (input) => ipcRenderer.invoke('planner:upsertItem', input),
-  plannerDeleteItem: (id) => ipcRenderer.invoke('planner:deleteItem', id),
-  plannerSetDone: (id, done) => ipcRenderer.invoke('planner:setDone', id, done),
-  plannerUpsertTag: (input) => ipcRenderer.invoke('planner:upsertTag', input),
-  plannerDeleteTag: (id) => ipcRenderer.invoke('planner:deleteTag', id),
-  plannerUpsertSection: (input) => ipcRenderer.invoke('planner:upsertSection', input),
-  plannerDeleteSection: (id) => ipcRenderer.invoke('planner:deleteSection', id),
-  onPlannerUpdated: (cb) => subscribe<null>('planner:updated', cb),
   // 자동 업데이트
   getUpdateStatus: () => ipcRenderer.invoke('update:status'),
   checkForUpdate: () => ipcRenderer.invoke('update:check'),
@@ -106,11 +99,12 @@ const api: LainApi = {
   onUpdateStatus: (cb) => subscribe<UpdateStatus>('update:status', cb),
   // Supertonic TTS 테스트 재생 / 모델 상태
   testTts: (text) => ipcRenderer.invoke('tts:test', text),
-  supertonicStatus: () => ipcRenderer.invoke('tts:supertonicStatus'),
   importVoice: () => ipcRenderer.invoke('voice:import'),
   openVoicesFolder: () => ipcRenderer.invoke('voice:openFolder'),
   sttVoice: (bytes) => ipcRenderer.invoke('voice:stt', bytes),
-  speakTts: (text) => ipcRenderer.invoke('tts:speak', text),
+  speakTtsStream: (text) => ipcRenderer.invoke('tts:speakStream', text),
+  stopTtsSpeak: () => ipcRenderer.invoke('tts:speakStop'),
+  onTtsChunk: (cb) => subscribe<TtsChunkEvent>('tts:chunk', cb),
   telegramStatus: () => ipcRenderer.invoke('telegram:status'),
   discordStatus: () => ipcRenderer.invoke('discord:status'),
   onDiscordState: (cb) => subscribe<DiscordStateEvent>('discord:state', cb),
@@ -118,10 +112,8 @@ const api: LainApi = {
   sendNaviChat: (projectId, text, attachments, conversationId) =>
     ipcRenderer.invoke('workerchat:send', projectId, text, attachments, conversationId),
   stopNaviChat: (projectId) => ipcRenderer.invoke('workerchat:stop', projectId),
-  naviChatHistory: (projectId) => ipcRenderer.invoke('workerchat:history', projectId),
   onNaviChatEvent: (cb) => subscribe<NaviChatEvent>('workerchat:event', cb),
   onConversationsUpdated: (cb) => subscribe<string>('conversations:updated', cb),
-  conversationPreviews: () => ipcRenderer.invoke('chat:previews'),
   // 다중 세션
   listConversations: (target) => ipcRenderer.invoke('conversations:list', target),
   createConversation: (target) => ipcRenderer.invoke('conversations:create', target),
@@ -148,7 +140,6 @@ const api: LainApi = {
   // §22 자기개선
   listLessons: () => ipcRenderer.invoke('lessons:list'),
   lessonsAbsorbedInto: (umbrellaId) => ipcRenderer.invoke('lessons:absorbedInto', umbrellaId),
-  flagLesson: (id) => ipcRenderer.invoke('lesson:flag', id),
   unflagLesson: (id) => ipcRenderer.invoke('lesson:unflag', id),
   archiveLesson: (id) => ipcRenderer.invoke('lesson:archive', id),
   pinLesson: (id, pinned) => ipcRenderer.invoke('lesson:pin', id, pinned),
@@ -184,6 +175,8 @@ const api: LainApi = {
   onWindowMaximized: (cb) => subscribe<boolean>('window:maximized', cb),
   // 렌더러 인박스 열림/닫힘 통지 (자리 비움 판단)
   setInboxOpen: (open) => ipcRenderer.send('ui:inbox-state', open),
+  // 렌더러 조용한 실패·렌더 예외 보고 → main이 renderer-crash.log에 한 줄 남긴다
+  reportError: (payload) => ipcRenderer.invoke('ui:error', payload),
   // 어깨너머 오버레이
   openMainWindow: () => ipcRenderer.invoke('window:openMain'),
   overlayResize: (height) => ipcRenderer.send('overlay:resize', height),

@@ -32,11 +32,6 @@ export function sessionStartStamp(date = new Date()): string {
   return date.toISOString().slice(0, 19).replace('T', ' ')
 }
 
-/** 이번 실행에서 생긴 메시지만 — created_at >= 세션 시작(동일 포맷 문자열 비교). */
-export function filterThisSession<T extends ChatMessage>(rows: T[], sessionStart: string): T[] {
-  return rows.filter((m) => m.createdAt >= sessionStart)
-}
-
 /**
  * DB 타임스탬프를 epoch ms로. datetime('now')=UTC 'YYYY-MM-DD HH:MM:SS'(공백·Z 없음)를 로컬로 오독하지 않도록
  * 공백형엔 'Z'를 붙여 UTC로 해석한다(git %cI 등 'T'+오프셋은 그대로). tokenUsage.parseUtcStamp와 동일 규약
@@ -405,6 +400,8 @@ function shortTokens(n: number): string {
  * elapsed는 fmtElapsed 재사용(재구현 금지). turns/tokens는 0이면 생략(신호 대 소음).
  */
 export function tileMeta(task: Task | null): TileMeta {
+  // 큐 대기(슬롯 대기)는 '진행 중'은 아니지만 제목조차 안 보이면 유휴와 구분이 안 된다 — 제목 + '큐 대기'만.
+  if (task && task.state === 'queued') return { active: true, title: task.title, stats: '큐 대기' }
   if (!isTaskActive(task)) return { active: false, title: '', stats: '' }
   const t = task!
   const stats = [

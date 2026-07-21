@@ -32,10 +32,9 @@ today. See [로드맵](#roadmap) below for i18n plans. ([한국어로 보기](RE
 - **Learning (taming)** — Automatically extracts lessons from conversations and tasks and
   applies them to future judgment, while building a profile of your preferences and habits.
   The more you use it, the more it adapts to your way of working.
-- **Planner** — Manages events and to-dos in one calendar. Say "schedule a meeting at 3pm
-  tomorrow" and it's registered; reminders come via desktop notification and Telegram.
-- **User watch** — (opt-in) Occasionally glances at your screen and offers advice only when
-  it's genuinely useful. Stays quiet the rest of the time.
+- **User watch** — (opt-in) Watches only development screens (terminals, editors, dev-related
+  browser tabs) and speaks up only when it's genuinely useful — an error, a failed build.
+  Anything else is never captured, and it stays quiet the rest of the time.
 - **Voice** — Supports 3 TTS engines (Edge/Supertonic/GPT-SoVITS) and Discord voice calls.
 - **Mobile** — Chat, dispatch tasks, approve, and check status from anywhere via Telegram.
 - **Safety** — Dangerous-command approval queue, secret-file access blocking, and
@@ -96,5 +95,5 @@ independently reimplemented (no code copied).
 
 ---
 
-For full documentation (features, configuration, local model setup, development), see the
+For full documentation (features, configuration, experimental local model, development), see the
 [Korean README](README.md) — it's the primary and most up-to-date reference.

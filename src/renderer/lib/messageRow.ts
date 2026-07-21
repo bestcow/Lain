@@ -42,7 +42,8 @@ function sameAttachments(
   return true
 }
 
-/** ChatPanel(레인) 행 memo prop 형태 — 렌더에 실제로 쓰이는 값만. 콜백은 App에서 useCallback으로 안정화됨. */
+/** ChatPanel(레인)·NaviChatPanel 공용 행 memo prop 형태 — 렌더에 실제로 쓰이는 값만.
+ * 콜백은 App에서 useCallback으로 안정화됨. (Navi는 sameSpeaker 계산 입력만 다르고 비교 자체는 동일.) */
 export interface ChatRowCompareProps {
   m: ChatMessage
   query: string
@@ -55,29 +56,6 @@ export interface ChatRowCompareProps {
 
 /** true면 리렌더 스킵. React.memo의 areEqual과 동일 규약(같으면 true). */
 export function chatRowPropsEqual(prev: ChatRowCompareProps, next: ChatRowCompareProps): boolean {
-  return (
-    prev.query === next.query &&
-    prev.isActiveHit === next.isActiveHit &&
-    prev.queued === next.queued &&
-    prev.sameSpeaker === next.sameSpeaker &&
-    prev.onMessageContext === next.onMessageContext &&
-    prev.onCancelQueued === next.onCancelQueued &&
-    sameMessageRenderFields(prev.m, next.m)
-  )
-}
-
-/** NaviChatPanel 행 memo prop 형태 — ChatPanel과 동일하되 sameSpeaker 계산 입력이 다르다(projectId·origin 포함). */
-export interface NaviRowCompareProps {
-  m: ChatMessage
-  query: string
-  isActiveHit: boolean
-  queued: boolean
-  sameSpeaker: boolean
-  onMessageContext?: unknown
-  onCancelQueued?: unknown
-}
-
-export function naviRowPropsEqual(prev: NaviRowCompareProps, next: NaviRowCompareProps): boolean {
   return (
     prev.query === next.query &&
     prev.isActiveHit === next.isActiveHit &&

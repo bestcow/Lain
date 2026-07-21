@@ -6,7 +6,6 @@ import { query } from '@anthropic-ai/claude-agent-sdk'
 import fs from 'node:fs'
 import path from 'node:path'
 import { AGENT_CWD, CLAUDE_BIN, DATA_DIR } from './paths'
-import { getSettings } from './store'
 import { judgeQueryOptions } from './agentopts'
 import type { ChatMessage } from '../shared/types'
 

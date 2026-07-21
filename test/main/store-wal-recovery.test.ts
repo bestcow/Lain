@@ -164,6 +164,66 @@ describe('recoverCorruptWalBeforeOpen — 2026 사고 시나리오(메인 손상
     }
   })
 
+  it('메인 손상 페이지가 WAL 미커버여도(병합 뷰 손상) 정상 WAL을 폐기하지 않는다 — 손상 위치 판별', () => {
+    // 실사고의 잔여 갭: WAL이 손상 페이지를 '가리지 못하는' 경우 병합 뷰도 손상 판정이라
+    // 과거 코드는 무조건 WAL을 폐기 → WAL에만 있던 멀쩡한 최신 커밋이 유실됐다.
+    // 픽스처: v 인덱스를 만들어 메인에 체크포인트 → 일부 행만 갱신(WAL은 그 페이지들만 보유)
+    // → WAL이 커버하지 않는 인덱스 루트 페이지를 쓰레기로 덮는다(테이블 b-tree는 무사 → 행 조회 가능).
+    const db1 = new DatabaseSync(dbPath)
+    db1.exec('PRAGMA journal_mode = WAL')
+    db1.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)')
+    db1.exec('CREATE INDEX idx_v ON t (v)')
+    const ins = db1.prepare('INSERT INTO t (id, v) VALUES (?, ?)')
+    for (let i = 0; i < ROWS; i++) ins.run(i, oldVal(i))
+    db1.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    const rootpage = (
+      db1.prepare("SELECT rootpage FROM sqlite_master WHERE name = 'idx_v'").get() as {
+        rootpage: number
+      }
+    ).rootpage
+    db1.close()
+    // WAL에만 존재하는 갱신 — id 0 한 건만(인덱스 루트가 아닌 리프/테이블 페이지 위주로 WAL 구성)
+    const db2 = new DatabaseSync(dbPath)
+    db2.exec('PRAGMA journal_mode = WAL')
+    db2.prepare('UPDATE t SET v = ? WHERE id = 0').run(newVal(0))
+    const staging = fs.mkdtempSync(path.join(DATA_DIR, 'staging-'))
+    for (const ext of ['', '-wal', '-shm']) {
+      if (fs.existsSync(dbPath + ext)) fs.copyFileSync(dbPath + ext, path.join(staging, 'f' + ext))
+    }
+    db2.close()
+    for (const ext of ['', '-wal', '-shm']) {
+      const src = path.join(staging, 'f' + ext)
+      if (fs.existsSync(src)) fs.copyFileSync(src, dbPath + ext)
+      else fs.rmSync(dbPath + ext, { force: true })
+    }
+    fs.rmSync(staging, { recursive: true, force: true })
+    // 인덱스 루트 페이지가 WAL에 없어야 픽스처 성립(있으면 WAL이 가려 병합 뷰가 정상이 됨)
+    const { pages, pageSize } = walPageNumbers()
+    expect(pages.has(rootpage)).toBe(false)
+    const fd = fs.openSync(dbPath, 'r+')
+    try {
+      fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, (rootpage - 1) * pageSize)
+    } finally {
+      fs.closeSync(fd)
+    }
+
+    recoverCorruptWalBeforeOpen()
+    // 핵심 회귀: 메인 자체 손상이므로 WAL은 보존돼야 한다(폐기하면 id 0의 신버전 커밋 유실)
+    expect(fs.existsSync(dbPath + '-wal')).toBe(true)
+    const db = new DatabaseSync(dbPath)
+    try {
+      const row = db.prepare('SELECT v FROM t WHERE id = 0').get() as { v: string }
+      expect(row.v).toBe(newVal(0)) // WAL의 최신 커밋 생존
+      // 테이블 b-tree는 무사 — 전 행 조회 가능(손상은 인덱스 페이지에 국한).
+      // 인덱스 치유 자체는 rw 오픈 경로 repairIndexesIfCorrupt(REINDEX→NOT NULL→VACUUM 다단계)의 몫이라
+      // 여기선 검증하지 않는다 — 이 테스트의 회귀 대상은 'WAL 오판 폐기' 하나다.
+      const all = db.prepare('SELECT id FROM t ORDER BY id').all() as { id: number }[]
+      expect(all.length).toBe(ROWS)
+    } finally {
+      db.close()
+    }
+  })
+
   it('반대로 WAL 자체가 손상이면 여전히 폐기하고 메인(구버전)으로 복원한다', () => {
     makeKillSnapshotFixture()
     // WAL 프레임 데이터를 깨뜨린다(헤더 32바이트 뒤 프레임 본문에 쓰레기) — 체크섬 불일치로 손상 WAL

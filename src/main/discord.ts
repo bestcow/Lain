@@ -2,7 +2,6 @@
 // 봇 토큰·길드/VC/userID는 시크릿(로그 비노출). 단일 화자(내 userID만 청취).
 // telegram.ts의 형제 — 매니저 코어(sendToManager)·store·rendererMirror를 재사용하고 음성 I/O만 담당.
 import path from 'node:path'
-import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import { Client, GatewayIntentBits } from 'discord.js'
 import {
@@ -43,16 +42,39 @@ let running = false
 let inCall = false
 let lastError: string | null = null
 
+// 로그인 실패 재시도 — 부팅 시 네트워크가 잠깐 끊겨 있으면(기존: 재시도 없음) 그날 내내 통화가 죽어 있었다.
+// 지수 백오프(5s→...→상한 5분)로 계속 시도하되, 토큰 자체가 잘못된 경우(TokenInvalid/TokenMissing)는 아무리
+// 재시도해도 안 풀리므로 재시도 대상에서 뺀다(사용자가 설정을 고쳐야 함).
+let retryTimer: ReturnType<typeof setTimeout> | null = null
+let retryAttempt = 0
+const LOGIN_RETRY_BASE_MS = 5_000
+const LOGIN_RETRY_MAX_MS = 5 * 60_000
+const PERMANENT_LOGIN_ERROR_CODES = new Set(['TokenInvalid', 'TokenMissing'])
+function isPermanentLoginError(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code
+  return typeof code === 'string' && PERMANENT_LOGIN_ERROR_CODES.has(code)
+}
+function scheduleLoginRetry(): void {
+  if (retryTimer) return // 이미 예약됨
+  const delay = Math.min(LOGIN_RETRY_BASE_MS * 2 ** retryAttempt, LOGIN_RETRY_MAX_MS)
+  retryAttempt++
+  dlog(`로그인 재시도 예약 — ${delay}ms 후(시도 ${retryAttempt})`)
+  retryTimer = setTimeout(() => {
+    retryTimer = null
+    void startDiscord()
+  }, delay)
+}
+
 // #3 통화 파이프라인 단계 — 렌더러 배지로 라이브 표시. ipc가 bindDiscordState로 broadcast에 연결.
 let callState: DiscordCallState = 'idle'
 let stateCb: ((ev: DiscordStateEvent) => void) | null = null
 export function bindDiscordState(cb: (ev: DiscordStateEvent) => void): void {
   stateCb = cb
 }
-function setCallState(state: DiscordCallState, error?: string): void {
+function setCallState(state: DiscordCallState): void {
   callState = state
   try {
-    stateCb?.({ state, error })
+    stateCb?.({ state })
   } catch {
     /* 무시 */
   }
@@ -110,6 +132,10 @@ export async function startDiscord(): Promise<void> {
     return
   }
   if (running) return
+  if (retryTimer) {
+    clearTimeout(retryTimer) // 수동/명시적 재기동이 예약된 자동 재시도를 대체한다
+    retryTimer = null
+  }
   client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   })
@@ -141,6 +167,7 @@ export async function startDiscord(): Promise<void> {
     await client.login(s.discordBotToken)
     running = true
     lastError = null
+    retryAttempt = 0 // 로그인 성공 — 다음 실패 시 백오프를 처음부터 다시
     dlog('logged in')
     // #4: 이미 타깃 유저가 VC에 있으면(앱 재시작 등으로 입장 transition을 놓친 경우) 즉시 따라 들어간다.
     void joinIfUserAlreadyIn()
@@ -149,10 +176,21 @@ export async function startDiscord(): Promise<void> {
     dlog(`login fail: ${lastError}`)
     client?.destroy()
     client = null
+    if (isPermanentLoginError(e)) {
+      dlog('영구 실패(토큰 오류) — 자동 재시도 안 함, 설정 수정 필요')
+      retryAttempt = 0
+      return
+    }
+    scheduleLoginRetry()
   }
 }
 
 export function stopDiscord(): void {
+  if (retryTimer) {
+    clearTimeout(retryTimer)
+    retryTimer = null
+  }
+  retryAttempt = 0
   onUserLeave()
   client?.destroy()
   client = null
@@ -197,7 +235,7 @@ async function onUserJoin(): Promise<void> {
       /* 이미 끊김 */
     }
     inCall = false
-    setCallState('error', lastError)
+    setCallState('error') // 사유는 lastError에 남아 getDiscordStatus().error로 조회된다
   }
 }
 
@@ -373,7 +411,7 @@ async function handleUtterance(pcm: Buffer): Promise<void> {
     if (!speaking && inCall) setCallState('waiting') // 응답이 음성으로 안 나온 경우 대기 복귀
   } catch (e) {
     dlog(`utt fail: ${(e as Error).message}`)
-    setCallState('error', (e as Error).message)
+    setCallState('error') // 사유는 위 dlog에 남는다
   }
 }
 

@@ -89,16 +89,6 @@ export const QUIPS: QuipDef[] = [
     escalation: TOGGLE_ESCALATION,
   },
   {
-    trigger: 'busy_week', // 플래너 upsert 후 이번 주 항목 ≥6
-    rarity: 'uncommon',
-    cooldownSec: 3600,
-    variants: [
-      '이번 주는 바쁘시네요.',
-      '일정이 {count}개예요. 무리하지 마세요.',
-      '이번 주 {count}개… 쉬는 시간도 일정에 넣어 두세요.',
-    ],
-  },
-  {
     trigger: 'late_night', // 00~04시 첫 채팅 활동 (쿨다운 20시간 ≒ 1일 1회)
     rarity: 'uncommon',
     cooldownSec: 72_000,
@@ -199,6 +189,34 @@ export const QUIPS: QuipDef[] = [
     rarity: 'rare',
     cooldownSec: 60,
     variants: ['정말요? 후회하실 텐데요.', '그럼 사양 않고 말 걸게요.', '수다쟁이라니… 노력해 볼게요.'],
+  },
+  {
+    trigger: 'task_done', // 작업 review 결재에서 merge 성공(resolveReview)
+    rarity: 'common',
+    cooldownSec: 300,
+    variants: [
+      '작업 하나 병합 완료됐어요. 확인해 보세요.',
+      '방금 그 작업, 검증까지 통과해서 병합했어요.',
+      '하나 끝났습니다. 다음 거 시킬 준비 됐어요.',
+    ],
+  },
+  {
+    trigger: 'verify_fail', // verify 재시도 소진 — 최종 실패로 review에 도달(finishWork)
+    rarity: 'uncommon',
+    cooldownSec: 600,
+    variants: [
+      '검증이 계속 빨간불이에요. 제가 원인 정리해 둘게요.',
+      '테스트가 안 통과해서 멈춰 세웠어요. 지시가 필요해요.',
+    ],
+  },
+  {
+    trigger: 'task_error', // 자동 재개 소진 후 error 확정(handleRunError)
+    rarity: 'uncommon',
+    cooldownSec: 600,
+    variants: [
+      '작업 하나가 에러로 넘어졌어요. 로그 봐뒀습니다.',
+      '문제가 생겨서 작업을 멈췄어요. 결재함을 봐 주세요.',
+    ],
   },
 ]
 

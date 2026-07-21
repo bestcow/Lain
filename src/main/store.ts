@@ -22,7 +22,6 @@ import type {
   Approval,
   ChatMessage,
   Conversation,
-  ConversationPreview,
   FileAttachment,
   LainSettings,
   ModelTier,
@@ -32,10 +31,6 @@ import type {
   BenchTaskResult,
   Lesson,
   Routine,
-  PlanItem,
-  PlanItemInput,
-  PlanTag,
-  PlanSection,
   McpServer,
   McpServerInput,
   Task,
@@ -48,14 +43,32 @@ import type {
   TaskPermissionMode,
   ThinkingLevel,
   ChatHistoryHit,
+  ReviewDepth,
 } from '../shared/types'
 import { MODEL_TIERS } from '../shared/models' // m6 — 티어 목록 단일출처(로컬 중복 제거)
-// 출력측 비밀 redaction + 교훈 인젝션 스캔 — 구현은 safety 소유자, store는 chokepoint에서 import-only.
+import type { LoopStats } from '../shared/loopstats' // L6 — 루프 성적표 집계 결과 타입(main/renderer 공용 아님)
+// 출력측 비밀 redaction + 학습 인젝션 스캔 — 구현은 safety 소유자, store는 chokepoint에서 import-only.
 import { redactSecrets, scanLessonInjection } from './safety'
 // curatedPlugins 기본값(CC-FEATURES P1) — skills는 store를 import하지 않아 단방향(순환 없음).
 import { CURATED_PLUGIN_NAMES } from './skills'
 
 let db: DatabaseSync
+
+// 클론 관점 감사(#5) — initStore의 ALTER TABLE 마이그레이션들이 전부 '어떤 에러든' catch{}로 무조건
+// 삼켰다("컬럼이 이미 있어서"라고 가정). 컬럼이 이미 있어 나는 'duplicate column name'만 정상(조용히
+// 넘김)이고, 그 외 실패(디스크 손상·권한 등 진짜 마이그레이션 실패)까지 조용히 넘기면 그 컬럼이 실제로는
+// 안 생긴 채 부팅이 '성공'으로 끝나 반쯤 초기화된 상태(zombie)로 계속 돌고, 그 컬럼을 쓰는 코드가 한참
+// 뒤 다른 자리에서 'no such column'으로 터져 원인 추적이 안 됐다. 여기서 실패 원인을 구분해 진짜
+// 실패만 recovery.log에 남긴다(부팅 자체를 막진 않는다 — index.ts가 initStore() 실패를 감싸지 않으므로
+// 더 근본적인 실패는 여전히 크래시로 드러난다는 기존 설계는 유지).
+export function safeAlter(sql: string): void {
+  try {
+    db.exec(sql)
+  } catch (e) {
+    if (!/duplicate column name/i.test(String(e)))
+      logRecovery(`마이그레이션 실패(컬럼 추가 아님 — 진단 필요): ${sql.slice(0, 100)} → ${String(e).slice(0, 150)}`)
+  }
+}
 
 export function initStore(): void {
   fs.mkdirSync(DATA_DIR, { recursive: true })
@@ -213,42 +226,6 @@ export function initStore(): void {
       enabled     INTEGER NOT NULL DEFAULT 1,
       created_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
-    CREATE TABLE IF NOT EXISTS plan_items (
-      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-      kind               TEXT NOT NULL,              -- 'event' | 'todo'
-      title              TEXT NOT NULL,
-      body               TEXT NOT NULL DEFAULT '',   -- 메모·링크 (md)
-      start_at           TEXT,                       -- ISO. event 필수. todo는 선택(=마감일, 있으면 캘린더에 표시·리마인드 대상)
-      end_at             TEXT,                       -- ISO. NULL 허용(점 이벤트)
-      all_day            INTEGER NOT NULL DEFAULT 0,
-      recur              TEXT NOT NULL DEFAULT 'none', -- none | daily | weekly:<0-6> | monthly:<1-31>
-      tag_id             INTEGER,                    -- plan_tags FK (NULL=무태그)
-      section_id         INTEGER,                    -- plan_sections FK (todo 전용, NULL=기본)
-      done               INTEGER NOT NULL DEFAULT 0,
-      done_at            TEXT,
-      remind_offset_min  INTEGER,                    -- NULL=설정 기본값 사용. start_at 있는 항목(event·마감 todo)에 적용
-      remind_sent_at     TEXT,                       -- 마지막 리마인드 발송 시각(반복이면 발생 회차별 재무장)
-      snooze_until       TEXT,                       -- [+10분] 스누즈 — 이 시각 전엔 리마인드 억제
-      pinned             INTEGER NOT NULL DEFAULT 0,
-      sort_order         INTEGER NOT NULL DEFAULT 0,
-      origin             TEXT NOT NULL DEFAULT 'user', -- user | lain | telegram
-      archived           INTEGER NOT NULL DEFAULT 0, -- 보관(하드삭제 없음 — 성장 보존 관행)
-      -- localtime: staleTodos 등이 로컬 ISO와 문자열 비교 — UPDATE 경로(datetime('now','localtime'))와 일치 필수
-      created_at         TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-      updated_at         TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-    );
-    CREATE TABLE IF NOT EXISTS plan_tags (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      name       TEXT NOT NULL UNIQUE,
-      color      TEXT NOT NULL,             -- #rrggbb
-      sort_order INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS plan_sections (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      name       TEXT NOT NULL,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      collapsed  INTEGER NOT NULL DEFAULT 0
-    );
     CREATE TABLE IF NOT EXISTS agent_skills (
       name         TEXT PRIMARY KEY,                      -- ascii kebab([a-z0-9-]) — 폴더명 겸 도구 인자
       description  TEXT NOT NULL DEFAULT '',              -- ≤60자 한 줄 — skills-index 주입용
@@ -260,42 +237,19 @@ export function initStore(): void {
       updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `)
-  // 마이그레이션: 기존 DB에 컬럼 추가 (없으면)
-  try {
-    db.exec('ALTER TABLE project_status ADD COLUMN has_task_md INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec('ALTER TABLE approvals ADD COLUMN answer TEXT')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec("ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL DEFAULT 'interactive'")
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec("ALTER TABLE tasks ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'acceptEdits'")
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec("ALTER TABLE tasks ADD COLUMN thinking_level TEXT NOT NULL DEFAULT 'default'")
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec("ALTER TABLE tasks ADD COLUMN disallowed_tools TEXT NOT NULL DEFAULT '[]'")
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec('ALTER TABLE tasks ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 있음 */
-  }
+  // 마이그레이션: 기존 DB에 컬럼 추가 (없으면). safeAlter는 'duplicate column name'(=이미 있음, 정상)만
+  // 조용히 넘기고 그 외 실패(디스크·권한 등 진짜 마이그레이션 실패)는 recovery.log에 남긴다 — 클론 관점
+  // 감사(#5): 예전엔 catch{}가 모든 에러를 무조건 삼켜, 컬럼이 실제로는 안 생겼는데도 부팅은 '성공'해
+  // 반쯤 초기화된 상태로 계속 돌다가 그 컬럼을 쓰는 코드가 한참 뒤 다른 자리에서 'no such column'으로
+  // 터졌다(원인 추적 불가). 부팅 자체는 여전히 막지 않는다(기존 설계 유지 — index.ts가 initStore() 호출을
+  // 감싸지 않아 더 치명적인 실패는 어차피 크래시로 드러난다).
+  safeAlter('ALTER TABLE project_status ADD COLUMN has_task_md INTEGER NOT NULL DEFAULT 0')
+  safeAlter('ALTER TABLE approvals ADD COLUMN answer TEXT')
+  safeAlter("ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL DEFAULT 'interactive'")
+  safeAlter("ALTER TABLE tasks ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'acceptEdits'")
+  safeAlter("ALTER TABLE tasks ADD COLUMN thinking_level TEXT NOT NULL DEFAULT 'default'")
+  safeAlter("ALTER TABLE tasks ADD COLUMN disallowed_tools TEXT NOT NULL DEFAULT '[]'")
+  safeAlter('ALTER TABLE tasks ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0')
   // I4 — 라이프타임 누적 토큰(핸드오프·resume·verify재시도로 세션이 여러 개인 작업의 예산 판정 기준).
   //  - tokens_total: 지금까지 모든 세션의 누계(= session_base_tokens + 현재 세션 cumulative).
   //  - session_base_tokens: 현재 세션 이전 세션들의 누계(현재 세션 result가 세션 cumulative를 보고할 때
@@ -303,185 +257,99 @@ export function initStore(): void {
   for (const col of [
     'ALTER TABLE tasks ADD COLUMN tokens_total INTEGER NOT NULL DEFAULT 0',
     'ALTER TABLE tasks ADD COLUMN session_base_tokens INTEGER NOT NULL DEFAULT 0',
-  ]) {
-    try {
-      db.exec(col)
-    } catch {
-      /* 이미 있음 */
-    }
-  }
-  try {
-    db.exec('ALTER TABLE bench_runs ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 있음 */
-  }
-  // §24 Phase1 — 교훈 수명주기 + telemetry + 출처. curator(Phase3)·provenance 게이트의 공통 토대.
+  ]) safeAlter(col)
+  safeAlter('ALTER TABLE bench_runs ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0')
+  // §24 Phase1 — 학습 수명주기 + telemetry + 출처. curator(Phase3)·provenance 게이트의 공통 토대.
   for (const col of [
     "ALTER TABLE lessons ADD COLUMN status TEXT NOT NULL DEFAULT 'active'", // active|stale|archived
     'ALTER TABLE lessons ADD COLUMN last_used_at TEXT', // 마지막 주입 시각(recency 신호, nullable)
     'ALTER TABLE lessons ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0', // 불가침(수명주기 전이·폐기 제외)
     "ALTER TABLE lessons ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'", // agent|user (provenance 게이트)
-    // §자기개선 — consolidation 계보 추적: 흡수된 교훈이 가리키는 umbrella id(revert 역참조 키, nullable).
+    // §자기개선 — consolidation 계보 추적: 흡수된 학습이 가리키는 umbrella id(revert 역참조 키, nullable).
     'ALTER TABLE lessons ADD COLUMN absorbed_into INTEGER',
     // 한 consolidate 호출에 archived+umbrella를 묶는 batch id(crypto.randomUUID()). NULL=curation 산물 아님.
     'ALTER TABLE lessons ADD COLUMN consolidation_batch TEXT',
     // Navi 스폰 시 실제 프롬프트에 주입된 횟수. reuse_count(=선택 bump)와 의미 분리 — inject_count는 실주입 신호.
     'ALTER TABLE lessons ADD COLUMN inject_count INTEGER NOT NULL DEFAULT 0',
-  ]) {
-    try {
-      db.exec(col)
-    } catch {
-      /* 이미 있음 */
-    }
-  }
-  try {
-    db.exec('ALTER TABLE messages ADD COLUMN conversation_id TEXT')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec('ALTER TABLE messages ADD COLUMN chapter TEXT') // 우클릭 '챕터로 고정' 제목
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec('ALTER TABLE messages ADD COLUMN attachments TEXT') // user 첨부(JSON) 인라인 로그
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec('ALTER TABLE messages ADD COLUMN origin TEXT') // 폰發 출처('telegram'); null/'pc'는 PC 발신
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    db.exec('ALTER TABLE messages ADD COLUMN uid TEXT') // 저널 재조정용 안정 식별자(legacy 행은 null)
-  } catch {
-    /* 이미 있음 */
-  }
+  ]) safeAlter(col)
+  safeAlter('ALTER TABLE messages ADD COLUMN conversation_id TEXT')
+  safeAlter('ALTER TABLE messages ADD COLUMN chapter TEXT') // 우클릭 '챕터로 고정' 제목
+  safeAlter('ALTER TABLE messages ADD COLUMN attachments TEXT') // user 첨부(JSON) 인라인 로그
+  safeAlter('ALTER TABLE messages ADD COLUMN origin TEXT') // 폰發 출처('telegram'); null/'pc'는 PC 발신
+  safeAlter('ALTER TABLE messages ADD COLUMN uid TEXT') // 저널 재조정용 안정 식별자(legacy 행은 null)
   try {
     // uid 유니크 인덱스(부분) — reconcile 멱등 보장(중복 삽입 차단). legacy null uid는 인덱스에서 제외.
+    // CREATE INDEX는 IF NOT EXISTS로 이미 멱등이라 실패는 진짜 문제(권한·디스크 등) — 그대로 로그.
     db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_uid ON messages(uid) WHERE uid IS NOT NULL')
-  } catch {
-    /* 무시 */
+  } catch (e) {
+    logRecovery(`idx_messages_uid 인덱스 생성 실패: ${String(e).slice(0, 150)}`)
   }
-  try {
-    // 작업 드로어 대화 트랜스크립트 — 이벤트 화자 귀속('worker'|'lain'|'user'). legacy 행은 null(시스템 로그로 표시).
-    db.exec('ALTER TABLE task_events ADD COLUMN speaker TEXT')
-  } catch {
-    /* 이미 있음 */
+  // 조회 경로 인덱스 — 전부 부모키+정렬키 조합. 인덱스는 쿼리 결과를 바꾸지 않으므로 호출부 수정이 없고,
+  // 기존 DB에도 부팅 시 1회 생성된다. messages는 정리 로직이 없어 단조 증가라(월 ~2,000행) 인덱스 없이는
+  // 대화 목록/열기(listConversations의 상관 서브쿼리·listConversationMessages)가 행 수에 비례해 느려지고,
+  // 그게 동기 IPC 핸들러라 메인 프로세스 전체가 그만큼 멈춘다.
+  for (const idx of [
+    'CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id)',
+    'CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, id)',
+    'CREATE INDEX IF NOT EXISTS idx_cc_events_project ON cc_events(project_id, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_approvals_state ON approvals(state)',
+  ]) {
+    try {
+      db.exec(idx)
+    } catch (e) {
+      logRecovery(`인덱스 생성 실패 [${idx}]: ${String(e).slice(0, 150)}`)
+    }
   }
-  try {
-    db.exec('ALTER TABLE conversations ADD COLUMN last_mobile_at TEXT') // 마지막 텔레그램 메시지 시각(📱 표시용, Lain 기여)
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    // 대화 제목 자동요약 1회 가드 — 1이면 이미 요약됨(또는 수동 rename) → 자동요약 스킵
-    db.exec('ALTER TABLE conversations ADD COLUMN title_auto INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    // 무한세션 — 마지막 result의 컨텍스트 점유 토큰(임계 도달 시 압축 트리거). 기존 행은 0.
-    db.exec('ALTER TABLE conversations ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    // 무한세션 — 압축된 구조화 월드모델(4필드 md). 세션 리셋 후 재주입해 맥락 유지.
-    db.exec('ALTER TABLE conversations ADD COLUMN world_state TEXT')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    // Navi 유한세션 핸드오프 — Navi가 직접 쓴 핸드오프 md(세션 교체 후 새 세션에 재주입). Lain의 world_state(무한세션)와 별개.
-    db.exec('ALTER TABLE conversations ADD COLUMN handoff_md TEXT')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    // 단일 세션 Lain — 화면에 보일 최소 메시지 id(워터마크). 압축 시 전진해 최근 N개만 표시(DB·저널은 보존, 비파괴).
-    db.exec('ALTER TABLE conversations ADD COLUMN visible_from_id INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    // Navi 유한세션 핸드오프(A 자율작업) — 작업당 컨텍스트 점유. resume 경계에서 임계 도달 시 교체 트리거.
-    db.exec('ALTER TABLE tasks ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    // Navi 유한세션 핸드오프(A 자율작업) — Navi가 직접 쓴 작업 핸드오프 md(세션 교체 후 재주입).
-    db.exec('ALTER TABLE tasks ADD COLUMN handoff_md TEXT')
-  } catch {
-    /* 이미 있음 */
-  }
-  try {
-    // Lain 스킬 할당 — 이 작업 Navi에 노출할 스킬(JSON 배열 문자열 or NULL=기본 전체).
-    db.exec('ALTER TABLE tasks ADD COLUMN skills TEXT')
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // B17 이미지 입력 — 작업 입력 이미지(FileAttachment[] JSON, image만). NULL=없음.
-    db.exec('ALTER TABLE tasks ADD COLUMN images TEXT')
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // B4 fast-mode — Opus 빠른 출력 모드(작업별 boolean, 0/1). 기본 0=off.
-    db.exec('ALTER TABLE tasks ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // 작업 실행 엔진 — claude(기본) | codex(OpenAI Codex CLI). worker만 해당.
-    db.exec("ALTER TABLE tasks ADD COLUMN engine TEXT NOT NULL DEFAULT 'claude'")
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // D3 — runNavi throw로 error 확정 전 자동 재시도한 횟수(영속·무한루프 방지). 재부팅 후에도 유지.
-    db.exec('ALTER TABLE tasks ADD COLUMN auto_retry_count INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // D10 — 작업별 모델 고정(빈 문자열=전역 naviModel 따름). 다음 실행/재개부터 적용.
-    db.exec("ALTER TABLE tasks ADD COLUMN model_override TEXT NOT NULL DEFAULT ''")
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // A4 — 최신 TodoWrite 스냅샷(JSON TodoItem[], 누적 아님). task_events에도 kind='todo'로
-    // 각 호출을 영속하지만(감사·리플레이), 이 컬럼은 "지금 상태"를 O(1)로 읽는 캐시 — NaviTile
-    // 진행률(n/m)이 listTasks() 브로드캐스트만으로 갱신되게 한다(새 조회 IPC 불필요).
-    db.exec('ALTER TABLE tasks ADD COLUMN todos TEXT')
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // D1 — 대기 큐(queued) 드레인 순서. 낮을수록 먼저, 기본 0. queued 아닌 상태에선 무의미(보존만).
-    db.exec('ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // D2 — 작업 간 의존성(선행 task id JSON 배열, '[]'=없음). 미충족이면 queued에 머물고 선행이
-    // 전부 done 되면 drainQueue가 자동 착수한다(레인 세션 기억과 무관한 L0 결정론).
-    db.exec("ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'")
-  } catch {
-    /* 이미 존재 */
-  }
-  try {
-    // 재리뷰 #2 — 그룹 일괄 병합 진행 플래그. resolveGroup이 병합 루프 진입 시 'merging'으로 영속하고
-    // 완료(성공·롤백 포함) 시 ''로 되돌린다. 크래시로 'merging'이 남으면 부팅 recoverGroups가 감지·통지.
-    db.exec("ALTER TABLE task_groups ADD COLUMN resolve_state TEXT NOT NULL DEFAULT ''")
-  } catch {
-    /* 이미 존재 */
-  }
+  // 작업 드로어 대화 트랜스크립트 — 이벤트 화자 귀속('worker'|'lain'|'user'). legacy 행은 null(시스템 로그로 표시).
+  safeAlter('ALTER TABLE task_events ADD COLUMN speaker TEXT')
+  safeAlter('ALTER TABLE conversations ADD COLUMN last_mobile_at TEXT') // 마지막 텔레그램 메시지 시각(📱 표시용, Lain 기여)
+  // 대화 제목 자동요약 1회 가드 — 1이면 이미 요약됨(또는 수동 rename) → 자동요약 스킵
+  safeAlter('ALTER TABLE conversations ADD COLUMN title_auto INTEGER NOT NULL DEFAULT 0')
+  // 무한세션 — 마지막 result의 컨텍스트 점유 토큰(임계 도달 시 압축 트리거). 기존 행은 0.
+  safeAlter('ALTER TABLE conversations ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0')
+  // 무한세션 — 압축된 구조화 월드모델(4필드 md). 세션 리셋 후 재주입해 맥락 유지.
+  safeAlter('ALTER TABLE conversations ADD COLUMN world_state TEXT')
+  // Navi 유한세션 핸드오프 — Navi가 직접 쓴 핸드오프 md(세션 교체 후 새 세션에 재주입). Lain의 world_state(무한세션)와 별개.
+  safeAlter('ALTER TABLE conversations ADD COLUMN handoff_md TEXT')
+  // 단일 세션 Lain — 화면에 보일 최소 메시지 id(워터마크). 압축 시 전진해 최근 N개만 표시(DB·저널은 보존, 비파괴).
+  safeAlter('ALTER TABLE conversations ADD COLUMN visible_from_id INTEGER NOT NULL DEFAULT 0')
+  // Navi 유한세션 핸드오프(A 자율작업) — 작업당 컨텍스트 점유. resume 경계에서 임계 도달 시 교체 트리거.
+  safeAlter('ALTER TABLE tasks ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0')
+  // Navi 유한세션 핸드오프(A 자율작업) — Navi가 직접 쓴 작업 핸드오프 md(세션 교체 후 재주입).
+  safeAlter('ALTER TABLE tasks ADD COLUMN handoff_md TEXT')
+  // Lain 스킬 할당 — 이 작업 Navi에 노출할 스킬(JSON 배열 문자열 or NULL=기본 전체).
+  safeAlter('ALTER TABLE tasks ADD COLUMN skills TEXT')
+  // B17 이미지 입력 — 작업 입력 이미지(FileAttachment[] JSON, image만). NULL=없음.
+  safeAlter('ALTER TABLE tasks ADD COLUMN images TEXT')
+  // B4 fast-mode — Opus 빠른 출력 모드(작업별 boolean, 0/1). 기본 0=off.
+  safeAlter('ALTER TABLE tasks ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0')
+  // 작업 실행 엔진 — claude(기본) | codex(OpenAI Codex CLI). worker만 해당.
+  safeAlter("ALTER TABLE tasks ADD COLUMN engine TEXT NOT NULL DEFAULT 'claude'")
+  // D3 — runNavi throw로 error 확정 전 자동 재시도한 횟수(영속·무한루프 방지). 재부팅 후에도 유지.
+  safeAlter('ALTER TABLE tasks ADD COLUMN auto_retry_count INTEGER NOT NULL DEFAULT 0')
+  // D10 — 작업별 모델 고정(빈 문자열=전역 naviModel 따름). 다음 실행/재개부터 적용.
+  safeAlter("ALTER TABLE tasks ADD COLUMN model_override TEXT NOT NULL DEFAULT ''")
+  // T14(P6) — 독립 완료 심사관. audit_result: 마지막 심사 판정(JSON AuditVerdict, null=심사 안 함/불능).
+  // audit_retried: 심사 미통과로 1회 자동 재작업했는지(영속·무한루프 방지 — 두 번째 심사는 재시도 없이 결과만).
+  safeAlter('ALTER TABLE tasks ADD COLUMN audit_result TEXT')
+  safeAlter('ALTER TABLE tasks ADD COLUMN audit_retried INTEGER NOT NULL DEFAULT 0')
+  // T15(P6) — 결재 수정요청(rework)으로 재작업한 횟수(영속·발산 방지). REWORK_MAX회 도달하면 rework 거부.
+  safeAlter('ALTER TABLE tasks ADD COLUMN rework_count INTEGER NOT NULL DEFAULT 0')
+  // L6(P6) — 생애 한 번이라도 자동 재개(D3)를 겪었는지(영속, 절대 리셋 안 됨). auto_retry_count는 review
+  // 도달 시 0으로 리셋되므로(orchestrator.ts) loopStats의 firstPass("진짜 1회 통과") 판정엔 이 플래그를 쓴다.
+  safeAlter('ALTER TABLE tasks ADD COLUMN ever_auto_retried INTEGER NOT NULL DEFAULT 0')
+  // A4 — 최신 TodoWrite 스냅샷(JSON TodoItem[], 누적 아님). task_events에도 kind='todo'로
+  // 각 호출을 영속하지만(감사·리플레이), 이 컬럼은 "지금 상태"를 O(1)로 읽는 캐시 — NaviTile
+  // 진행률(n/m)이 listTasks() 브로드캐스트만으로 갱신되게 한다(새 조회 IPC 불필요).
+  safeAlter('ALTER TABLE tasks ADD COLUMN todos TEXT')
+  // D1 — 대기 큐(queued) 드레인 순서. 낮을수록 먼저, 기본 0. queued 아닌 상태에선 무의미(보존만).
+  safeAlter('ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
+  // D2 — 작업 간 의존성(선행 task id JSON 배열, '[]'=없음). 미충족이면 queued에 머물고 선행이
+  // 전부 done 되면 drainQueue가 자동 착수한다(레인 세션 기억과 무관한 L0 결정론).
+  safeAlter("ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'")
+  // 재리뷰 #2 — 그룹 일괄 병합 진행 플래그. resolveGroup이 병합 루프 진입 시 'merging'으로 영속하고
+  // 완료(성공·롤백 포함) 시 ''로 되돌린다. 크래시로 'merging'이 남으면 부팅 recoverGroups가 감지·통지.
+  safeAlter("ALTER TABLE task_groups ADD COLUMN resolve_state TEXT NOT NULL DEFAULT ''")
   for (const col of [
     // D8 — ff 병합 성공 시 되돌릴 커밋 범위를 포착. base=병합 직전 main tip, head=병합 후 main tip.
     // ff 병합엔 머지커밋이 없으므로 revert는 범위(base..head)의 각 커밋을 개별 revert(비파괴, 새 revert 커밋 생성).
@@ -489,20 +357,16 @@ export function initStore(): void {
     'ALTER TABLE tasks ADD COLUMN merge_base_sha TEXT', // 병합 직전 main tip(되돌릴 범위 하한, exclusive)
     'ALTER TABLE tasks ADD COLUMN merge_head_sha TEXT', // 병합 후 main tip=Navi 브랜치 tip(되돌릴 범위 상한, inclusive)
     'ALTER TABLE tasks ADD COLUMN group_id TEXT', // D13 — 크로스레포 작업 그룹 소속(NULL=단독). 그룹은 all-or-nothing 결재(resolve_group)
-  ]) {
-    try {
-      db.exec(col)
-    } catch {
-      /* 이미 존재 */
-    }
-  }
-  try {
-    // 내비 '제거'는 하드 삭제가 아니라 보드에서 숨김(데이터 보존) — id가 폴더 경로 결정론이라
-    // 같은 폴더를 다시 추가하면 대화·교훈·작업·현황이 그대로 복원된다. 스캔이 되살리지 않게 플래그로 둔다.
-    db.exec('ALTER TABLE projects ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
-  } catch {
-    /* 이미 있음 */
-  }
+  ]) safeAlter(col)
+  // L3(P6) — elicit(§21.3) criteria 영속(JSON string[], NULL=미확정/구버전). content append(하위호환)와 이중 기록.
+  safeAlter('ALTER TABLE tasks ADD COLUMN criteria TEXT')
+  // L4(P6) — 작업별 리뷰 강도 고정(NULL=설정 reviewDepthDefault 따름). start_task review_depth로 override.
+  safeAlter('ALTER TABLE tasks ADD COLUMN review_depth TEXT')
+  // 내비 '제거'는 하드 삭제가 아니라 보드에서 숨김(데이터 보존) — id가 폴더 경로 결정론이라
+  // 같은 폴더를 다시 추가하면 대화·학습·작업·현황이 그대로 복원된다. 스캔이 되살리지 않게 플래그로 둔다.
+  safeAlter('ALTER TABLE projects ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
+  // C3 — CC 세션 종료 judge 요약(cchooks summarizeCcEnd)을 SessionEnd 행에 붙여 다이제스트로 노출.
+  safeAlter('ALTER TABLE cc_events ADD COLUMN summary TEXT')
   try {
     // '숨김'(muted) — 레인이 계속 관리(수집·작업·질의응답)하되, 유저가 먼저 언급하기 전엔 레인이
     // 먼저 화제로 꺼내지 않는 내비. 구 '대기실'(enabled=0, 관리 완전 제외)을 대체 — 기존 비활성
@@ -602,6 +466,14 @@ export function initStore(): void {
     if (c) logRecovery(`저널 컴팩션: ${c.before} → ${c.after}줄`)
   } catch (e) {
     logRecovery(`저널 컴팩션 실패(무시): ${e}`)
+  }
+  // 클론 관점 감사(#2) — task_events 무한 성장 방지. 완료 후 30일 넘게 지난 작업의 이벤트를 최근
+  // 50개로 정리한다(진행 중 작업·최근 완료 작업은 손대지 않음). 매 부팅 1회, 멱등 — 실패해도 부팅을 깨지 않는다.
+  try {
+    const n = compactTaskEvents()
+    if (n > 0) logRecovery(`task_events 컴팩션: ${n}행 정리`)
+  } catch (e) {
+    logRecovery(`task_events 컴팩션 실패(무시): ${e}`)
   }
   // bench 도중 크래시로 lessons가 bench 조건 상태로 남은 경우 — 백업 테이블에서 원본 자동 복원.
   try {
@@ -788,7 +660,7 @@ function repairIndexesIfCorrupt(): void {
   // REINDEX 결과(재생성 인덱스)는 WAL에 쓰인다 → 즉시 메인 DB에 영속화하지 않으면, 다음 강제종료(force-kill)
   // + 손상 WAL 폐기에 복구가 소실돼 매 부팅 REINDEX가 반복된다(관측된 루프의 재발 경로). 단 **REINDEX 후
   // quick_check가 다시 'ok'일 때만** 체크포인트한다 — 인덱스로 못 고치는 손상(페이지 등)을 메인에 굳혀버려
-  // corrupt WAL을 메인에 합쳐 오염시킨 과거 사고([[lain-sqlite-wal-corruption-recovery]])를 재현하지 않도록.
+  // corrupt WAL을 메인에 합쳐 오염시킨 과거 사고(WAL 손상 복구 이력)를 재현하지 않도록.
   let after: unknown[] | null = null
   let afterErr: unknown
   try {
@@ -1097,6 +969,13 @@ export function closeStore(): void {
 // 손상 WAL/SHM을 백업·폐기해 메인 DB(마지막 체크포인트)로 복원한다(거의 무손실).
 // read-only 연결은 메인에 못 쓰므로 close해도 체크포인트가 없다 — rw로 열고 close하면 손상 WAL이
 // 메인에 합쳐져 메인까지 오염되므로(검증됨) 반드시 read-only 프로브 + 오픈 전 폐기로 처리한다.
+//
+// ⚠️ 폐기 전 손상 위치 판별(2026 실사고 재발 방지) — 병합 뷰(메인+WAL)가 손상이라고 WAL이 범인인 게
+// 아니다. 메인 단독 사본을 2차 프로브해서: 메인이 깨끗하면 WAL이 독 → 폐기(기존 동작), 메인 자체가
+// 손상이면 WAL은 별개의 정상 커밋(REINDEX 미영속분 포함)일 수 있으므로 **폐기 금지** — rw 오픈 경로의
+// repairIndexesIfCorrupt(REINDEX·NOT NULL 치유·VACUUM)와 저널 reconcile이 치유를 담당한다.
+// 과거엔 이 분기 없이 무조건 폐기해, 메인 단독 손상 때 정상 WAL(수정분)을 매 부팅 잃고
+// quick_check 실패→REINDEX→미영속이 무한 반복됐다.
 // (export는 테스트 전용 — 부팅 경로에선 initStore만 부른다.)
 export function recoverCorruptWalBeforeOpen(): void {
   const dbPath = path.join(DATA_DIR, 'lain.sqlite')
@@ -1120,6 +999,11 @@ export function recoverCorruptWalBeforeOpen(): void {
     }
   }
   if (!corrupt) return
+  // 병합 뷰 손상 — 메인 단독 사본(-wal 없는 임시 복사본)으로 손상 위치를 가른다.
+  if (isMainFileItselfCorrupt(dbPath)) {
+    log('병합 뷰 손상이나 메인 자체 손상 감지 — WAL 보존(정상 커밋 가능성), rw 치유 경로에 위임')
+    return
+  }
   try {
     const bdir = path.join(DATA_DIR, 'db-corrupt')
     fs.mkdirSync(bdir, { recursive: true })
@@ -1134,9 +1018,31 @@ export function recoverCorruptWalBeforeOpen(): void {
       }
       fs.rmSync(f, { force: true })
     }
-    log('손상 WAL 폐기(rw 오픈 전·read-only 프로브) → 메인 DB로 복원')
+    log('손상 WAL 폐기(rw 오픈 전·read-only 프로브, 메인 단독은 정상) → 메인 DB로 복원')
   } catch (e) {
     log(`WAL 폐기 실패: ${e}`)
+  }
+}
+
+// 메인 파일 자체가 손상인지 — 메인만 임시 경로에 복사해(-wal/-shm 없이) quick_check한다.
+// 병합 뷰 손상 시 WAL 폐기 여부를 가르는 2차 프로브: true=메인 손상(WAL 보존), false=메인 청정(WAL이 독).
+// 판별 자체가 실패하면 보수적으로 true(보존) — 잘못 폐기하는 쪽(데이터 유실)이 잘못 보존하는 쪽보다 나쁘다.
+function isMainFileItselfCorrupt(dbPath: string): boolean {
+  const tmp = path.join(DATA_DIR, `main-probe-${process.pid}-${Date.now()}.sqlite`)
+  let probe: DatabaseSync | null = null
+  try {
+    fs.copyFileSync(dbPath, tmp)
+    probe = new DatabaseSync(tmp, { readOnly: true })
+    return isCorruptResult(probe.prepare('PRAGMA quick_check').all())
+  } catch {
+    return true // 복사·오픈 실패도 보존 쪽으로
+  } finally {
+    try {
+      probe?.close()
+    } catch {
+      /* 무시 */
+    }
+    fs.rmSync(tmp, { force: true })
   }
 }
 
@@ -1148,7 +1054,6 @@ function rowToProject(r: any): Project {
     stack: r.stack,
     verifyCmd: r.verify_cmd,
     isGit: !!r.is_git,
-    enabled: !!r.enabled,
     muted: !!r.muted,
   }
 }
@@ -1176,8 +1081,8 @@ export function upsertProject(p: Project): void {
   // 명시적 파라미터 객체 — Project에 muted 등 SQL 미사용 필드가 있어 spread로 넘기면
   // node:sqlite가 unknown named parameter로 throw한다. (muted/hidden은 스캔 재등록에도 보존)
   db.prepare(`
-    INSERT INTO projects (id, path, name, stack, verify_cmd, is_git, enabled)
-    VALUES (@id, @path, @name, @stack, @verifyCmd, @isGit, @enabled)
+    INSERT INTO projects (id, path, name, stack, verify_cmd, is_git)
+    VALUES (@id, @path, @name, @stack, @verifyCmd, @isGit)
     ON CONFLICT(id) DO UPDATE SET
       path = @path, name = @name, stack = @stack,
       verify_cmd = @verifyCmd, is_git = @isGit
@@ -1188,7 +1093,6 @@ export function upsertProject(p: Project): void {
     stack: p.stack,
     verifyCmd: p.verifyCmd,
     isGit: p.isGit ? 1 : 0,
-    enabled: p.enabled ? 1 : 0,
   })
 }
 
@@ -1197,7 +1101,7 @@ export function setProjectMuted(id: string, muted: boolean): void {
   db.prepare('UPDATE projects SET muted = ? WHERE id = ?').run(muted ? 1 : 0, id)
 }
 
-// 내비 '제거' = 보드에서 숨김(데이터 보존). 작업·대화·교훈·현황은 남는다(하드 삭제는 deleteProject).
+// 내비 '제거' = 보드에서 숨김(데이터 보존). 작업·대화·학습·현황은 남는다(하드 삭제는 deleteProject).
 export function hideProject(id: string): void {
   db.prepare('UPDATE projects SET hidden = 1 WHERE id = ?').run(id)
 }
@@ -1220,7 +1124,33 @@ export function listProjects(): ProjectView[] {
     WHERE p.hidden = 0
     ORDER BY p.id
   `).all()
-  return rows.map((r: any) => ({ ...rowToProject(r), status: rowToStatus(r) }))
+  // C2 — 프로젝트별 대기 승인(approvals.state='pending') 카운트. status가 아직 없는(=미스캔)
+  // 프로젝트는 null 의미를 보존해야 하므로(StageView '미수집' 분기, manager.ts 다이제스트) status가
+  // 있을 때만 pendingApprovals를 병합한다 — 배지는 첫 스캔 이후에만 나타난다.
+  const apRows = db.prepare(`
+    SELECT t.project_id pid, COUNT(*) n FROM approvals a JOIN tasks t ON t.id = a.task_id
+    WHERE a.state = 'pending'
+    GROUP BY t.project_id
+  `).all() as { pid: string; n: number }[]
+  const apMap = new Map(apRows.map((r) => [r.pid, r.n]))
+  // C1 — 프로젝트별 마지막 CC(Claude Code) 이벤트 시각. status가 없는(=미스캔) 프로젝트는
+  // pendingApprovals와 동일하게 null 의미를 보존해야 하므로 status가 있을 때만 병합한다.
+  const ccRows = db
+    .prepare(`SELECT project_id pid, MAX(created_at) m FROM cc_events GROUP BY project_id`)
+    .all() as { pid: string; m: string }[]
+  const ccMap = new Map(ccRows.map((r) => [r.pid, r.m]))
+  return rows.map((r: any) => {
+    const project = rowToProject(r)
+    const base = rowToStatus(r)
+    const status: ProjectStatus | null = base
+      ? {
+          ...base,
+          pendingApprovals: apMap.get(project.id) ?? 0,
+          lastCcAt: ccMap.get(project.id),
+        }
+      : null
+    return { ...project, status }
+  })
 }
 
 export function saveStatus(s: Partial<ProjectStatus> & { projectId: string }): void {
@@ -1291,13 +1221,6 @@ function rowToChatMessage(r: any): ChatMessage {
 // datetime('now')와 동일 포맷·UTC 'YYYY-MM-DD HH:MM:SS' — 저널과 DB created_at을 정확히 일치시킨다.
 function nowStamp(): string {
   return new Date().toISOString().slice(0, 19).replace('T', ' ')
-}
-
-// 사용자 시각 필드 표준 포맷 — 로컬 ISO 'YYYY-MM-DDTHH:mm' (다른 plan 시각 필드와 문자열 비교·정렬 일관성 유지).
-function nowLocalMinuteISO(): string {
-  const d = new Date()
-  const pad = (n: number): string => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 export function addMessage(
@@ -1651,22 +1574,6 @@ export function ensureActiveConversation(target: string): string {
   return id
 }
 
-export function listNaviMessages(projectId: string, limit = 200): ChatMessage[] {
-  const rows = db
-    .prepare(
-      "SELECT * FROM (SELECT * FROM messages WHERE scope = 'worker' AND project_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
-    )
-    .all(projectId, limit)
-  return rows.map(rowToChatMessage)
-}
-
-export function listMessages(scope: string, limit = 200): ChatMessage[] {
-  const rows = db.prepare(
-    'SELECT * FROM (SELECT * FROM messages WHERE scope = ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC'
-  ).all(scope, limit)
-  return rows.map(rowToChatMessage)
-}
-
 // ── 클로드코드 연동(개선 #2 Phase 1) — 사용자가 레인 밖에서 직접 실행한 CC 세션 이벤트 로그 ──
 export interface CcEvent {
   id: number
@@ -1674,6 +1581,7 @@ export interface CcEvent {
   sessionId: string
   event: string // SessionStart | SessionEnd
   createdAt: string
+  summary?: string | null // CC 세션 요약(SessionEnd만 유의미)
 }
 export function addCcEvent(projectId: string, sessionId: string, event: string): void {
   db.prepare('INSERT INTO cc_events (project_id, session_id, event) VALUES (?, ?, ?)').run(
@@ -1681,6 +1589,32 @@ export function addCcEvent(projectId: string, sessionId: string, event: string):
     sessionId,
     event,
   )
+}
+// C3 — CC 세션 종료 judge 요약(cchooks summarizeCcEnd)을 해당 SessionEnd 행에 붙인다. 500자 컷(다이제스트 비대화 방지).
+export function setCcEventSummary(projectId: string, sessionId: string, summary: string): void {
+  db.prepare(`UPDATE cc_events SET summary=? WHERE project_id=? AND session_id=? AND event='SessionEnd'`).run(
+    summary.slice(0, 500),
+    projectId,
+    sessionId,
+  )
+}
+// C3 — 요약이 달린 SessionEnd를 최신순으로 N개(buildDigest 노출용).
+export function latestCcSummaries(
+  limit = 3,
+): Array<{ projectId: string; sessionId: string; summary: string; createdAt: string }> {
+  return (
+    db
+      .prepare(
+        `SELECT project_id, session_id, summary, created_at FROM cc_events
+         WHERE summary IS NOT NULL AND summary != '' ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(limit) as any[]
+  ).map((r) => ({
+    projectId: r.project_id,
+    sessionId: r.session_id,
+    summary: r.summary,
+    createdAt: r.created_at,
+  }))
 }
 export function listRecentCcEvents(limit = 20): CcEvent[] {
   return (
@@ -1693,6 +1627,7 @@ export function listRecentCcEvents(limit = 20): CcEvent[] {
     sessionId: r.session_id ?? '',
     event: r.event,
     createdAt: r.created_at,
+    summary: r.summary ?? null,
   }))
 }
 
@@ -1713,7 +1648,7 @@ export function listRecentActivity(limit = 20): ActivityRaw[] {
     )
     .all(cap) as any[]
   const ccRows = db
-    .prepare('SELECT project_id, event, created_at FROM cc_events ORDER BY id DESC LIMIT ?')
+    .prepare('SELECT project_id, event, summary, created_at FROM cc_events ORDER BY id DESC LIMIT ?')
     .all(cap) as any[]
   const out: ActivityRaw[] = []
   for (const r of taskRows)
@@ -1730,6 +1665,7 @@ export function listRecentActivity(limit = 20): ActivityRaw[] {
       at: r.created_at,
       detail: r.event,
       projectId: r.project_id ?? null,
+      summary: r.summary ?? null,
     })
   return out
 }
@@ -1745,39 +1681,22 @@ export function lastChatActivityAt(): string | null {
   return r && r.m ? String(r.m) : null
 }
 
-/** 대화 인박스 — Lain(manager) + Navi 대화가 있는 프로젝트들의 '마지막 메시지' 1건씩.
- *  Navi별은 MAX(id)로 마지막 행만 조인(id는 PK AUTOINCREMENT라 단조 증가). content는 첫 줄·200자 절단. */
-export function listConversationPreviews(): ConversationPreview[] {
-  const trunc = (s: unknown) => String(s ?? '').split('\n')[0].slice(0, 200)
-  const out: ConversationPreview[] = []
-  // 어깨너머(overlay) 자발 발화는 프리뷰 대표 문장에서 제외 — 조용한 곁다리가 대화 목록 헤드라인을 차지하지 않게.
-  const mgr = db
-    .prepare(
-      "SELECT role, content, created_at FROM messages WHERE scope = 'manager' AND (origin IS NULL OR origin <> 'overlay') ORDER BY id DESC LIMIT 1",
-    )
-    .get() as any
-  out.push({
-    target: 'manager',
-    role: mgr ? mgr.role : null,
-    content: mgr ? trunc(mgr.content) : null,
-    createdAt: mgr ? mgr.created_at : null,
-  })
-  const rows = db
-    .prepare(
-      `SELECT m.project_id, m.role, m.content, m.created_at
-       FROM messages m
-       JOIN (SELECT project_id, MAX(id) AS mx FROM messages
-             WHERE scope = 'worker' AND project_id IS NOT NULL GROUP BY project_id) g
-         ON m.id = g.mx`,
-    )
-    .all() as any[]
-  for (const r of rows) {
-    out.push({ target: r.project_id, role: r.role, content: trunc(r.content), createdAt: r.created_at })
-  }
-  return out
-}
-
 // ── Phase 1: tasks / approvals / task_events ──
+
+// 클론 관점 감사(#1) — tasks의 JSON 컬럼(questions/skills/images/todos/depends_on)이 디스크 손상·수동
+// 편집 등으로 깨지면, 가드 없는 JSON.parse가 rowToTask 전체를 throw시켜 listTasks/getTask 호출 자체가
+// 실패했다(부팅·조회 전면 장애). mcpJsonArray/mcpJsonObject(설정·MCP 서버 행)와 동일한 관용구를 여기도
+// 적용 — 손상은 '그 필드만' 기본값으로 되돌리고 나머지 필드·행·전체 목록은 정상 반환한다(전체 실패 금지).
+// recovery.log에 남겨 재발을 추적할 수 있게 한다.
+function safeTaskJson<T>(raw: unknown, fallback: T, taskId: unknown, field: string): T {
+  if (raw === null || raw === undefined) return fallback
+  try {
+    return JSON.parse(String(raw)) as T
+  } catch (e) {
+    logRecovery(`작업 ${String(taskId)} 손상 JSON 필드 스킵(${field} → 기본값): ${String(e).slice(0, 120)}`)
+    return fallback
+  }
+}
 
 function rowToTask(r: any): Task {
   return {
@@ -1797,7 +1716,7 @@ function rowToTask(r: any): Task {
       : 'default',
     disallowedTools: mcpJsonArray(r.disallowed_tools),
     content: r.content,
-    questions: JSON.parse(r.questions ?? '[]'),
+    questions: safeTaskJson(r.questions, [], r.id, 'questions'),
     branch: r.branch,
     worktreePath: r.worktree_path,
     naviSessionId: r.worker_session_id,
@@ -1813,19 +1732,27 @@ function rowToTask(r: any): Task {
     turns: r.turns,
     error: r.error,
     autoRetryCount: r.auto_retry_count ?? 0,
-    skills: r.skills ? JSON.parse(r.skills) : null,
-    images: r.images ? JSON.parse(r.images) : [],
+    skills: safeTaskJson(r.skills, null, r.id, 'skills'),
+    images: safeTaskJson(r.images, [], r.id, 'images'),
     fastMode: r.fast_mode === 1,
     modelOverride: (MODEL_TIERS as readonly string[]).includes(r.model_override)
       ? (r.model_override as ModelTier)
       : '',
-    todos: r.todos ? JSON.parse(r.todos) : null,
+    todos: safeTaskJson(r.todos, null, r.id, 'todos'),
     engine: r.engine === 'codex' ? 'codex' : 'claude',
     priority: r.priority ?? 0,
-    dependsOn: r.depends_on ? JSON.parse(r.depends_on) : [], // D2 — 선행 task id 배열
+    dependsOn: safeTaskJson(r.depends_on, [], r.id, 'depends_on'), // D2 — 선행 task id 배열
     groupId: r.group_id ?? null, // D13 — 크로스레포 그룹 소속(NULL=단독)
     mergeBaseSha: r.merge_base_sha ?? null, // D8 — 되돌릴 병합 범위 하한(exclusive). NULL=되돌릴 병합 없음
     mergeHeadSha: r.merge_head_sha ?? null, // D8 — 되돌릴 병합 범위 상한(inclusive)
+    auditResult: r.audit_result ?? undefined, // T14 — 마지막 독립 심사 판정(JSON). 없으면 미심사
+    auditRetried: r.audit_retried === 1, // T14 — 심사 미통과로 1회 자동 재작업했는지
+    reworkCount: r.rework_count ?? 0, // T15 — 결재 수정요청(rework) 재작업 횟수(상한 REWORK_MAX)
+    everAutoRetried: r.ever_auto_retried === 1, // L6 — 생애 한 번이라도 자동 재개(D3)를 겪었는지(리셋 안 됨)
+    criteria: safeTaskJson<string[] | undefined>(r.criteria, undefined, r.id, 'criteria'), // L3(P6) — elicit 완료 조건(구조화). 없으면 undefined(구버전/미확정)
+    reviewDepth: (['light', 'standard', 'adversarial'] as const).includes(r.review_depth)
+      ? (r.review_depth as ReviewDepth)
+      : undefined, // L4(P6) — 미지정이면 설정 reviewDepthDefault를 finishWork가 대신 적용
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }
@@ -1848,9 +1775,10 @@ export function insertTask(t: {
   priority?: number // D1 — queued 드레인 순서(낮을수록 먼저, 기본 0)
   dependsOn?: string[] // D2 — 선행 task id(전부 done 돼야 착수)
   groupId?: string // D13 — 크로스레포 그룹 소속
+  reviewDepth?: ReviewDepth // L4(P6) — 미지정이면 NULL(설정 reviewDepthDefault를 finishWork가 대신 적용)
 }): void {
   db.prepare(
-    'INSERT INTO tasks (id, project_id, title, state, content, mode, permission_mode, thinking_level, disallowed_tools, skills, fast_mode, model_override, engine, priority, depends_on, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO tasks (id, project_id, title, state, content, mode, permission_mode, thinking_level, disallowed_tools, skills, fast_mode, model_override, engine, priority, depends_on, group_id, review_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   ).run(t.id, t.projectId, t.title, t.state, t.content, t.mode ?? 'interactive',
         t.permissionMode ?? 'acceptEdits',
         t.thinkingLevel ?? 'default',
@@ -1861,7 +1789,8 @@ export function insertTask(t: {
         t.engine === 'codex' ? 'codex' : 'claude',
         t.priority ?? 0,
         JSON.stringify(t.dependsOn ?? []),
-        t.groupId ?? null)
+        t.groupId ?? null,
+        t.reviewDepth ?? null)
 }
 
 export function updateTask(id: string, patch: Partial<Task>): void {
@@ -1890,6 +1819,8 @@ export function updateTask(id: string, patch: Partial<Task>): void {
     priority: 'priority',
     mergeBaseSha: 'merge_base_sha', // D8 — 병합 범위 하한(포착 시 저장, revert에 사용)
     mergeHeadSha: 'merge_head_sha', // D8 — 병합 범위 상한
+    auditResult: 'audit_result', // T14 — 독립 심사 판정(JSON)
+    reworkCount: 'rework_count', // T15 — 결재 수정요청(rework) 재작업 횟수
   }
   const sets: string[] = []
   const vals: (string | number | null)[] = []
@@ -1923,9 +1854,22 @@ export function updateTask(id: string, patch: Partial<Task>): void {
     sets.push('fast_mode = ?')
     vals.push(patch.fastMode ? 1 : 0)
   }
+  if ('auditRetried' in patch) {
+    sets.push('audit_retried = ?')
+    vals.push(patch.auditRetried ? 1 : 0)
+  }
+  if ('everAutoRetried' in patch) {
+    sets.push('ever_auto_retried = ?')
+    vals.push(patch.everAutoRetried ? 1 : 0)
+  }
   if ('todos' in patch) {
     sets.push('todos = ?')
     vals.push(patch.todos && patch.todos.length ? JSON.stringify(patch.todos) : null)
+  }
+  if ('criteria' in patch) {
+    // L3(P6) — elicit 완료 조건 영속(JSON string[]). 빈 배열/undefined는 NULL(미확정)로 되돌린다.
+    sets.push('criteria = ?')
+    vals.push(patch.criteria && patch.criteria.length ? JSON.stringify(patch.criteria) : null)
   }
   if (sets.length === 0) return
   sets.push("updated_at = datetime('now')")
@@ -1964,6 +1908,48 @@ export function dailyTaskUsage(windowDays = 15): TaskUsageRow[] {
     costUsd: r.cost_usd ?? 0,
     createdAt: r.created_at,
   }))
+}
+
+/** L6(P6) — 루프 성적표: 최근 days일 작업의 done/error/cancelled·1회 통과(자동재시도·rework 없이 done)·재작업
+ *  건수·상위 실패 사유를 집계한다(다이제스트 한 줄 + 주간 보고 문단용, 포맷은 shared/loopstats.ts). 읽기 전용.
+ *  ⚠️ created_at은 datetime('now')=UTC라 dailyTaskUsage(C4)와 동일하게 datetime('now', '-N days')로 비교
+ *  (JS에서 ISO 문자열을 만들면 SQLite 저장 포맷과 어긋날 수 있음 — Task 9 확인된 관례). */
+export function loopStats(days = 7): LoopStats {
+  const win = Math.max(1, Math.min(400, Math.floor(days)))
+  const row = db
+    .prepare(
+      `SELECT
+         COUNT(*) total,
+         SUM(state='done') done, SUM(state='error') error, SUM(state='cancelled') cancelled,
+         SUM(state='done' AND COALESCE(ever_auto_retried,0)=0 AND COALESCE(rework_count,0)=0 AND COALESCE(audit_retried,0)=0) firstPass,
+         SUM(COALESCE(rework_count,0)>0) reworked
+       FROM tasks WHERE created_at >= datetime('now', ?)`,
+    )
+    .get(`-${win} days`) as any
+  // 실패 사유 — kind='exit' content는 "<reason>" 또는 "<reason>: <detail>"(worker.ts logExit). detail은
+  // 자유 텍스트라 원문 그대로 묶으면 조각나므로 콜론 앞 reason만 키로 묶는다(done은 실패가 아니라 제외).
+  const reasons = db
+    .prepare(
+      `SELECT
+         CASE WHEN instr(content, ':') > 0 THEN substr(content, 1, instr(content, ':') - 1) ELSE content END k,
+         COUNT(*) n
+       FROM task_events
+       WHERE kind='exit' AND created_at >= datetime('now', ?)
+       GROUP BY k
+       HAVING k != 'done'
+       ORDER BY n DESC LIMIT 3`,
+    )
+    .all(`-${win} days`) as any[]
+  return {
+    days: win,
+    total: row.total ?? 0,
+    done: row.done ?? 0,
+    error: row.error ?? 0,
+    cancelled: row.cancelled ?? 0,
+    firstPass: row.firstPass ?? 0,
+    reworked: row.reworked ?? 0,
+    topFailReasons: reasons.map((r) => [r.k, r.n] as [string, number]),
+  }
 }
 
 /** D14 — 프로젝트의 활성(queued 제외) 작업 수. projectParallelCap 게이트의 계수(activeTaskForProject와 동일 상태 필터). */
@@ -2107,13 +2093,52 @@ export function listTaskEvents(taskId: string, limit = 500): TaskEvent[] {
     .map((r: any) => ({ taskId: r.task_id, kind: r.kind, text: r.content, speaker: r.speaker ?? undefined }))
 }
 
+// 클론 관점 감사(#2) — task_events는 append-only라 정리 로직이 없으면(deleteProject로 프로젝트째
+// 지우는 경우 외엔) 무한 성장한다. journal.ts의 compactJournal과 동형 컨벤션: 진실원천이 아니라
+// UI 트랜스크립트 캐시(작업 드로어 표시용, 작업 자체의 summary/diffStat 등은 tasks에 별도 보존)이므로
+// 오래된 기록은 손실 허용 가능하다. 최종 상태(done/error/cancelled) 도달 후 retentionDays 넘게 지난
+// 작업만 대상으로 하고, 그런 작업이라도 최근 keepPerTask개는 남겨(드로어 마지막 몇 줄은 계속 보이게)
+// 둔다. 진행 중인 작업은 아무리 오래돼도 손대지 않는다. initStore에서 부팅 시 1회 호출.
+export function compactTaskEvents(retentionDays = 30, keepPerTask = 50): number {
+  const cutoff = `-${Math.max(1, Math.floor(retentionDays))} days`
+  const staleTaskIds = (
+    db
+      .prepare(
+        "SELECT id FROM tasks WHERE state IN ('done','error','cancelled') AND updated_at < datetime('now', ?)",
+      )
+      .all(cutoff) as { id: string }[]
+  ).map((r) => r.id)
+  if (staleTaskIds.length === 0) return 0
+  const del = db.prepare(
+    `DELETE FROM task_events WHERE task_id = ? AND id NOT IN (
+       SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT ?
+     )`,
+  )
+  let deleted = 0
+  for (const tid of staleTaskIds) deleted += Number(del.run(tid, tid, keepPerTask).changes)
+  return deleted
+}
+
 /** 크래시 복원(§15b): 재시작 시점의 pending 승인은 대기자(promise)가 사라진 고아 — 일괄 거절 처리 */
 export function clearOrphanApprovals(): number {
   const r = db.prepare("UPDATE approvals SET state = 'rejected' WHERE state = 'pending'").run()
   return Number(r.changes)
 }
 
-// ── 자기개선 교훈 (§22) ──
+/**
+ * A4 — 특정 작업의 pending 승인만 고아 처리(취소·인터럽트 경로용). 스트림이 이미 abort된 뒤엔
+ * 그 작업의 승인 대기는 영영 해소되지 않아 승인함 카드·트레이 배지·텔레그램 목록에 유령으로 남고,
+ * 눌러도 죽은 promise만 resolve된다. clearOrphanApprovals의 작업 한정판(부팅 전역 스윕과 동형).
+ * @returns 거절로 닫은 행 수
+ */
+export function rejectPendingApprovalsForTask(taskId: string): number {
+  const r = db
+    .prepare("UPDATE approvals SET state = 'rejected' WHERE state = 'pending' AND task_id = ?")
+    .run(taskId)
+  return Number(r.changes)
+}
+
+// ── 자기개선 학습 (§22) ──
 function rowToLesson(r: any): Lesson {
   return {
     id: r.id,
@@ -2140,11 +2165,11 @@ export function insertLesson(l: {
   scope: 'project' | 'global'
   trigger: string
   lesson: string
-  origin?: 'agent' | 'user' // 기본 agent(회고). user 교훈은 curator 폐기 대상에서 제외(§24 Phase3 토대)
+  origin?: 'agent' | 'user' // 기본 agent(회고). user 학습은 curator 폐기 대상에서 제외(§24 Phase3 토대)
   consolidationBatch?: string // curator umbrella 삽입 시 batch 태깅용(§자기개선 revert 토대)
 }): number {
   const origin = l.origin ?? 'agent'
-  // 교훈 주입 인젝션 방어 — origin='agent'(추출된 교훈)만 스캔. 단일 PC라 user 입력은 신뢰루트.
+  // 학습 주입 인젝션 방어 — origin='agent'(추출된 학습)만 스캔. 단일 PC라 user 입력은 신뢰루트.
   // 매치 시 새 status 추가 없이 기존 'archived'로 즉시 격리(주입 경로에서 제외). 본문은 그대로 보존(추적용).
   const status = origin === 'agent' && scanLessonInjection(l.lesson).blocked ? 'archived' : 'active'
   const res = db
@@ -2155,8 +2180,8 @@ export function insertLesson(l: {
   return Number(res.lastInsertRowid)
 }
 
-/** Navi 스폰 시 주입할 교훈 — 해당 프로젝트 교훈 + 모든 global 교훈, archived 제외.
- *  queryText(작업 내용)를 주면 §24 콘텐츠-인지 랭킹: 작업과 키워드가 겹치는 교훈을 우선(pin > 관련도 > 재사용).
+/** Navi 스폰 시 주입할 학습 — 해당 프로젝트 학습 + 모든 global 학습, archived 제외.
+ *  queryText(작업 내용)를 주면 §24 콘텐츠-인지 랭킹: 작업과 키워드가 겹치는 학습을 우선(pin > 관련도 > 재사용).
  *  없으면 기존대로 pin·재사용·최신순. lessons는 소형이라 전건 fetch 후 JS 스코어링(임베딩은 후속). */
 export function lessonsForProject(projectId: string, limit = 8, queryText?: string): Lesson[] {
   const rows = db
@@ -2175,8 +2200,8 @@ export function lessonsForProject(projectId: string, limit = 8, queryText?: stri
     return terms.reduce((s, t) => s + (hay.includes(t) ? 1 : 0), 0)
   }
   // 적합도(fitness) — reuse_count/max(inject_count,1): 여러 번 주입됐는데 한 번도 실제 적용(reuse) 안 된
-  // 교훈은 1 미만으로 떨어져 강등된다. inject_count=0(아직 한 번도 안 박힌 새 교훈)은 1.0(중립)로 둬
-  // 신규 교훈이 부당하게 강등되지 않게 한다. pin·관련도·reuse 다음의 동률 분리 신호로 작용.
+  // 학습은 1 미만으로 떨어져 강등된다. inject_count=0(아직 한 번도 안 박힌 새 학습)은 1.0(중립)로 둬
+  // 신규 학습이 부당하게 강등되지 않게 한다. pin·관련도·reuse 다음의 동률 분리 신호로 작용.
   const fitness = (l: Lesson): number =>
     l.injectCount > 0 ? l.reuseCount / l.injectCount : 1
   return rows
@@ -2193,11 +2218,11 @@ export function lessonsForProject(projectId: string, limit = 8, queryText?: stri
     .map((x) => x.l)
 }
 
-// 시간 기반 자동 만료(stale/archive)는 폐지했다 — 계속 배운 교훈이 쌓여야 개인화의 의미가 있고,
+// 시간 기반 자동 만료(stale/archive)는 폐지했다 — 계속 배운 학습이 쌓여야 개인화의 의미가 있고,
 // 주입은 어차피 관련도순 top-K만 뽑으므로 누적은 안전하다. 정리는 시간이 아니라 명시적 신호로만 한다:
 // 사용자 flag(flagLesson→archived) · 중복 병합(curator: applyConsolidation→soft-archive). (이전: applyLessonLifecycle)
 
-/** 교훈 목록 — 인자 없으면 status 무관 최신 200건(기존 동작). opts.status가 active|stale|archived면 해당만,
+/** 학습 목록 — 인자 없으면 status 무관 최신 200건(기존 동작). opts.status가 active|stale|archived면 해당만,
  *  'all'/미지정이면 전체. opts.limit 기본 200. */
 export function listLessons(opts?: { status?: Lesson['status'] | 'all'; limit?: number }): Lesson[] {
   const limit = opts?.limit ?? 200
@@ -2211,7 +2236,7 @@ export function listLessons(opts?: { status?: Lesson['status'] | 'all'; limit?: 
   return db.prepare('SELECT * FROM lessons ORDER BY id DESC LIMIT ?').all(limit).map(rowToLesson)
 }
 
-/** 주입된 교훈의 재사용 카운트 증가 + last_used_at 갱신(recency telemetry) + stale→active 되살림(§24). */
+/** 주입된 학습의 재사용 카운트 증가 + last_used_at 갱신(recency telemetry) + stale→active 되살림(§24). */
 export function bumpLessonReuse(ids: number[]): void {
   if (ids.length === 0) return
   const stmt = db.prepare(
@@ -2224,23 +2249,19 @@ export function bumpLessonReuse(ids: number[]): void {
   for (const id of ids) stmt.run(id)
 }
 
-/** lessonsBlock이 프롬프트에 실제 주입한 교훈의 inject_count += 1(실주입 신호). reuse_count(=선택 bump)와
+/** lessonsBlock이 프롬프트에 실제 주입한 학습의 inject_count += 1(실주입 신호). reuse_count(=선택 bump)와
  *  별개 — last_used_at·status 되살림은 건드리지 않음(그건 bumpLessonReuse 책임). 빈 배열이면 no-op. */
 export function bumpLessonInject(ids: number[]): void {
   if (ids.length === 0) return
   // 주입 = '사용'으로 친다 — last_used_at 갱신. 자동 만료는 폐지했으므로(계속 배운 게 쌓여야 개인화),
-  // 적용 중인 교훈은 항상 살아있다. 정리는 시간 만료가 아니라 명시적 flag·중복 병합(curator)만.
+  // 적용 중인 학습은 항상 살아있다. 정리는 시간 만료가 아니라 명시적 flag·중복 병합(curator)만.
   const stmt = db.prepare(
     "UPDATE lessons SET inject_count = inject_count + 1, last_used_at = datetime('now') WHERE id = ?",
   )
   for (const id of ids) stmt.run(id)
 }
 
-export function countLessons(): number {
-  return Number((db.prepare('SELECT COUNT(*) c FROM lessons').get() as any).c)
-}
-
-/** §24 Phase3 curator — consolidate 후보: agent 출처·비핀·비archived 교훈. 프롬프트 한도용 cap.
+/** §24 Phase3 curator — consolidate 후보: agent 출처·비핀·비archived 학습. 프롬프트 한도용 cap.
  *  pinned·origin='user'는 절대 후보 아님(불가침). */
 export function lessonsForCuration(limit = 40): Lesson[] {
   return db
@@ -2269,11 +2290,11 @@ export function applyConsolidation(
         .get(id),
   )
   if (eligible.length < 2) return 0
-  // batch id로 umbrella와 흡수된 교훈들을 묶는다 — revertConsolidationBatch의 데이터 토대(§자기개선).
+  // batch id로 umbrella와 흡수된 학습들을 묶는다 — revertConsolidationBatch의 데이터 토대(§자기개선).
   const batch = crypto.randomUUID()
   db.exec('BEGIN')
   try {
-    // umbrella 먼저 삽입하고 rowid 확보 → 흡수 교훈의 absorbed_into 백필에 쓴다.
+    // umbrella 먼저 삽입하고 rowid 확보 → 흡수 학습의 absorbed_into 백필에 쓴다.
     const umbrellaId = insertLesson({
       projectId: umbrella.projectId,
       taskId: 'curator',
@@ -2295,8 +2316,8 @@ export function applyConsolidation(
   return eligible.length
 }
 
-/** §자기개선 curation revert — 한 batch의 umbrella를 archive하고 흡수된 교훈(absorbed_into=umbrellaId)을
- *  active 복구한다. 트랜잭션. 반환: 복구된 교훈 수. applyConsolidation의 역연산. */
+/** §자기개선 curation revert — 한 batch의 umbrella를 archive하고 흡수된 학습(absorbed_into=umbrellaId)을
+ *  active 복구한다. 트랜잭션. 반환: 복구된 학습 수. applyConsolidation의 역연산. */
 export function revertConsolidationBatch(batch: string): number {
   const umbrellaIds = db
     .prepare(`SELECT id FROM lessons WHERE consolidation_batch = ? AND task_id = 'curator'`)
@@ -2320,7 +2341,7 @@ export function revertConsolidationBatch(batch: string): number {
   return restored
 }
 
-/** C7 — 병합 통합본(umbrella)에 흡수된 원본 교훈들(absorbed_into 역참조). 상세창 계보 표시용. 읽기 전용.
+/** C7 — 병합 통합본(umbrella)에 흡수된 원본 학습들(absorbed_into 역참조). 상세창 계보 표시용. 읽기 전용.
  *  createdAt 오름차순(오래된 원본 먼저)으로 정렬 — 계보를 시간순으로 나열한다. */
 export function lessonsAbsorbedInto(umbrellaId: number): Lesson[] {
   return db
@@ -2329,13 +2350,13 @@ export function lessonsAbsorbedInto(umbrellaId: number): Lesson[] {
     .map(rowToLesson)
 }
 
-/** §24 Phase3 patch-on-use — Navi가 '주입된 교훈이 틀렸다'고 신고하면 즉시 soft-archive(복구 가능).
- *  pinned·origin='user'는 보호. 신고 자체가 신호라 judge LLM 불필요(틀린 교훈 누적 §22.2 정면 차단).
+/** §24 Phase3 patch-on-use — Navi가 '주입된 학습이 틀렸다'고 신고하면 즉시 soft-archive(복구 가능).
+ *  pinned·origin='user'는 보호. 신고 자체가 신호라 judge LLM 불필요(틀린 학습 누적 §22.2 정면 차단).
  *  반환: 실제로 보관됐는지. */
-/** 사용자 정정發 철회 — 키워드로 비보관 교훈을 찾아 soft-archive하고, 잘못된 내용이 병합으로
+/** 사용자 정정發 철회 — 키워드로 비보관 학습을 찾아 soft-archive하고, 잘못된 내용이 병합으로
  *  살아남지 못하게 absorbed_into 우산(파생 통합본) 체인도 함께 보관한다(2026-07-05 사고: 잘못된
- *  교훈을 보관해도 큐레이터 umbrella에 흡수된 사본이 active로 남아 재발). 사용자 명시 철회라
- *  pinned·origin='user'도 대상 — 명시 의사가 불가침 표시보다 우선한다. 반환: 보관된 교훈 목록. */
+ *  학습을 보관해도 큐레이터 umbrella에 흡수된 사본이 active로 남아 재발). 사용자 명시 철회라
+ *  pinned·origin='user'도 대상 — 명시 의사가 불가침 표시보다 우선한다. 반환: 보관된 학습 목록. */
 export function retractLessons(keyword: string): { id: number; lesson: string }[] {
   const kw = `%${keyword.trim()}%`
   const direct = db
@@ -2380,7 +2401,7 @@ export function pinLesson(id: number, pinned: boolean): boolean {
   return Number(r.changes) > 0
 }
 
-/** flagLesson 역연산 — archived 교훈을 active로 복구. pinned/origin 무관(복구는 항상 허용). 반환: 변경됨 여부. */
+/** flagLesson 역연산 — archived 학습을 active로 복구. pinned/origin 무관(복구는 항상 허용). 반환: 변경됨 여부. */
 export function unflagLesson(id: number): boolean {
   const r = db
     .prepare(`UPDATE lessons SET status = 'active' WHERE id = ? AND status = 'archived'`)
@@ -2463,7 +2484,7 @@ export function deleteAllLessons(): void {
   db.prepare('DELETE FROM lessons').run()
 }
 
-// ── bench 교훈 격리(스냅샷/복원) — runBench의 deleteAllLessons가 사용자 교훈을 영구 파괴하지 않게 ──
+// ── bench 학습 격리(스냅샷/복원) — runBench의 deleteAllLessons가 사용자 학습을 영구 파괴하지 않게 ──
 // 백업은 같은 DB 안의 테이블이라 크래시에도 살아남고, 부팅 시 잔여 백업을 감지해 자동 복원한다(initStore).
 
 /** bench 시작 전 lessons 전체를 백업 테이블로 스냅샷. 이전 백업이 남아 있으면(크래시) 먼저 복원한다. */
@@ -2799,203 +2820,6 @@ export function markRoutineRan(id: string, nowIso?: string): void {
   db.prepare('UPDATE routines SET last_run_at = ?, next_run_at = ? WHERE id = ?').run(now, next, id)
 }
 
-// ── 플래너 — plan_items/plan_tags/plan_sections (2026-07-05 설계) ──
-function rowToPlanItem(r: any): PlanItem {
-  return {
-    id: r.id,
-    kind: r.kind,
-    title: r.title,
-    body: r.body,
-    startAt: r.start_at ?? null,
-    endAt: r.end_at ?? null,
-    allDay: !!r.all_day,
-    recur: r.recur,
-    tagId: r.tag_id ?? null,
-    sectionId: r.section_id ?? null,
-    done: !!r.done,
-    doneAt: r.done_at ?? null,
-    remindOffsetMin: r.remind_offset_min ?? null,
-    remindSentAt: r.remind_sent_at ?? null,
-    snoozeUntil: r.snooze_until ?? null,
-    pinned: !!r.pinned,
-    sortOrder: r.sort_order,
-    origin: r.origin,
-    archived: !!r.archived,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
-  }
-}
-
-/** 정렬: kind, sort_order, id. includeArchived 기본 false(보관 항목 제외). */
-export function listPlanItems(includeArchived = false): PlanItem[] {
-  const sql = includeArchived
-    ? 'SELECT * FROM plan_items ORDER BY kind, sort_order, id'
-    : 'SELECT * FROM plan_items WHERE archived = 0 ORDER BY kind, sort_order, id'
-  return db.prepare(sql).all().map(rowToPlanItem)
-}
-
-/** id 있으면 UPDATE(+updated_at 갱신), 없으면 INSERT. 반환은 id. startAt 등 사용자 시각 필드는 저장값 그대로(변환 금지). */
-export function upsertPlanItem(input: PlanItemInput): number {
-  if (input.id != null) {
-    const cur = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(input.id) as any
-    if (!cur) throw new Error(`plan_items: id ${input.id} 없음`)
-    const merged = {
-      kind: input.kind ?? cur.kind,
-      title: input.title ?? cur.title,
-      body: input.body ?? cur.body,
-      start_at: input.startAt !== undefined ? input.startAt : cur.start_at,
-      end_at: input.endAt !== undefined ? input.endAt : cur.end_at,
-      all_day: input.allDay !== undefined ? (input.allDay ? 1 : 0) : cur.all_day,
-      recur: input.recur ?? cur.recur,
-      tag_id: input.tagId !== undefined ? input.tagId : cur.tag_id,
-      section_id: input.sectionId !== undefined ? input.sectionId : cur.section_id,
-      remind_offset_min: input.remindOffsetMin !== undefined ? input.remindOffsetMin : cur.remind_offset_min,
-      pinned: input.pinned !== undefined ? (input.pinned ? 1 : 0) : cur.pinned,
-      sort_order: input.sortOrder !== undefined ? input.sortOrder : cur.sort_order,
-      origin: input.origin ?? cur.origin,
-    }
-    db.prepare(
-      `UPDATE plan_items SET kind=?, title=?, body=?, start_at=?, end_at=?, all_day=?, recur=?,
-        tag_id=?, section_id=?, remind_offset_min=?, pinned=?, sort_order=?, origin=?,
-        updated_at = datetime('now', 'localtime')
-       WHERE id=?`,
-    ).run(
-      merged.kind,
-      merged.title,
-      merged.body,
-      merged.start_at,
-      merged.end_at,
-      merged.all_day,
-      merged.recur,
-      merged.tag_id,
-      merged.section_id,
-      merged.remind_offset_min,
-      merged.pinned,
-      merged.sort_order,
-      merged.origin,
-      input.id,
-    )
-    return input.id
-  }
-  const result = db
-    .prepare(
-      `INSERT INTO plan_items
-        (kind, title, body, start_at, end_at, all_day, recur, tag_id, section_id,
-         remind_offset_min, pinned, sort_order, origin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      input.kind,
-      input.title,
-      input.body ?? '',
-      input.startAt ?? null,
-      input.endAt ?? null,
-      input.allDay ? 1 : 0,
-      input.recur ?? 'none',
-      input.tagId ?? null,
-      input.sectionId ?? null,
-      input.remindOffsetMin ?? null,
-      input.pinned ? 1 : 0,
-      input.sortOrder ?? 0,
-      input.origin ?? 'user',
-    )
-  return Number(result.lastInsertRowid)
-}
-
-/** 완료 토글 — done_at 세팅/해제, updated_at 갱신. */
-export function setPlanItemDone(id: number, done: boolean): void {
-  db.prepare(
-    `UPDATE plan_items SET done = ?, done_at = ?, updated_at = datetime('now', 'localtime') WHERE id = ?`,
-  ).run(done ? 1 : 0, done ? nowLocalMinuteISO() : null, id)
-}
-
-/** 보관(하드삭제 없음 — 성장 보존 관행). */
-export function archivePlanItem(id: number): void {
-  db.prepare(
-    `UPDATE plan_items SET archived = 1, updated_at = datetime('now', 'localtime') WHERE id = ?`,
-  ).run(id)
-}
-
-/** 리마인드 발송 확정 — remind_sent_at=발생(occurrence) ISO, snooze_until 해제. */
-export function markPlanReminded(id: number, occurISO: string): void {
-  db.prepare(
-    `UPDATE plan_items SET remind_sent_at = ?, snooze_until = NULL, updated_at = datetime('now', 'localtime') WHERE id = ?`,
-  ).run(occurISO, id)
-}
-
-/** 스누즈 — snooze_until 세팅, remind_sent_at 해제(재무장). */
-export function snoozePlanItem(id: number, untilISO: string): void {
-  db.prepare(
-    `UPDATE plan_items SET snooze_until = ?, remind_sent_at = NULL, updated_at = datetime('now', 'localtime') WHERE id = ?`,
-  ).run(untilISO, id)
-}
-
-function rowToPlanTag(r: any): PlanTag {
-  return { id: r.id, name: r.name, color: r.color, sortOrder: r.sort_order }
-}
-
-export function listPlanTags(): PlanTag[] {
-  return db.prepare('SELECT * FROM plan_tags ORDER BY sort_order, id').all().map(rowToPlanTag)
-}
-
-export function upsertPlanTag(t: { id?: number; name: string; color: string; sortOrder?: number }): number {
-  if (t.id != null) {
-    db.prepare('UPDATE plan_tags SET name = ?, color = ?, sort_order = ? WHERE id = ?').run(
-      t.name,
-      t.color,
-      t.sortOrder ?? 0,
-      t.id,
-    )
-    return t.id
-  }
-  const result = db
-    .prepare('INSERT INTO plan_tags (name, color, sort_order) VALUES (?, ?, ?)')
-    .run(t.name, t.color, t.sortOrder ?? 0)
-  return Number(result.lastInsertRowid)
-}
-
-/** 삭제 시 참조하던 항목의 tag_id를 NULL로 정리(FK 끊김 방지). */
-export function deletePlanTag(id: number): void {
-  db.prepare('UPDATE plan_items SET tag_id = NULL WHERE tag_id = ?').run(id)
-  db.prepare('DELETE FROM plan_tags WHERE id = ?').run(id)
-}
-
-function rowToPlanSection(r: any): PlanSection {
-  return { id: r.id, name: r.name, sortOrder: r.sort_order, collapsed: !!r.collapsed }
-}
-
-export function listPlanSections(): PlanSection[] {
-  return db.prepare('SELECT * FROM plan_sections ORDER BY sort_order, id').all().map(rowToPlanSection)
-}
-
-export function upsertPlanSection(s: {
-  id?: number
-  name: string
-  sortOrder?: number
-  collapsed?: boolean
-}): number {
-  if (s.id != null) {
-    const cur = db.prepare('SELECT * FROM plan_sections WHERE id = ?').get(s.id) as any
-    db.prepare('UPDATE plan_sections SET name = ?, sort_order = ?, collapsed = ? WHERE id = ?').run(
-      s.name,
-      s.sortOrder ?? cur?.sort_order ?? 0,
-      s.collapsed !== undefined ? (s.collapsed ? 1 : 0) : (cur?.collapsed ?? 0),
-      s.id,
-    )
-    return s.id
-  }
-  const result = db
-    .prepare('INSERT INTO plan_sections (name, sort_order, collapsed) VALUES (?, ?, ?)')
-    .run(s.name, s.sortOrder ?? 0, s.collapsed ? 1 : 0)
-  return Number(result.lastInsertRowid)
-}
-
-/** 삭제 시 참조하던 항목의 section_id를 NULL로 정리(FK 끊김 방지). */
-export function deletePlanSection(id: number): void {
-  db.prepare('UPDATE plan_items SET section_id = NULL WHERE section_id = ?').run(id)
-  db.prepare('DELETE FROM plan_sections WHERE id = ?').run(id)
-}
-
 // ── 외부 MCP 서버 (CC-FEATURES P1) — Routine과 동형 CRUD. 시크릿(env/headers)은 로그 금지(§9-6) ──
 const MCP_RESERVED = new Set(['lain'])
 
@@ -3036,7 +2860,7 @@ function rowToMcpServer(r: any): McpServer {
 }
 
 /** 이름 검증 — 도구 접두사로 쓰여 안전 문자만. 'lain'(내부 서버) 예약·중복 차단. 에러 문자열 또는 null. */
-export function validateMcpName(name: string, exceptId?: string): string | null {
+function validateMcpName(name: string, exceptId?: string): string | null {
   const n = (name ?? '').trim()
   if (!n) return '이름이 필요하다'
   if (!/^[A-Za-z0-9_-]+$/.test(n)) return '이름은 영문·숫자·_·- 만 가능'
@@ -3183,15 +3007,6 @@ export function getSetting(key: string): string | null {
   return r ? r.value : null
 }
 
-/** §9 signal review wake-gate 스냅샷 — 직전 리뷰가 본 다이제스트 해시. 같은 상태 반복 리뷰 차단
- *  (autoPriority 해시가드와 동형). settings 위 래퍼. */
-export function getWakeGateSnapshot(): string | null {
-  return getSetting('wake_gate_snapshot')
-}
-export function setWakeGateSnapshot(hash: string): void {
-  setSetting('wake_gate_snapshot', hash)
-}
-
 // 저널에 남기지 않을 고빈도/일회성 키 — 폴·스캔마다 갱신돼 append-only 저널을 단조 비대화시킨다.
 // 모두 부팅 시 재생성되거나 변화감지용이라 복구 가치가 없다(저널은 telegram 토큰·world_state 등 '진짜 잃으면 안 되는 것'만).
 const JOURNAL_SKIP_SETTINGS = new Set([
@@ -3200,9 +3015,9 @@ const JOURNAL_SKIP_SETTINGS = new Set([
   'auto_priority_wake_snapshot', // 스캔마다 프로젝트 스냅샷 JSON
   'auto_priority_last_digest', // 변화감지 해시
   'lesson_curator_last_hash', // 변화감지 해시
-  'wake_gate_snapshot', // 변화감지 해시
   'db_corrupt_streak', // 손상 카운터(이걸 저널링하면 손상 복구를 방해)
   'db_corrupt_pending_notify', // 일회성 통지 플래그
+  'auto_backup_last_date', // 하루 1회 자동 백업 판정용 — 유실돼도 백업 한 번 더 돌 뿐(복구 가치 없음)
 ])
 
 export function setSetting(key: string, value: string): void {
@@ -3272,6 +3087,12 @@ export function getSettings(): LainSettings {
     )
       ? (getSetting('default_task_mode') as 'auto' | 'autonomous' | 'interactive')
       : 'auto',
+    // L4(P6) — 작업별 reviewDepth 미지정 시 기본 강도. 3값 화이트리스트 외면 'standard'로 안전 폴백.
+    reviewDepthDefault: (['light', 'standard', 'adversarial'] as readonly string[]).includes(
+      getSetting('review_depth_default') ?? '',
+    )
+      ? (getSetting('review_depth_default') as ReviewDepth)
+      : 'standard',
     overlayMonitoringEnabled: (getSetting('overlay_monitoring_enabled') ?? '0') === '1',
     monitorSensitiveApps: (() => {
       const raw = getSetting('monitor_sensitive_apps')
@@ -3285,6 +3106,7 @@ export function getSettings(): LainSettings {
     })(),
     monitorCooldownSec: Math.max(5, Number(getSetting('monitor_cooldown_sec') ?? '30') || 30),
     monitorPollMs: Math.max(500, Number(getSetting('monitor_poll_ms') ?? '1500') || 1500),
+    overlayDevApps: getSetting('overlay_dev_apps') ?? '',
     // 말수(quips+감시 선제발화 빈도) 0~4 — 0(묵언)이 유효값이라 `|| 기본` 폴백 금지, NaN만 방어.
     chattiness: (() => {
       const n = Number(getSetting('chattiness') ?? '2')
@@ -3313,36 +3135,6 @@ export function getSettings(): LainSettings {
     idleMin: Math.max(1, Number(getSetting('idle_min') ?? '3') || 3),
     routinesEnabled: (getSetting('routines_enabled') ?? '0') === '1',
     ccHooksEnabled: (getSetting('cc_hooks_enabled') ?? '0') === '1',
-    plannerShowEvents: (getSetting('planner_show_events') ?? '1') === '1',
-    plannerShowTodos: (getSetting('planner_show_todos') ?? '1') === '1',
-    plannerShowRoutines: (getSetting('planner_show_routines') ?? '1') === '1',
-    plannerShowTasks: (getSetting('planner_show_tasks') ?? '1') === '1',
-    plannerDefaultView: (['month', 'week', 'day'] as readonly string[]).includes(
-      getSetting('planner_default_view') ?? '',
-    )
-      ? (getSetting('planner_default_view') as 'month' | 'week' | 'day')
-      : 'month',
-    plannerWeekStart: getSetting('planner_week_start') === '0' ? 0 : 1,
-    plannerShowDone: (getSetting('planner_show_done') ?? '1') === '1',
-    plannerSidebarSide: getSetting('planner_sidebar_side') === 'left' ? 'left' : 'right',
-    plannerSidebarWidth: Math.max(
-      200,
-      Math.min(480, Number(getSetting('planner_sidebar_width') ?? '300') || 300),
-    ),
-    plannerDensity: getSetting('planner_density') === 'compact' ? 'compact' : 'cozy',
-    plannerRemindDefaultMin: (() => {
-      const n = Number(getSetting('planner_remind_default_min') ?? '10')
-      return Math.max(0, Math.min(1440, Number.isNaN(n) ? 10 : n))
-    })(),
-    plannerStaleDays: Math.max(1, Math.min(90, Number(getSetting('planner_stale_days') ?? '7') || 7)),
-    plannerNudge: (['off', 'daily', 'weekly'] as readonly string[]).includes(
-      getSetting('planner_nudge') ?? '',
-    )
-      ? (getSetting('planner_nudge') as 'off' | 'daily' | 'weekly')
-      : 'weekly',
-    plannerInBriefing: (getSetting('planner_in_briefing') ?? '1') === '1',
-    plannerOfferHelp: (getSetting('planner_offer_help') ?? '1') === '1',
-    plannerTelegramRemind: (getSetting('planner_telegram_remind') ?? '1') === '1',
     onboardingDone: (getSetting('onboarding_done') ?? '0') === '1',
     telegramEnabled: (getSetting('telegram_enabled') ?? '0') === '1',
     telegramBotToken: getSetting('telegram_bot_token') ?? '',
@@ -3389,6 +3181,7 @@ export function getSettings(): LainSettings {
     supertonicCustomSample: getSetting('supertonic_custom_sample') ?? '',
     koreanizeTts: getSetting('koreanize_tts') !== 'false', // 기본 on
     pcVoiceOut: getSetting('pc_voice_out') === 'true', // 기본 off
+    pcVoiceIn: getSetting('pc_voice_in') === '1', // 기본 off
     supertonicSpeed: Math.max(0.5, Math.min(2.0, Number(getSetting('supertonic_speed') ?? '1.05') || 1.05)),
     supertonicStep: Math.max(2, Math.min(16, Number(getSetting('supertonic_step') ?? '8') || 8)),
     voiceTone:
@@ -3399,6 +3192,8 @@ export function getSettings(): LainSettings {
           : 'deadpan',
     updateNotify: (getSetting('update_notify') ?? '1') === '1',
     updateAutoDownload: (getSetting('update_auto_download') ?? '0') === '1',
+    autoBackupEnabled: (getSetting('auto_backup_enabled') ?? '1') === '1',
+    autoBackupKeep: Math.max(1, Math.min(60, Number(getSetting('auto_backup_keep') ?? '7') || 7)),
   }
 }
 
@@ -3433,9 +3228,20 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
   if (patch.userAliases !== undefined)
     setSetting('user_aliases', JSON.stringify(patch.userAliases.map((a) => String(a).trim()).filter(Boolean)))
   if (patch.defaultTaskMode !== undefined) setSetting('default_task_mode', patch.defaultTaskMode)
+  if (patch.reviewDepthDefault !== undefined)
+    setSetting(
+      'review_depth_default',
+      (['light', 'standard', 'adversarial'] as readonly string[]).includes(patch.reviewDepthDefault)
+        ? patch.reviewDepthDefault
+        : 'standard',
+    )
   if (patch.updateNotify !== undefined) setSetting('update_notify', patch.updateNotify ? '1' : '0')
   if (patch.updateAutoDownload !== undefined)
     setSetting('update_auto_download', patch.updateAutoDownload ? '1' : '0')
+  if (patch.autoBackupEnabled !== undefined)
+    setSetting('auto_backup_enabled', patch.autoBackupEnabled ? '1' : '0')
+  if (patch.autoBackupKeep !== undefined)
+    setSetting('auto_backup_keep', String(Math.max(1, Math.min(60, Math.floor(patch.autoBackupKeep) || 7))))
   if (patch.overlayMonitoringEnabled !== undefined)
     setSetting('overlay_monitoring_enabled', patch.overlayMonitoringEnabled ? '1' : '0')
   if (patch.monitorSensitiveApps !== undefined)
@@ -3452,6 +3258,7 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     )
   if (patch.monitorPollMs !== undefined)
     setSetting('monitor_poll_ms', String(Math.max(500, Math.floor(patch.monitorPollMs) || 1500)))
+  if (patch.overlayDevApps !== undefined) setSetting('overlay_dev_apps', patch.overlayDevApps.trim())
   if (patch.workspaceRoot !== undefined) setSetting('workspace_root', patch.workspaceRoot.trim())
   if (patch.scanDirs !== undefined)
     setSetting('scan_dirs', JSON.stringify(patch.scanDirs.map((d) => String(d).trim()).filter(Boolean)))
@@ -3477,59 +3284,6 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     setSetting('routines_enabled', patch.routinesEnabled ? '1' : '0')
   if (patch.ccHooksEnabled !== undefined)
     setSetting('cc_hooks_enabled', patch.ccHooksEnabled ? '1' : '0')
-  if (patch.plannerShowEvents !== undefined)
-    setSetting('planner_show_events', patch.plannerShowEvents ? '1' : '0')
-  if (patch.plannerShowTodos !== undefined)
-    setSetting('planner_show_todos', patch.plannerShowTodos ? '1' : '0')
-  if (patch.plannerShowRoutines !== undefined)
-    setSetting('planner_show_routines', patch.plannerShowRoutines ? '1' : '0')
-  if (patch.plannerShowTasks !== undefined)
-    setSetting('planner_show_tasks', patch.plannerShowTasks ? '1' : '0')
-  if (patch.plannerDefaultView !== undefined)
-    setSetting(
-      'planner_default_view',
-      (['month', 'week', 'day'] as readonly string[]).includes(patch.plannerDefaultView)
-        ? patch.plannerDefaultView
-        : 'month',
-    )
-  if (patch.plannerWeekStart !== undefined)
-    setSetting('planner_week_start', patch.plannerWeekStart === 0 ? '0' : '1')
-  if (patch.plannerShowDone !== undefined)
-    setSetting('planner_show_done', patch.plannerShowDone ? '1' : '0')
-  if (patch.plannerSidebarSide !== undefined)
-    setSetting('planner_sidebar_side', patch.plannerSidebarSide === 'left' ? 'left' : 'right')
-  if (patch.plannerSidebarWidth !== undefined)
-    setSetting(
-      'planner_sidebar_width',
-      String(Math.max(200, Math.min(480, Math.floor(patch.plannerSidebarWidth) || 300))),
-    )
-  if (patch.plannerDensity !== undefined)
-    setSetting('planner_density', patch.plannerDensity === 'compact' ? 'compact' : 'cozy')
-  if (patch.plannerRemindDefaultMin !== undefined) {
-    const n = Math.floor(patch.plannerRemindDefaultMin)
-    setSetting(
-      'planner_remind_default_min',
-      String(Math.max(0, Math.min(1440, Number.isNaN(n) ? 10 : n))),
-    )
-  }
-  if (patch.plannerStaleDays !== undefined)
-    setSetting(
-      'planner_stale_days',
-      String(Math.max(1, Math.min(90, Math.floor(patch.plannerStaleDays) || 7))),
-    )
-  if (patch.plannerNudge !== undefined)
-    setSetting(
-      'planner_nudge',
-      (['off', 'daily', 'weekly'] as readonly string[]).includes(patch.plannerNudge)
-        ? patch.plannerNudge
-        : 'weekly',
-    )
-  if (patch.plannerInBriefing !== undefined)
-    setSetting('planner_in_briefing', patch.plannerInBriefing ? '1' : '0')
-  if (patch.plannerOfferHelp !== undefined)
-    setSetting('planner_offer_help', patch.plannerOfferHelp ? '1' : '0')
-  if (patch.plannerTelegramRemind !== undefined)
-    setSetting('planner_telegram_remind', patch.plannerTelegramRemind ? '1' : '0')
   if (patch.onboardingDone !== undefined)
     setSetting('onboarding_done', patch.onboardingDone ? '1' : '0')
   if (patch.curatedPlugins !== undefined)
@@ -3599,6 +3353,7 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     setSetting('supertonic_custom_sample', patch.supertonicCustomSample.trim())
   if (patch.koreanizeTts !== undefined) setSetting('koreanize_tts', patch.koreanizeTts ? 'true' : 'false')
   if (patch.pcVoiceOut !== undefined) setSetting('pc_voice_out', patch.pcVoiceOut ? 'true' : 'false')
+  if (patch.pcVoiceIn !== undefined) setSetting('pc_voice_in', patch.pcVoiceIn ? '1' : '0')
   if (patch.supertonicSpeed !== undefined)
     setSetting('supertonic_speed', String(Math.max(0.5, Math.min(2.0, patch.supertonicSpeed || 1.05))))
   if (patch.supertonicStep !== undefined)

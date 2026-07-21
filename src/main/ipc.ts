@@ -1,5 +1,4 @@
 // IPC 핸들러 (PLAN.md §4) — Renderer ↔ L0. 변경 후엔 projects:updated 푸시.
-import { execFile } from 'node:child_process'
 import { BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import {
   listProjects,
@@ -7,7 +6,6 @@ import {
   hideProject,
   unhideProject,
   getProject,
-  listMessages,
   listTasks,
   dailyTaskUsage,
   listRecentActivity,
@@ -18,8 +16,6 @@ import {
   getSettings,
   saveSettings,
   backupDatabase,
-  listNaviMessages,
-  listConversationPreviews,
   listConversations,
   createConversation,
   listConversationMessages,
@@ -34,7 +30,6 @@ import {
   setChapter,
   listLessons,
   getTask,
-  flagLesson,
   unflagLesson,
   archiveLesson,
   pinLesson,
@@ -50,16 +45,6 @@ import {
   updateMcpServer,
   setMcpServerEnabled,
   deleteMcpServer,
-  listPlanItems,
-  upsertPlanItem,
-  archivePlanItem,
-  setPlanItemDone,
-  listPlanTags,
-  upsertPlanTag,
-  deletePlanTag,
-  listPlanSections,
-  upsertPlanSection,
-  deletePlanSection,
   listBenchRuns,
   lastChatActivityAt,
   getTaskGroup,
@@ -82,6 +67,7 @@ import { setInboxOpen } from './notify'
 import { scanProjects, addProject, workspaceRoot, workspaceInfo } from './registry'
 import { collectStatus, runVerify } from './collectors'
 import { walkProjectFiles, MAX_FILES } from './filewalk'
+import { listCcSessions, ccSessionDigest } from './ccsessions'
 import {
   sendToManager,
   stopManager,
@@ -114,7 +100,7 @@ import {
 } from './orchestrator'
 import { resolveApproval } from './worker'
 import { bindScheduler, rearmScheduler } from './scheduler'
-import { restartTelegram, telegramReconcile, telegramStatus } from './telegram'
+import { restartTelegram, telegramReconcile, telegramStatus, telegramTaskEvent } from './telegram'
 import { discordStatus, restartDiscord, bindDiscordState } from './discord'
 import { refreshTray } from './tray'
 import { capTaskImages } from './taskimages'
@@ -126,6 +112,9 @@ import type { LainSettings } from '../shared/types'
 // 모듈 const로 직접 now를 계산하면 reload마다 경계가 '지금'으로 밀려 이번 세션 메시지가 콜드스타트처럼
 // 통째로 숨겨졌다. store.nowStamp와 동일 UTC 'YYYY-MM-DD HH:MM:SS' 포맷으로 맞춘다(문자열 비교 정합).
 const APP_STARTED_AT = new Date().toISOString().slice(0, 19).replace('T', ' ')
+
+// 렌더러 오류 보고('ui:error') 프로세스당 기록 상한 — 렌더 루프가 초당 수백 건을 밀어도 디스크·CPU를 안 태운다.
+const UI_ERROR_LOG_MAX = 200
 
 function broadcast(channel: string, payload: unknown): void {
   // 파괴/크래시 중인 webContents에 send하면 throw → 비동기 콜백(스케줄러·오케스트레이터 등)에서
@@ -145,10 +134,20 @@ function pushProjects(): void {
   refreshCcLinkIfEnabled() // 클로드코드 연동 — 등록 프로젝트 목록·다이제스트를 훅이 읽는 파일에 반영
 }
 
+// 승인 큐 방송 — 직전 스냅샷과 내용이 같으면 내보내지 않는다. 작업 이벤트가 흐를 때마다 무조건 밀면
+// 승인이 하나도 안 바뀐 턴에도 IPC와 렌더러 갱신이 계속 돈다. approvals:updated 방송은 전부 이 함수를
+// 지나야 스냅샷이 단일 출처가 된다 — 일부만 우회하면 스냅샷이 실제 화면과 어긋나 갱신이 유실된다.
+let lastApprovalsJson = ''
+function broadcastApprovals(): void {
+  const list = listApprovals()
+  const json = JSON.stringify(list)
+  if (json === lastApprovalsJson) return
+  lastApprovalsJson = json
+  broadcast('approvals:updated', list)
+}
+
 async function refresh(id: string | null): Promise<void> {
-  const targets = id
-    ? [getProject(id)].filter((p) => p !== null)
-    : listProjects().filter((p) => p.enabled)
+  const targets = id ? [getProject(id)].filter((p) => p !== null) : listProjects()
   await Promise.all(targets.map((p) => collectStatus(p)))
   pushProjects()
 }
@@ -217,31 +216,11 @@ export function registerIpc(): void {
     pushProjects()
   })
 
-  // '제거' = 보드에서 숨김(데이터 보존). 하드 삭제 아님 — 같은 폴더 재추가 시 대화·교훈·작업 복원.
+  // '제거' = 보드에서 숨김(데이터 보존). 하드 삭제 아님 — 같은 폴더 재추가 시 대화·학습·작업 복원.
   ipcMain.handle('projects:remove', (_e, id: string) => {
     hideProject(id)
     emitQuip('project_remove')
     pushProjects()
-  })
-
-  ipcMain.handle('projects:push', async (_e, id: string) => {
-    const p = getProject(id)
-    if (!p || !p.isGit) return { ok: false, output: '프로젝트 없음 또는 git 아님' }
-    const result = await new Promise<{ ok: boolean; output: string }>((resolve) => {
-      execFile(
-        'git',
-        ['push', 'origin', 'HEAD'],
-        { cwd: p.path, windowsHide: true, timeout: 30_000 },
-        (err, stdout, stderr) => {
-          resolve({
-            ok: !err,
-            output: err ? (stderr || err.message).trim() : (stdout || '완료').trim(),
-          })
-        },
-      )
-    })
-    if (result.ok) await refresh(id)
-    return result
   })
 
   ipcMain.handle('status:refresh', (_e, id: string | null) => refresh(id))
@@ -256,14 +235,14 @@ export function registerIpc(): void {
   })
 
   // A12 — @파일 자동완성 파일 목록. projectId 지정 시 그 프로젝트만(Navi 드릴, 상대경로 그대로),
-  // 미지정 시 등록된 모든(enabled) 프로젝트를 훑어 'projectId/상대경로'로 접두(레인 채팅 범위).
+  // 미지정 시 등록된 모든 프로젝트를 훑어 'projectId/상대경로'로 접두(레인 채팅 범위).
   // 렌더러가 @ 진입 시 1회만 호출하고 이후 fuzzy 필터는 렌더러 쪽에서 처리(매 키 재-glob 금지).
   ipcMain.handle('files:list', (_e, projectId?: string) => {
     if (projectId) {
       const p = getProject(projectId)
       return p ? walkProjectFiles(p.path) : []
     }
-    const projects = listProjects().filter((p) => p.enabled)
+    const projects = listProjects()
     const out: string[] = []
     for (const p of projects) {
       if (out.length >= MAX_FILES) break
@@ -272,8 +251,15 @@ export function registerIpc(): void {
     return out
   })
 
-  ipcMain.handle('chat:history', () => listMessages('manager'))
-  ipcMain.handle('chat:previews', () => listConversationPreviews())
+  // CC 세션 열람 — 그 프로젝트(+워크트리)의 클로드코드 데스크톱/터미널 세션 목록·내용 발췌(읽기 전용).
+  ipcMain.handle('cc:sessions', (_e, projectId: string) => {
+    const p = getProject(projectId)
+    return p ? listCcSessions(p.path) : []
+  })
+  ipcMain.handle('cc:sessionDigest', (_e, projectId: string, sessionId: string) => {
+    const p = getProject(projectId)
+    return p ? ccSessionDigest(p.path, sessionId) : null
+  })
 
   ipcMain.handle('chat:send', async (_e, text: string, attachments?: import('../shared/types').FileAttachment[], conversationId?: string) => {
     // 렌더러 반영은 rendererMirror(bindManagerRenderer)가 conversationId 태깅해 단일 처리.
@@ -315,8 +301,9 @@ export function registerIpc(): void {
       // (working 유지) 기존 setState 경로의 tasks:updated가 안 나간다. NaviTile 진행률(n/m)이 실시간
       // 갱신되게 todo 이벤트에 한해 여기서 직접 브로드캐스트(추가 IPC 없이 기존 tasks:updated 재사용).
       if (ev.kind === 'todo') broadcast('tasks:updated', listTasks())
-      broadcast('approvals:updated', listApprovals()) // 승인 생성/해소가 이벤트에 실려옴
+      broadcastApprovals() // 승인 생성/해소가 이벤트에 실려옴(내용이 바뀐 때만 나간다)
       telegramReconcile() // §20.3 새 승인/질문/결재를 폰으로 즉시 푸시
+      telegramTaskEvent(ev) // P1 — 라이브 카드 '지금' 줄 실시간 갱신(스로틀 내장, 미설정 시 no-op)
       refreshTray()
     },
     () => {
@@ -339,7 +326,7 @@ export function registerIpc(): void {
       refreshCcLinkIfEnabled() // 작업 상태 변화 → CC가 읽을 프로젝트 다이제스트 갱신(레인→CC)
     },
     refreshApprovals: () => {
-      broadcast('approvals:updated', listApprovals())
+      broadcastApprovals()
       telegramReconcile()
     },
     // #1: 레인이 채팅으로 받은 디스코드 설정을 저장(준 값만 패치) + 어댑터 재기동. saveSettings·restartDiscord는
@@ -358,11 +345,9 @@ export function registerIpc(): void {
     // 즉시 흘린다 — Navi가 승인 대기로 블록되는 동안에도 승인 카드가 떠야 사용자가 풀 수 있다.
     onNaviEvent: (ev) => {
       broadcast('workerchat:event', ev)
-      broadcast('approvals:updated', listApprovals())
+      broadcastApprovals()
       telegramReconcile()
     },
-    // 레인 도구(플래너 CRUD)發 변경을 렌더러에 브로드캐스트 — CRUD IPC 핸들러와 동일 채널.
-    refreshPlanner: () => broadcast('planner:updated', null),
   })
 
   // 텔레그램·PC·스케줄러 등 모든 출처의 Lain 대화 이벤트를 렌더러로 미러(conversationId 태깅).
@@ -406,8 +391,8 @@ export function registerIpc(): void {
     // resume 프롬프트에만 붙이고, 영속 명세(task.content)에는 박지 않는다(명세 오염 방지).
     answerClarify(taskId, answers, 'user'),
   )
-  ipcMain.handle('tasks:resolveReview', (_e, taskId: string, action: any) =>
-    resolveReview(taskId, action),
+  ipcMain.handle('tasks:resolveReview', (_e, taskId: string, action: any, comment?: string) =>
+    resolveReview(taskId, action, comment),
   )
   // D8 — 병합 되돌리기(비파괴 revert). 성공 시 task 갱신 브로드캐스트.
   ipcMain.handle('tasks:revertMerge', async (_e, taskId: string) => {
@@ -441,8 +426,12 @@ export function registerIpc(): void {
   ipcMain.handle(
     'tasks:setImages',
     (_e, taskId: string, images: import('../shared/types').FileAttachment[]) => {
-      updateTask(taskId, { images: capTaskImages(images ?? []) })
+      const given = images ?? []
+      const kept = capTaskImages(given)
+      updateTask(taskId, { images: kept })
       broadcast('tasks:updated', listTasks())
+      // 상한의 단일 출처는 메인 — 몇 장이 걸러졌는지 돌려줘 렌더러가 상한을 복제해 세지 않아도 되게 한다.
+      return { accepted: kept.length, dropped: given.length - kept.length }
     },
   )
   // B4 fast-mode — Opus 빠른 출력 모드 토글. 다음 실행/재개부터 적용.
@@ -480,16 +469,13 @@ export function registerIpc(): void {
   ipcMain.handle('workerchat:send', (_e, projectId: string, text: string, attachments?: import('../shared/types').FileAttachment[], conversationId?: string) => {
     const emit = (ev: unknown) => {
       broadcast('workerchat:event', ev)
-      broadcast('approvals:updated', listApprovals())
+      broadcastApprovals()
       telegramReconcile() // §20.3 Navi 직접 채팅 승인도 폰으로
     }
     return projectId === '@all'
       ? sendToAllNavis(text, emit)
       : sendToNavi(projectId, text, emit, conversationId, attachments ?? [])
   })
-  ipcMain.handle('workerchat:history', (_e, projectId: string) =>
-    projectId === '@all' ? [] : listNaviMessages(projectId),
-  )
   // §5.6 Navi 직접 채팅 응답 정지 — stopManager 미러(SDK abort)
   ipcMain.handle('workerchat:stop', (_e, projectId: string) => stopNaviChat(projectId))
 
@@ -591,16 +577,36 @@ export function registerIpc(): void {
   // 인박스 열림/닫힘 통지 — notify가 "자리 비움"·알림 재진입 억제 판단에 사용(단방향)
   ipcMain.on('ui:inbox-state', (_e, open: boolean) => setInboxOpen(open))
 
+  // 렌더러 조용한 실패·렌더 예외 보고 — 렌더러 콘솔은 앱을 닫으면 사라져 '빈 화면' 사후 추적이 불가능했다.
+  // message/componentStack만 파일 한 줄(JSON)로 남긴다 — 시크릿·경로 전문은 싣지 않는다(§9-6).
+  // 렌더러 reload가 렌더러 쪽 쿨다운을 리셋하므로 프로세스당 총량 상한을 여기서 한 번 더 건다(폭주 차단).
+  let uiErrorCount = 0
+  ipcMain.handle(
+    'ui:error',
+    async (_e, payload: { kind: string; message: string; componentStack?: string }) => {
+      if (uiErrorCount >= UI_ERROR_LOG_MAX) return
+      uiErrorCount++
+      const path = await import('node:path')
+      const { DATA_DIR } = await import('./paths')
+      const { appendCapped } = await import('./logfile')
+      const stack = payload?.componentStack ? String(payload.componentStack).slice(0, 2000) : undefined
+      appendCapped(
+        path.join(DATA_DIR, 'renderer-crash.log'),
+        `${JSON.stringify({
+          time: new Date().toISOString(),
+          kind: String(payload?.kind ?? '').slice(0, 60),
+          message: String(payload?.message ?? '').slice(0, 500),
+          componentStack: stack,
+        })}\n`,
+      )
+    },
+  )
+
   ipcMain.handle('lessons:list', () => listLessons())
-  // C7 — 병합 통합본(umbrella)에 흡수된 원본 교훈 목록(absorbed_into 역참조). 상세창 계보 표시용.
+  // C7 — 병합 통합본(umbrella)에 흡수된 원본 학습 목록(absorbed_into 역참조). 상세창 계보 표시용.
   ipcMain.handle('lessons:absorbedInto', (_e, umbrellaId: number) => lessonsAbsorbedInto(umbrellaId))
 
-  // §24 교훈 수명주기 — 변경 후 lessons:updated push로 모든 패널 동기화.
-  ipcMain.handle('lesson:flag', (_e, id: number) => {
-    const ok = flagLesson(id)
-    broadcast('lessons:updated', listLessons())
-    return ok
-  })
+  // §24 학습 수명주기 — 변경 후 lessons:updated push로 모든 패널 동기화.
   ipcMain.handle('lesson:unflag', (_e, id: number) => {
     const ok = unflagLesson(id)
     broadcast('lessons:updated', listLessons())
@@ -632,7 +638,7 @@ export function registerIpc(): void {
       broadcast('lessons:updated', listLessons())
     },
   )
-  // §curation revert — batch의 umbrella archive + 흡수 교훈 active 복구. 복구 수 반환, 이후 패널 동기화.
+  // §curation revert — batch의 umbrella archive + 흡수 학습 active 복구. 복구 수 반환, 이후 패널 동기화.
   ipcMain.handle('lesson:revertConsolidation', (_e, batch: string) => {
     const n = revertConsolidationBatch(batch)
     broadcast('lessons:updated', listLessons())
@@ -771,11 +777,6 @@ export function registerIpc(): void {
     )
     return `data:${mime};base64,${audio.toString('base64')}`
   })
-  ipcMain.handle('tts:supertonicStatus', async () => {
-    const { supertonicStatus } = await import('./supertonic-proc')
-    return supertonicStatus()
-  })
-
   // PC 네이티브 음성 — 렌더러 마이크 녹음(webm) → Groq Whisper(ko) STT. 키 없으면 no-key.
   ipcMain.handle('voice:stt', async (_e, bytes: Uint8Array) => {
     const s = getSettings()
@@ -800,14 +801,50 @@ export function registerIpc(): void {
       return { error: String((e as Error)?.message || e) }
     }
   })
-  // PC 네이티브 음성 — 임의 텍스트를 현재 설정 엔진으로 합성 → data URI(mime 포함).
-  // 예전엔 Supertonic 고정이라 ttsBackend=gpt-sovits로 바꿔도 PC 창 음성이 안 바뀌었음 → 디스패처로 통일.
+  // PC 네이티브 음성(스트리밍) — 문장 단위로 나눠 합성하고 청크마다 'tts:chunk' 이벤트로 밀어
+  // 첫 문장부터 바로 재생되게 한다(전문 합성 대기 침묵 제거). 전역 단일 스트림 — 새 요청/정지가
+  // 이전 스트림을 세대(gen) 불일치로 무효화한다(렌더러 stopVoice와 동형 패턴).
   // fallback: true면 설정한 로컬 엔진이 실패해 edge로 대체됐다는 뜻(B7-2) — 렌더러가 통보.
-  ipcMain.handle('tts:speak', async (_e, text: string) => {
-    if (!text || !text.trim()) return { uri: '' }
+  let ttsStreamGen = 0
+  ipcMain.handle('tts:speakStream', async (_e, text: string) => {
+    const id = ++ttsStreamGen
+    if (!text || !text.trim()) return { id }
     const tts = await import('./tts')
-    const { audio, mime, fallback } = await tts.synthesizeBackend(text, getSettings())
-    return { uri: `data:${mime};base64,${audio.toString('base64')}`, fallback }
+    // fire-and-forget — 핸들러는 id만 즉시 반환하고 합성 루프는 배경에서 이벤트로 흘린다.
+    void tts
+      .synthesizeBackendStream(
+        text,
+        getSettings(),
+        (c) =>
+          broadcast('tts:chunk', {
+            id,
+            seq: c.seq,
+            uri: `data:${c.mime};base64,${c.audio.toString('base64')}`,
+            fallback: c.fallback,
+            last: c.last,
+          }),
+        () => id !== ttsStreamGen,
+      )
+      .catch((e) => {
+        // 전 엔진 실패(edge 폴백까지). 그냥 삼키면 사용자에겐 원인 없는 무음만 남는다 — 로그 한 줄과
+        // 종료 청크(seq:-1·uri 없음·error)로 알린다. 렌더러는 빈 uri를 큐에 넣지 않아 재생은 그대로 무음.
+        const msg = String((e as Error)?.message || e)
+        void (async () => {
+          const path = await import('node:path')
+          const { DATA_DIR } = await import('./paths')
+          const { appendCapped } = await import('./logfile')
+          // 메시지만 — 시크릿·경로 전문은 남기지 않는다(§9-6).
+          appendCapped(
+            path.join(DATA_DIR, 'tts.log'),
+            `${new Date().toISOString()} 스트리밍 합성 실패 — ${msg.slice(0, 300)}\n`,
+          )
+        })()
+        broadcast('tts:chunk', { id, seq: -1, uri: '', last: true, error: msg.slice(0, 300) })
+      })
+    return { id }
+  })
+  ipcMain.handle('tts:speakStop', () => {
+    ttsStreamGen++ // 진행 중 스트림 무효화 — 합성 루프가 다음 청크 전에 멈춘다
   })
 
   // 개인 보이스(로컬) 가져오기 — '찾아보기'로 파일 선택 → %APPDATA%\lain\voices\ 로 복사.
@@ -866,7 +903,7 @@ export function registerIpc(): void {
     return dir
   })
 
-  // E8 — 데이터 폴더 열기(설정·대화·교훈·플래너가 쌓이는 %APPDATA%\lain). 사용자가 직접 확인·백업.
+  // E8 — 데이터 폴더 열기(설정·대화·학습이 쌓이는 %APPDATA%\lain). 사용자가 직접 확인·백업.
   ipcMain.handle('data:openFolder', async () => {
     const { DATA_DIR } = await import('./paths')
     await shell.openPath(DATA_DIR)
@@ -888,6 +925,27 @@ export function registerIpc(): void {
     const r = backupDatabase(result.filePath)
     if (r.ok) emitQuip('backup_export')
     return r
+  })
+
+  // E8 확장 — 자동 백업 상태(마지막 성공 시각 / 마지막 실패 사유). autobackup.ts가 settings에 남긴 JSON을
+  // 읽어 그대로 노출한다(키의 단일 출처는 autobackup.ts). 값이 없거나 깨졌으면 null — 설정 화면은 힌트만 감춘다.
+  ipcMain.handle('data:autoBackupStatus', () => {
+    const parse = (key: string): Record<string, unknown> | null => {
+      try {
+        const raw = getSetting(key)
+        if (!raw) return null
+        const v = JSON.parse(raw)
+        return v && typeof v === 'object' ? (v as Record<string, unknown>) : null
+      } catch {
+        return null // 값 손상 — 상태 표시만 생략(백업 자체와 무관)
+      }
+    }
+    const ok = parse('auto_backup_last_ok')
+    const err = parse('auto_backup_last_error')
+    return {
+      lastAt: typeof ok?.at === 'string' ? ok.at : null,
+      lastError: typeof err?.error === 'string' ? err.error.slice(0, 300) : null,
+    }
   })
 
   // D15 되감기 — 레인 직접 편집의 턴 체크포인트 요약(확인창 목록)/복원(편집 diff 카드 '이 턴 편집 되돌리기')
@@ -992,59 +1050,10 @@ export function registerIpc(): void {
     }
   })
 
-  // ── 플래너 — CRUD는 결정론 직통, 변경은 planner:updated 브로드캐스트(레인 도구發 포함) ──
-  ipcMain.handle('planner:list', () => ({ items: listPlanItems(), tags: listPlanTags(), sections: listPlanSections() }))
-  ipcMain.handle('planner:upsertItem', (_e, input) => {
-    const id = upsertPlanItem(input)
-    broadcast('planner:updated', null)
-    // quips — 이번 주(월~일) 일정·마감이 6개 이상이면 한마디. startAt은 로컬 'YYYY-MM-DDTHH:mm'
-    // 고정 포맷이라 문자열 비교가 시간순과 일치한다(타임존 파싱 함정 회피).
-    try {
-      const now = new Date()
-      const mon = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7))
-      const next = new Date(mon.getFullYear(), mon.getMonth(), mon.getDate() + 7)
-      const fmt = (d: Date) =>
-        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}T00:00`
-      const lo = fmt(mon)
-      const hi = fmt(next)
-      const count = listPlanItems().filter((it) => it.startAt && it.startAt >= lo && it.startAt < hi).length
-      if (count >= 6) emitQuip('busy_week', { count })
-    } catch {
-      /* 플레이버 — 실패 무해 */
-    }
-    return id
-  })
-  ipcMain.handle('planner:deleteItem', (_e, id: number) => {
-    archivePlanItem(id)
-    broadcast('planner:updated', null)
-  })
-  ipcMain.handle('planner:setDone', (_e, id: number, done: boolean) => {
-    setPlanItemDone(id, done)
-    broadcast('planner:updated', null)
-  })
-  ipcMain.handle('planner:upsertTag', (_e, input) => {
-    const id = upsertPlanTag(input)
-    broadcast('planner:updated', null)
-    return id
-  })
-  ipcMain.handle('planner:deleteTag', (_e, id: number) => {
-    deletePlanTag(id)
-    broadcast('planner:updated', null)
-  })
-  ipcMain.handle('planner:upsertSection', (_e, input) => {
-    const id = upsertPlanSection(input)
-    broadcast('planner:updated', null)
-    return id
-  })
-  ipcMain.handle('planner:deleteSection', (_e, id: number) => {
-    deletePlanSection(id)
-    broadcast('planner:updated', null)
-  })
-
   ipcMain.handle('approvals:list', () => listApprovals())
   ipcMain.handle('approvals:resolve', (_e, id: number, approved: boolean, answer?: string) => {
     resolveApproval(id, approved, answer)
-    broadcast('approvals:updated', listApprovals())
+    broadcastApprovals()
   })
 
   // 인라인 질문(ask_user) 답 제출 — 대기 중인 Lain 턴을 깨운다.

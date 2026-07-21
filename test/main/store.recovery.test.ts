@@ -25,7 +25,7 @@ import {
   formatCorruptDetail,
   isQuickCheckOk,
   addMessage,
-  listMessages,
+  listConversationMessages,
   ensureActiveConversation,
   parseNullViolations,
   repairNullViolations,
@@ -181,7 +181,7 @@ describe('closeStore + 재오픈 — 정상 종료 후 데이터·구조 보존'
     closeStore() // wal_checkpoint(TRUNCATE) + close — WAL을 메인에 합침
     // 재오픈: recoverCorruptWalBeforeOpen(정상→noop) + repairIndexesIfCorrupt(quick_check ok→noop)
     initStore()
-    const after = listMessages('manager')
+    const after = listConversationMessages(cid)
     expect(after.some((m) => m.content === 'SURVIVOR')).toBe(true)
     // 재오픈 후에도 쓰기 가능(인덱스 복구가 healthy DB를 깨지 않음)
     expect(() => addMessage('manager', 'assistant', 'OK', cid)).not.toThrow()
