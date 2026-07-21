@@ -8,8 +8,12 @@ import type { Project } from '../shared/types'
 
 const WT_ROOT = path.join(DATA_DIR, 'wt')
 
+// git이 index lock 경합·credential prompt 등으로 매달리면 동기 호출이라 Electron 메인 프로세스
+// 전체가 굳는다 — 상한을 걸어 실패(throw)로 떨어뜨린다(호출부들은 이미 실패를 방어 처리한다).
+const GIT_TIMEOUT = 30_000
+
 function git(cwd: string, ...args: string[]): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true }).trim()
+  return execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true, timeout: GIT_TIMEOUT }).trim()
 }
 
 export function branchName(taskId: string): string {

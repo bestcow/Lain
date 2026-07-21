@@ -72,6 +72,7 @@ import {
 } from '../../src/main/store'
 import { startTask, cancelTask, interruptTask } from '../../src/main/orchestrator'
 import { createWorktree } from '../../src/main/worktree'
+import { verifyInDir } from '../../src/main/collectors'
 import { runNavi, isNaviRunning } from '../../src/main/worker'
 import type { Task } from '../../src/shared/types'
 
@@ -96,7 +97,7 @@ beforeAll(() => {
   })
   upsertProject({
     id: 'race-verify', path: os.tmpdir(), name: 'race-verify', stack: '',
-    verifyCmd: 'exit 1', // finishWork verify를 항상 실패시켜 재시도 경로(runNavi at 982)를 태운다
+    verifyCmd: 'exit 1', // verify 루프 진입용(non-null이면 됨) — 실패 자체는 #2가 verifyInDir 목으로 만든다
     isGit: true,
   })
 })
@@ -143,6 +144,8 @@ describe('cancelTask — clarify 단계 취소 부활 레이스(#1)', () => {
 describe('interruptTask — verify 재시도 경로 인터럽트 유실(#2)', () => {
   it('verify 재시도 runNavi 중 인터럽트가 후속 세션 resume에 반영된다(유실 금지)', async () => {
     const MARK = 'INTERRUPT_MARKER_XYZ'
+    // verify를 항상 실패시켜 재시도 경로를 태운다 — verify는 verifyInDir 경유라 목 반환값이 판정이다.
+    vi.mocked(verifyInDir).mockResolvedValue({ pass: false, tail: 'AssertionError: race verify fail' })
     vi.mocked(isNaviRunning).mockReturnValue(true) // interruptTask 게이트 통과
     vi.mocked(runNavi).mockReset()
     let injectedOnce = false
@@ -168,6 +171,7 @@ describe('interruptTask — verify 재시도 경로 인터럽트 유실(#2)', ()
     expect(carried).toBe(true)
 
     // 정리
+    vi.mocked(verifyInDir).mockResolvedValue({ pass: true, tail: '' })
     vi.mocked(isNaviRunning).mockReturnValue(false)
     vi.mocked(runNavi).mockImplementation(async () => ({ status: 'done', summary: '', questions: [] }))
   })
