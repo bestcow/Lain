@@ -39,6 +39,13 @@ $commitFile = Join-Path $install 'BUILD_COMMIT.txt'
 if ((Test-Path $commitFile) -and -not $Force) {
   $installed = (Get-Content $commitFile -Raw).Trim()
   if ($installed) {
+    # 이력 재작성(rebase·filter·.git 교체)을 하면 설치본이 기록한 커밋이 이 저장소에 없을 수 있다.
+    # 그 경우 조상 판정 자체가 불가능하므로 git fatal로 죽지 않고 사유를 알려준다.
+    & git -C $root cat-file -e "$installed^{commit}" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      $iShort = $installed.Substring(0, [Math]::Min(8, $installed.Length))
+      throw "deploy 거부: 설치본 커밋($iShort)이 이 저장소에 없음 — 이력이 재작성됐을 수 있다. 덮어써도 되는 게 확실하면 -Force."
+    }
     & git -C $root merge-base --is-ancestor $installed $head 2>$null
     if ($LASTEXITCODE -ne 0) {
       $hShort = $head.Substring(0, [Math]::Min(8, $head.Length))
