@@ -5,8 +5,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { query } from '@anthropic-ai/claude-agent-sdk'
-import { DATA_DIR, AGENT_CWD, CLAUDE_BIN } from './paths'
+import { DATA_DIR } from './paths'
 import { appendCapped } from './logfile'
 import { collectStatus } from './collectors'
 import { generateBriefing } from './briefing'
@@ -28,7 +27,7 @@ import {
   promotionStats,
   setSetting,
 } from './store'
-import { judgeQueryOptions } from './agentopts'
+import { runJudge, parseJsonBlock, isJsonObject } from './judge'
 import { runAutoBackupIfDue } from './autobackup'
 import { cleanupCheckpoints } from './rewind'
 import { buildDigest, pushManagerNotice, sendToManager, setStartupBriefing } from './manager'
@@ -56,10 +55,35 @@ export function bindScheduler(
 // B — Claude 보고 갱신(throttle). 결과는 설정에 저장(다음 시작 시 노출) + 렌더러 push.
 let lastBriefAt = 0
 const BRIEF_MIN_MS = 5 * 60_000
-async function refreshBriefing(includePrior = false): Promise<string | null> {
+const BRIEFING_HASH_KEY = 'dock_briefing_hash'
+
+// #15 — 브리핑 입력 지문: generateBriefing이 읽는 결정론 현황 중 '브리핑 문면을 바꾸는 신호'만 추려
+// 해시한다(autoPriority의 wake 스냅샷과 같은 취지 — 타임스탬프·dirty 줄수 잡변동으로 churn하지 않게).
+// 작업 상태 전이·프로젝트 testState·dirty 유무·승인 수가 바뀌면 해시가 바뀐다.
+function briefingInputHash(): string {
+  const sig = [
+    listProjects()
+      .filter((p) => !p.muted)
+      .map((p) => `${p.id}:${p.status?.testState ?? 'unknown'}:${(p.status?.dirtyFiles ?? 0) > 0 ? 1 : 0}`)
+      .join('|'),
+    listTasks()
+      .map((t) => `${t.id}:${t.state}`)
+      .join('|'),
+    String(listApprovals().length),
+  ].join('\n')
+  return crypto.createHash('sha1').update(sig).digest('hex')
+}
+
+/** (export는 테스트용 — 프로덕션 진입점은 runScanOnce·briefNow뿐)
+ *  #15 상태 해시 가드: 현황 무변화면 judge 콜을 스킵한다 — 주기 틱마다 도는 유일한 상시 LLM 낭비
+ *  (~144회/일) 차단. 시작 브리핑(briefNow·includePrior=true)은 가드 제외 — 재시작 연속성은 항상 새로. */
+export async function refreshBriefing(includePrior = false): Promise<string | null> {
   const now = Date.now()
   if (now - lastBriefAt < BRIEF_MIN_MS) return null
   lastBriefAt = now
+  const hash = briefingInputHash()
+  if (!includePrior && getSetting(BRIEFING_HASH_KEY) === hash) return null // 무변화 → judge 스킵
+  setSetting(BRIEFING_HASH_KEY, hash) // autoPriority 해시가드 동형 — 생성 실패해도 같은 상태로 재호출 안 함
   const text = await generateBriefing({ includePrior })
   if (text) {
     setSetting('dock_briefing', text)
@@ -220,14 +244,11 @@ async function autoPriority(): Promise<void> {
   const hash = crypto.createHash('sha1').update(digest).digest('hex')
   if (getSetting(DIGEST_HASH_KEY) === hash) return
   setSetting(DIGEST_HASH_KEY, hash) // 판단 실패해도 같은 상태로 재호출하지 않음
-  // 판정 SDK가 무응답(네트워크 정체 등)이어도 runScanOnce의 running을 영구 점유해 주기 스캔을
-  // 죽이지 않도록 60초 abort 타임아웃을 건다. 타임아웃 = 그냥 이번 보고 생략(치명적 아님).
-  const ac = new AbortController()
-  const killTimer = setTimeout(() => ac.abort(), 60_000)
+  // judge 1콜(#8 공용 러너 — 60초 abort 내장). 판정 SDK가 무응답이어도 runScanOnce의 running을 영구
+  // 점유해 주기 스캔을 죽이지 않는다. 실패·타임아웃 = 그냥 이번 보고 생략(치명적 아님).
   try {
-    let last = ''
-    const stream = query({
-      prompt: `너는 lain의 관리자다. 아래는 주기 스캔으로 갱신된 프로젝트 현황 다이제스트다.
+    const last = await runJudge(
+      `너는 lain의 관리자다. 아래는 주기 스캔으로 갱신된 프로젝트 현황 다이제스트다.
 사용자가 지금 알아야 할 우선순위 변화(새 TASK.md, 테스트 깨짐, 방치된 dirty, 결재 대기 등)가 있으면 2-3문장으로 짚어라. 특별한 변화가 없으면 보고하지 마라.
 
 <status-digest>
@@ -238,40 +259,18 @@ JSON 한 블록만 출력:
 \`\`\`json
 {"report": true|false, "urgent": true|false, "message": "<report=true일 때 사용자에게 보일 우선순위 보고>"}
 \`\`\``,
-      options: {
-        cwd: AGENT_CWD,
-        allowedTools: [],
-        maxTurns: 2,
-        ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
-        abortController: ac,
-        executable: 'node',
-        pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
-        stderr: (d: string) =>
-          appendCapped(path.join(DATA_DIR, 'scheduler-stderr.log'), d),
-      },
-    })
-    for await (const msg of stream) {
-      if (msg.type === 'assistant') {
-        const t = (msg.message?.content ?? [])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('')
-        if (t) last = t
-      }
-    }
-    const m = last.match(/```json\s*([\s\S]*?)```/)
-    if (!m) return
-    const obj = JSON.parse(m[1])
+      { stderr: (d: string) => appendCapped(path.join(DATA_DIR, 'scheduler-stderr.log'), d) },
+    )
+    const obj = parseJsonBlock(last, isJsonObject)
+    if (!obj) return
     if (obj.report && obj.message) {
-      const text = `[자동 우선순위] ${obj.message}`
+      const text = `[자동 우선순위] ${String(obj.message)}`
       addMessage('manager', 'assistant', text)
       emitChat({ kind: 'assistant', text })
       if (obj.urgent) notifyUser('lain — 우선순위', String(obj.message).slice(0, 120))
     }
   } catch {
     /* 판단 실패는 치명적이지 않음 — 다음 변화 때 재시도 */
-  } finally {
-    clearTimeout(killTimer)
   }
 }
 
@@ -289,8 +288,6 @@ async function consolidateLessons(): Promise<void> {
   const hash = sig(candidates)
   if (getSetting(CURATOR_HASH_KEY) === hash) return // 변화 없으면 재판정 안 함
   setSetting(CURATOR_HASH_KEY, hash) // 실패해도 같은 입력 반복 호출 방지
-  const ac = new AbortController()
-  const killTimer = setTimeout(() => ac.abort(), 60_000)
   try {
     const list = candidates
       .map(
@@ -298,9 +295,9 @@ async function consolidateLessons(): Promise<void> {
           `[L${l.id}] (scope:${l.scope}/project:${l.projectId}${l.trigger ? ` · ${l.trigger}` : ''} · use:${l.reuseCount} last:${l.lastUsedAt ? l.lastUsedAt.slice(0, 10) : 'never'}) ${l.lesson}`,
       )
       .join('\n')
-    let last = ''
-    const stream = query({
-      prompt: `너는 lain의 학습 큐레이터다. 아래는 Navi들이 검증된 작업에서 누적한 학습 목록이다(use=재사용 횟수, last=마지막 주입일).
+    // judge 1콜(#8 공용 러너 — 60초 abort 내장). 실패·타임아웃·파싱 불능 = 이번 정비 생략(무해).
+    const last = await runJudge(
+      `너는 lain의 학습 큐레이터다. 아래는 Navi들이 검증된 작업에서 누적한 학습 목록이다(use=재사용 횟수, last=마지막 주입일).
 **같은 project**의 **같은 작업 클래스**(빌드·테스트·배포·도구 사용 등) 안에서, 한쪽이 다른 쪽의 하위집합이거나 같은 함정을 가리키는 학습 군만 umbrella 후보다.
 규칙:
 - 정말 중복·하위집합·같은 함정일 때만 통합한다. 작업 클래스가 다르거나 무관한 학습은 **절대** 합치지 마라.
@@ -316,29 +313,10 @@ JSON 한 블록만 출력:
 \`\`\`json
 {"merges": [{"archive_ids": [번호…], "umbrella": {"project_id": "<합쳐지는 학습들의 project>", "scope": "project|global", "trigger": "<적용 힌트>", "lesson": "<통합 학습>"}}], "retires": [정정으로 무효화된 옛 학습 번호…]}
 \`\`\``,
-      options: {
-        cwd: AGENT_CWD,
-        allowedTools: [],
-        maxTurns: 2,
-        ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
-        abortController: ac,
-        executable: 'node',
-        pathToClaudeCodeExecutable: CLAUDE_BIN,
-        stderr: (d: string) => appendCapped(path.join(DATA_DIR, 'scheduler-stderr.log'), d),
-      },
-    })
-    for await (const msg of stream) {
-      if (msg.type === 'assistant') {
-        const t = (msg.message?.content ?? [])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('')
-        if (t) last = t
-      }
-    }
-    const m = last.match(/```json\s*([\s\S]*?)```/)
-    if (!m) return
-    const obj = JSON.parse(m[1])
+      { stderr: (d: string) => appendCapped(path.join(DATA_DIR, 'scheduler-stderr.log'), d) },
+    )
+    const obj = parseJsonBlock(last, isJsonObject)
+    if (!obj) return
     const merges = Array.isArray(obj.merges) ? obj.merges.slice(0, 3) : [] // 한 틱 최대 3병합
     const candidateIds = new Set(candidates.map((l) => l.id))
     let archivedTotal = 0
@@ -380,8 +358,6 @@ JSON 한 블록만 출력:
     }
   } catch {
     /* 판단 실패는 치명적 아님 — 다음 변화 때 재시도 */
-  } finally {
-    clearTimeout(killTimer)
   }
 }
 
@@ -489,16 +465,30 @@ function dispatchDueRoutines(): void {
   }
 }
 
+// #15 — routines 전용 경량 틱(60초). listDueRoutines SQL 1건 확인(LLM 0)이라 상시 돌려도 무해.
+let routineTimer: ReturnType<typeof setInterval> | null = null
+const ROUTINE_TICK_MS = 60_000
+
 /** settings.scanIntervalMin 기준으로 타이머 재장전 (0 = 끔). 설정 변경 시마다 호출. */
 export function rearmScheduler(): void {
   if (timer) clearInterval(timer)
   timer = null
   const min = getSettings().scanIntervalMin
   if (min > 0) timer = setInterval(() => void runScanOnce(), min * 60_000)
+  // #15 — routines를 스캔 틱에서 분리: scanIntervalMin=0이면 루틴이 조용히 죽고, cron 정밀도가 스캔
+  // 간격으로 뭉개지던 문제. opt-in(routinesEnabled)은 틱 안에서 판정 — ipc는 scanIntervalMin 변경에만
+  // rearm하므로, 설정 토글이 rearm 없이 다음 틱부터 반영되게 한다. runScanOnce의 기존 디스패치는
+  // 유지 — markRoutineRan이 next_run_at을 다음 cron 시각으로 전진시켜 중복 실행을 차단한다.
+  if (routineTimer) clearInterval(routineTimer)
+  routineTimer = setInterval(() => {
+    if (getSettings().routinesEnabled) dispatchDueRoutines()
+  }, ROUTINE_TICK_MS)
 }
 
 /** 앱 종료 시 주기 스캔 타이머 정지 — 닫히는 DB에 스캔 결과를 쓰려는 늦은 tick 차단(종료 시퀀스). */
 export function stopScheduler(): void {
   if (timer) clearInterval(timer)
   timer = null
+  if (routineTimer) clearInterval(routineTimer)
+  routineTimer = null
 }

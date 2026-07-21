@@ -1,10 +1,9 @@
 // 오케스트레이터 (PLAN.md §8) — task 상태머신과 실행 흐름.
 // TASK.md 로드 → 관리자 명확화 → worktree 격리 Navi → verify → review → 사람 결정.
-import { query } from '@anthropic-ai/claude-agent-sdk'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { DATA_DIR, AGENT_CWD, CLAUDE_BIN } from './paths'
+import { DATA_DIR } from './paths'
 import {
   activeTaskCountForProject,
   getProject,
@@ -42,7 +41,7 @@ import { runNavi, abortNavi, waitApproval, isNaviRunning, approvalTimeoutMs, isA
 import { codexStatus } from './codex'
 import { engineCapabilities } from './engines'
 import { saveStatus } from './store'
-import { judgeQueryOptions } from './agentopts'
+import { runJudge, parseJsonBlock, isJsonObject } from './judge'
 import { buildPostmortemPrompt, parsePostmortem } from './postmortem'
 import { runAudit, type AuditVerdict } from './audit'
 import { REWORK_MAX, canRework, buildReworkPrompt } from './rework'
@@ -111,15 +110,10 @@ interface Elicited {
   autoGradable: boolean
 }
 async function elicit(content: string): Promise<Elicited> {
-  // 판정 SDK 무응답(네트워크 정체 등)에 60초 abort — 없으면 task가 clarifying에 영구 고착되고
-  // 그 상태가 동시성 슬롯을 세므로 몇 개 쌓이면 큐 전체가 기아가 된다(scheduler judge와 동일 패턴).
-  // 타임아웃 = 기준 없이 진행(게이트가 진행을 막지 않게 — 기존 catch 폴백과 동일 경로).
-  const ac = new AbortController()
-  const killTimer = setTimeout(() => ac.abort(), 60_000)
-  try {
-    let last = ''
-    const stream = query({
-      prompt: `너는 lain의 elicitation 게이트다(§21.3). 아래 작업 지시서를 *실행하지 말고*, 요구사항을 하나씩 "합격/불합격을 확인할 수 있는 구체적 기준(테스트·체크)"으로 적어본다.
+  // judge 1콜(#8 공용 러너 — 60초 abort 내장). 무응답이면 task가 clarifying에 영구 고착되고 그 상태가
+  // 동시성 슬롯을 세므로 몇 개 쌓이면 큐 전체가 기아가 된다(scheduler judge와 동일 패턴).
+  // 실패·타임아웃·파싱 불능 = 기준 없이 진행(게이트가 진행을 막지 않게 — 무해 폴백).
+  const last = await runJudge(`너는 lain의 elicitation 게이트다(§21.3). 아래 작업 지시서를 *실행하지 말고*, 요구사항을 하나씩 "합격/불합격을 확인할 수 있는 구체적 기준(테스트·체크)"으로 적어본다.
 
 규칙:
 - 확인 가능한 기준으로 적히면 criteria에 넣는다. (예: "npm test 통과", "buttonX 클릭 시 모달 열림", "sum(2,3)===5", "/health가 200")
@@ -133,39 +127,14 @@ ${content}
 JSON 한 블록만 출력:
 \`\`\`json
 {"criteria": ["확인 가능한 합격 기준"], "questions": ["테스트로 못 적는 모호한 지점만"], "autoGradable": true|false}
-\`\`\``,
-      options: {
-        cwd: AGENT_CWD,
-        allowedTools: [],
-        maxTurns: 2,
-        ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
-        abortController: ac,
-        executable: 'node',
-        pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
-      },
-    })
-    for await (const msg of stream) {
-      if (msg.type === 'assistant') {
-        const t = (msg.message?.content ?? [])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('')
-        if (t) last = t
-      }
+\`\`\``)
+  const obj = parseJsonBlock(last, isJsonObject)
+  if (obj) {
+    return {
+      criteria: Array.isArray(obj.criteria) ? obj.criteria.map(String) : [],
+      questions: Array.isArray(obj.questions) ? obj.questions.map(String) : [],
+      autoGradable: !!obj.autoGradable,
     }
-    const m = last.match(/```json\s*([\s\S]*?)```/)
-    if (m) {
-      const obj = JSON.parse(m[1])
-      return {
-        criteria: Array.isArray(obj.criteria) ? obj.criteria.map(String) : [],
-        questions: Array.isArray(obj.questions) ? obj.questions.map(String) : [],
-        autoGradable: !!obj.autoGradable,
-      }
-    }
-  } catch {
-    /* 판정 실패 → 기준 없이 진행 (게이트가 진행을 막지 않게) */
-  } finally {
-    clearTimeout(killTimer)
   }
   return { criteria: [], questions: [], autoGradable: false }
 }
@@ -635,14 +604,9 @@ export function recoverTasks(): number {
 function makeAskManager(taskId: string): (question: string) => Promise<string> {
   return async (question: string) => {
     const task = getTask(taskId)
-    // 1) 관리자가 답할 수 있으면 즉답 — 판정 SDK 무응답에 60초 abort(없으면 ask_manager를 기다리는
-    // Navi가 영구 대기). 타임아웃 = 즉답 포기하고 사용자 에스컬레이션(기존 catch 폴백과 동일 경로).
-    const ac = new AbortController()
-    const killTimer = setTimeout(() => ac.abort(), 60_000)
-    try {
-      let last = ''
-      const stream = query({
-        prompt: `Navi가 작업 중 질문을 보냈다. 네가 작업 지시서만으로 확실히 답할 수 있으면 답하고, 사용자의 의도·취향·결정이 필요하면 escalate해라.
+    // 1) 관리자가 답할 수 있으면 즉답 — judge 1콜(#8 공용 러너 — 60초 abort 내장, 없으면 ask_manager를
+    // 기다리는 Navi가 영구 대기). 실패·타임아웃·파싱 불능 = 즉답 포기하고 사용자 에스컬레이션(무해 폴백).
+    const last = await runJudge(`Navi가 작업 중 질문을 보냈다. 네가 작업 지시서만으로 확실히 답할 수 있으면 답하고, 사용자의 의도·취향·결정이 필요하면 escalate해라.
 
 <task>
 ${task?.content ?? ''}
@@ -655,38 +619,11 @@ ${question}
 JSON 한 블록만 출력:
 \`\`\`json
 {"escalate": true|false, "answer": "<escalate=false일 때 Navi에게 줄 답>"}
-\`\`\``,
-        options: {
-          cwd: AGENT_CWD,
-          allowedTools: [],
-          maxTurns: 2,
-          ...judgeQueryOptions(), // §9b — 짧은 판정류(local 라우팅 + D7 사용량 가드 강등)
-          abortController: ac,
-          executable: 'node',
-          pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
-        },
-      })
-      for await (const msg of stream) {
-        if (msg.type === 'assistant') {
-          const t = (msg.message?.content ?? [])
-            .filter((b: any) => b.type === 'text')
-            .map((b: any) => b.text)
-            .join('')
-          if (t) last = t
-        }
-      }
-      const m = last.match(/```json\s*([\s\S]*?)```/)
-      if (m) {
-        const obj = JSON.parse(m[1])
-        if (!obj.escalate && obj.answer) {
-          log(taskId, 'status', `관리자 즉답: ${String(obj.answer).slice(0, 120)}`)
-          return `[lain] ${obj.answer}`
-        }
-      }
-    } catch {
-      /* 관리자 판정 실패 → 사용자로 */
-    } finally {
-      clearTimeout(killTimer)
+\`\`\``)
+    const obj = parseJsonBlock(last, isJsonObject)
+    if (obj && !obj.escalate && obj.answer) {
+      log(taskId, 'status', `관리자 즉답: ${String(obj.answer).slice(0, 120)}`)
+      return `[lain] ${String(obj.answer)}`
     }
     // 2) 사용자 에스컬레이션 — question 카드
     const approvalId = insertApproval(taskId, 'question', question)
@@ -1156,7 +1093,6 @@ async function finishWork(taskId: string, firstReport: FinishReport): Promise<vo
 async function reflect(taskId: string): Promise<void> {
   const task = getTask(taskId)
   if (!task) return
-  let last = ''
   // 회고가 본 주입 학습(§8) — judge가 'cited_lesson_ids'로 인용해 계보를 추적하게 한다.
   const injected = lessonsForProject(task.projectId, 8, task.content)
   const injectedBlock = injected.length
@@ -1164,11 +1100,8 @@ async function reflect(taskId: string): Promise<void> {
         .map((l) => `[L${l.id}] (${l.scope}) ${l.trigger ? l.trigger + ' → ' : ''}${l.lesson}`)
         .join('\n')}\n</injected-lessons>`
     : ''
-  // 판정 SDK 무응답에 60초 abort — 호출부가 fire-and-forget(.catch 로그)이라 throw해도 안전.
-  const reflectAbort = new AbortController()
-  const reflectKill = setTimeout(() => reflectAbort.abort(), 60_000)
-  const stream = query({
-    prompt: `너는 lain의 회고 담당이다. 방금 검증(테스트)을 통과한 작업에서, **이 프로젝트의 이후 작업에 재사용할 수 있는 학습**을 0~2건 뽑아라.
+  // judge 1콜(#8 공용 러너 — 60초 abort 내장). 실패(null)면 학습 없이 종료 — 무해 폴백.
+  const last = await runJudge(`너는 lain의 회고 담당이다. 방금 검증(테스트)을 통과한 작업에서, **이 프로젝트의 이후 작업에 재사용할 수 있는 학습**을 0~2건 뽑아라.
 좋은 학습 예: 프로젝트 컨벤션(파일명·디렉터리 구조·도구·명령), 검증을 통과시키는 데 필요했던 비자명한 단계, 이 repo 특유의 제약.
 
 이 학습들은 다음 Navi의 프롬프트에 그대로 주입된다 — 잘못 적으면 미래의 Navi가 시도도 안 하고 거부(self-refusal)하게 굳는다. 다음은 **학습이 아니다. 절대 만들지 마라**:
@@ -1195,40 +1128,14 @@ JSON 한 블록만:
 {"lessons": [{"scope": "project|global", "trigger": "<언제 적용되나, 키워드>", "lesson": "<재사용 학습 한두 문장>", "cited_lesson_ids": [<이 학습을 도출하는 데 실제 도움된 주입 학습 L번호들, 없으면 빈배열>]}]}
 \`\`\`
 - scope: 이 repo 한정이면 project, 어떤 프로젝트에도 통하는 일반 원칙이면 global.
-- cited_lesson_ids: 위 injected-lessons 중 이번 작업에 실제로 도움이 된 것의 L번호만. 추측 금지, 없으면 [].`,
-    options: {
-      cwd: AGENT_CWD,
-      allowedTools: [],
-      maxTurns: 2,
-      ...judgeQueryOptions(), // §9b 판정류(local 라우팅 + D7 사용량 가드 강등)
-      abortController: reflectAbort,
-      executable: 'node',
-      pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
-    },
-  })
-  try {
-    for await (const msg of stream) {
-      if (msg.type === 'assistant') {
-        const t = (msg.message?.content ?? [])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('')
-        if (t) last = t
-      }
-    }
-  } finally {
-    clearTimeout(reflectKill)
-  }
-  const m = last.match(/```json\s*([\s\S]*?)```/)
-  if (!m) {
-    log(taskId, 'status', `자기개선 회고: JSON 블록 없음 (응답 ${last.length}자)`)
+- cited_lesson_ids: 위 injected-lessons 중 이번 작업에 실제로 도움이 된 것의 L번호만. 추측 금지, 없으면 [].`)
+  if (last === null) {
+    log(taskId, 'status', '자기개선 회고 실패: judge 무응답/타임아웃')
     return
   }
-  let obj: any
-  try {
-    obj = JSON.parse(m[1])
-  } catch {
-    log(taskId, 'status', '자기개선 회고: JSON 파싱 실패')
+  const obj = parseJsonBlock(last, isJsonObject)
+  if (!obj) {
+    log(taskId, 'status', `자기개선 회고: JSON 블록 없음/파싱 실패 (응답 ${last.length}자)`)
     return
   }
   const lessons = Array.isArray(obj.lessons) ? obj.lessons : []
@@ -1271,36 +1178,9 @@ JSON 한 블록만:
 async function reflectFailure(taskId: string, kind: 'verify' | 'error' | 'blocked', detail: string): Promise<void> {
   const task = getTask(taskId)
   if (!task) return
-  let last = ''
-  // 판정 SDK 무응답에 60초 abort — 호출부가 fire-and-forget(.catch 무시)이라 throw해도 안전.
-  const abort = new AbortController()
-  const kill = setTimeout(() => abort.abort(), 60_000)
-  const stream = query({
-    prompt: buildPostmortemPrompt(task.title, kind, detail),
-    options: {
-      cwd: AGENT_CWD,
-      allowedTools: [],
-      maxTurns: 2,
-      ...judgeQueryOptions(), // §9b 판정류(local 라우팅 + D7 사용량 가드 강등)
-      abortController: abort,
-      executable: 'node',
-      pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
-    },
-  })
-  try {
-    for await (const msg of stream) {
-      if (msg.type === 'assistant') {
-        const t = (msg.message?.content ?? [])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('')
-        if (t) last = t
-      }
-    }
-  } finally {
-    clearTimeout(kill)
-  }
-  const lesson = parsePostmortem(last)
+  // judge 1콜(#8 공용 러너 — 60초 abort 내장). 실패(null)는 조용히 무시 — fire-and-forget 전제 유지.
+  const last = await runJudge(buildPostmortemPrompt(task.title, kind, detail))
+  const lesson = parsePostmortem(last ?? '')
   if (!lesson) return
   insertLesson({ projectId: task.projectId, taskId, scope: 'project', trigger: `실패(${kind})`, lesson, origin: 'agent' })
   log(taskId, 'status', `실패 회고(L2): ${lesson}`)
@@ -1457,6 +1337,18 @@ export async function resolveReview(
       return `재작업 상한(${REWORK_MAX}회) 도달 — 병합/보류/폐기로 결정하세요`
     }
     const round = (task.reworkCount ?? 0) + 1
+    // #9 — 사람 지적 코멘트를 프롬프트 소비로 끝내지 않고 학습으로 영속(LLM 0콜). origin='user'라
+    // curator 폐기 대상에서 제외되고, 기존 lessons 주입 경로(lessonsBlock)가 다음 작업에 자동 태운다.
+    if (comment?.trim()) {
+      insertLesson({
+        projectId: task.projectId,
+        taskId,
+        scope: 'project',
+        trigger: `재작업 지적(${task.title})`,
+        lesson: comment.trim(),
+        origin: 'user',
+      })
+    }
     // 이전 라운드 심사 판정을 비워둔다 — 재작업 후 verify가 실패해 audit을 건너뛰면(위 T14 게이트) 갱신 기회가
     // 없어 결재 화면(TaskDrawer 체크리스트)에 지난 라운드 ✗가 그대로 남는다(falsy 클리어 관례, rowToTask 참고).
     setState(taskId, 'working', { reworkCount: round, auditResult: '' })

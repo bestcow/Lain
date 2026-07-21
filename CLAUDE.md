@@ -40,7 +40,7 @@ Phase 0~3 + autonomous 첫 슬라이스(§21)까지 구현됨 — 작업 실행(
 
 ## 컨벤션
 
-- 결정론적 배관은 코드, 판단은 Claude (PLAN.md §4). L0에 LLM 호출 넣지 않는다 — manager.ts만 SDK 사용.
+- 결정론적 배관은 코드, 판단은 Claude (PLAN.md §4). LLM 호출은 ① 세션 본체(manager·worker·navichat) ② judge 지점(judge.ts 러너 경유 — 60s abort·maxTurns 2·실패 무해 폴백)만 허용. 결정론 배관 모듈(store·worktree·registry·collectors·safety·ipc·usage 등)엔 금지.
 - IPC 채널 추가 시: ipc.ts(핸들러) + preload/index.ts + shared/types.ts(LainApi) 세 곳 동기화.
 - Agent SDK 옵션은 추측 금지 — PLAN.md §18 체크리스트로 실측 후 사용.
 - 시크릿·.env 값을 로그/다이제스트에 남기지 않는다 (PLAN.md §9-6).

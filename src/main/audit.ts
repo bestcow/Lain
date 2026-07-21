@@ -3,13 +3,11 @@
 // 단위테스트 대상, LLM·git 호출부(모듈 내부 auditTask)는 진입점 runAudit을 거쳐 orchestrator의
 // finishWork가 verify 통과 후에만 호출한다.
 //
-// ⚠ auditTask는 명시 승인된 judge 지점(L1) — L0 결정론 코어가 아니라 판정 단계라 SDK query()를 쓴다
-// (reflect/reflectFailure와 동형). L0 배관에 LLM을 넣지 않는다는 컨벤션의 명시적 예외.
-import { query } from '@anthropic-ai/claude-agent-sdk'
+// ⚠ auditTask는 명시 승인된 judge 지점(L1) — L0 결정론 코어가 아니라 판정 단계라 LLM을 쓴다
+// (reflect/reflectFailure와 동형, judge.ts 러너 경유 — 60s abort·maxTurns 2·실패 무해 폴백).
 import { exec } from 'node:child_process'
 import { promisify } from 'node:util'
-import { AGENT_CWD, CLAUDE_BIN } from './paths'
-import { judgeQueryOptions } from './agentopts'
+import { runJudge } from './judge'
 import type { Task, ReviewDepth } from '../shared/types'
 
 const execP = promisify(exec)
@@ -81,42 +79,6 @@ export function parseAuditVerdict(text: string): AuditVerdict | null {
   }
 }
 
-// judge 1콜 — reflect/reflectFailure와 동일 골격(짧은 판정, 도구 없음, 60초 abort, 로컬 라우팅).
-// 무응답/타임아웃/throw면 null → 호출부에서 심사 불능=통과 취급.
-async function runAuditJudge(prompt: string): Promise<string | null> {
-  const abort = new AbortController()
-  const kill = setTimeout(() => abort.abort(), 60_000)
-  let last = ''
-  try {
-    const stream = query({
-      prompt,
-      options: {
-        cwd: AGENT_CWD,
-        allowedTools: [],
-        maxTurns: 2,
-        ...judgeQueryOptions(), // §9b 판정류(local 라우팅 + D7 사용량 가드 강등)
-        abortController: abort,
-        executable: 'node',
-        pathToClaudeCodeExecutable: CLAUDE_BIN, // 패키징본: asar.unpacked 네이티브 바이너리 경로 명시
-      },
-    })
-    for await (const msg of stream) {
-      if (msg.type === 'assistant') {
-        const t = (msg.message?.content ?? [])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('')
-        if (t) last = t
-      }
-    }
-  } catch {
-    return null
-  } finally {
-    clearTimeout(kill)
-  }
-  return last
-}
-
 /** 독립 완료 심사 — worktree의 실제 diff와 완료 조건·자기보고를 judge로 대조한다.
  *  반환: 판정(AuditVerdict) 또는 null(심사 불능 — git diff 실패 등 → 호출부는 통과 취급, 흐름 막지 않기).
  *  git diff base: 병합 시점에만 채워지는 mergeBaseSha는 심사 시점(병합 전)엔 보통 null → 'main' 기준.
@@ -144,7 +106,8 @@ async function auditTask(task: Task, worktreePath: string, lens?: string): Promi
   // 구버전 작업(criteria 컬럼 없음)·content만 남은 경우의 하위호환 폴백.
   const criteria = task.criteria?.length ? task.criteria : extractCriteria(task.content)
   const prompt = buildAuditPrompt(task.content, criteria, stat, task.summary ?? '', lens)
-  const text = await runAuditJudge(prompt)
+  // judge 1콜(#8 공용 러너) — 짧은 판정·도구 없음·60초 abort. 무응답/타임아웃/throw면 null → 심사 불능=통과 취급.
+  const text = await runJudge(prompt)
   if (text === null) return null
   return parseAuditVerdict(text)
 }

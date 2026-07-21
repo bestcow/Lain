@@ -67,6 +67,7 @@ import {
   activeTaskForProject,
   queuedTasks,
   saveSettings,
+  lessonsForProject,
 } from '../../src/main/store'
 import {
   startTask,
@@ -782,5 +783,43 @@ describe('cancelTask — 인터럽트 in-flight 취소 레이스(#3)', () => {
     // 복원(다른 테스트 오염 방지)
     vi.mocked(isNaviRunning).mockReturnValue(false)
     vi.mocked(runNavi).mockImplementation(async () => ({ status: 'done', summary: '', questions: [] }))
+  })
+})
+
+// #9 — rework 코멘트 학습 영속: resolveReview rework의 사람 지적이 프롬프트 소비로 끝나지 않고
+// origin='user' 학습으로 남는다(LLM 0콜 — 기존 lessons 주입 경로가 다음 작업에 자동 태운다).
+describe('resolveReview rework — 지적 코멘트 학습 영속(#9)', () => {
+  const LP = 'test-proj-rework-lesson'
+  // rework는 void launch2(백그라운드 재작업)를 발사한다 — 테스트 종료 후 비동기 잔류를 막기 위해
+  // working을 벗어날 때까지 폴링(예산 게이트 테스트의 flush와 동형).
+  const settle = async (taskId: string) => {
+    const start = Date.now()
+    while (getTask(taskId)?.state === 'working' && Date.now() - start < 3000) {
+      await new Promise((res) => setTimeout(res, 20))
+    }
+  }
+  beforeAll(() => {
+    upsertProject({ id: LP, path: os.tmpdir(), name: 'rework-lesson', stack: '', verifyCmd: null, isGit: true })
+  })
+
+  it('rework 코멘트가 origin=user 학습으로 저장된다(작업 제목이 trigger 근거)', async () => {
+    insertTask({ id: 'rl-task', projectId: LP, title: '버튼 모달 구현', state: 'review', content: 'c' })
+    updateTask('rl-task', { worktreePath: os.tmpdir(), branch: 'rl-branch' })
+    const res = await resolveReview('rl-task', 'rework', '모달 닫힘 처리가 빠졌다')
+    expect(res).toContain('재작업')
+    const saved = lessonsForProject(LP, 8).find((l) => l.lesson.includes('모달 닫힘 처리가 빠졌다'))
+    expect(saved).toBeTruthy()
+    expect(saved!.origin).toBe('user') // curator 폐기 대상 제외(§24)
+    expect(saved!.taskId).toBe('rl-task')
+    expect(saved!.trigger).toContain('버튼 모달 구현')
+    await settle('rl-task')
+  })
+
+  it('빈 코멘트 rework는 학습을 남기지 않는다', async () => {
+    insertTask({ id: 'rl-task2', projectId: LP, title: '빈 코멘트', state: 'review', content: 'c' })
+    updateTask('rl-task2', { worktreePath: os.tmpdir(), branch: 'rl-branch2' })
+    await resolveReview('rl-task2', 'rework', '   ')
+    expect(lessonsForProject(LP, 8).filter((l) => l.origin === 'user')).toHaveLength(1) // 앞 테스트 1건뿐
+    await settle('rl-task2')
   })
 })
