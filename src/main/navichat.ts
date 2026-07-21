@@ -32,14 +32,13 @@ import {
   touchConversation,
   needsAutoTitle,
 } from './store'
-import { tierQueryOptions } from './agentopts'
+import { preToolUseGuard, secretDeny, tierQueryOptions } from './agentopts'
 import { summarizeConversationTitle } from './title'
 import { RISKY, sumUsageTokens, waitApproval } from './worker'
 import { workspaceRoot } from './registry'
 import { answerClarify, interruptTask } from './orchestrator'
 import { notifyUser } from './notify'
 import { classifySystemDestructive } from './sysrisk'
-import { blocksSecretFile, toolFilePath, SECRET_DENY_MESSAGE } from './safety'
 import { shouldCompact, contextOccupancyTokens } from './compactgate'
 import { summarizeNaviHandoff, handoffBlock } from './handoff'
 import { skillOptions } from './skills'
@@ -304,14 +303,21 @@ export async function sendToNavi(
             path.join(DATA_DIR, `workerchat-${projectId.replaceAll('/', '_')}-stderr.log`),
             d,
           ),
+        // 비밀 파일 데노리스트 (§24 Phase1) — Navi 채팅은 원본 프로젝트 경로(cwd)에서 돌아 노출면이 크다.
+        // canUseTool이 아니라 PreToolUse 훅에 둔다: auto-allow된 호출(기본 허용 Read, acceptEdits의
+        // Edit/Write)은 canUseTool을 아예 거치지 않아 차단이 발동하지 않았다(실측 — manager/worker 동형).
+        ...preToolUseGuard(secretDeny, (_toolName, d) => {
+          const text = `secret 차단: ${d.detail}`
+          addNaviMessage(projectId, 'tool', text, conversationId)
+          emit({ projectId, kind: 'tool', text })
+        }),
         canUseTool: async (toolName, input) => {
           const cmd = String((input as any)?.command ?? '')
-          // 비밀 파일 데노리스트 (§24 Phase1) — Navi 채팅도 파일 도구로 시크릿을 못 끌어오게.
-          if (blocksSecretFile(toolName, input)) {
-            const text = `secret 차단: 비밀 파일 접근 거부 (${path.basename(toolFilePath(input))})`
-            addNaviMessage(projectId, 'tool', text)
-            emit({ projectId, kind: 'tool', text })
-            return { behavior: 'deny', message: SECRET_DENY_MESSAGE }
+          // 시크릿 차단은 PreToolUse 훅이 이미 했다(모든 호출 경유). 여기 한 번 더 보는 것은
+          // 훅이 어떤 이유로 등록되지 않았을 때를 위한 이중 방어 — 순수 판정이라 비용 0(manager 동형).
+          const secret = secretDeny(toolName, input)
+          if (secret) {
+            return { behavior: 'deny', message: secret.message }
           }
           if (toolName === 'Bash' || toolName === 'PowerShell') {
             // 시스템/PC 파괴(sysrisk.ts) — 항상 사람 승인(예외 없음).
@@ -335,8 +341,9 @@ export async function sendToNavi(
               return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
             }
             const root = workspaceRoot() // E6 — 유효 워크스페이스 루트(UI/env) 반영
+            // A1 — 백슬래시 표기만 잡으면 `cat C:/...`(포워드슬래시)로 우회된다 → [\\/]로 확대.
             const outside =
-              /[A-Za-z]:\\/.test(cmd) && !cmd.toUpperCase().includes(root.toUpperCase())
+              /[A-Za-z]:[\\/]/.test(cmd) && !cmd.toUpperCase().includes(root.toUpperCase())
             const risky = RISKY.find((r) => r.re.test(cmd))
             if (risky || outside) {
               const kind = risky?.kind ?? 'outside_dev'

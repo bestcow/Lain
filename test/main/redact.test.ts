@@ -2,7 +2,7 @@
 //   redactSecrets — 고신뢰 credential 형상만 마스킹, 정상 텍스트 오탐 0.
 //   scanLessonInjection — origin='agent' 학습 인젝션/invisible/oversize 격리 판정.
 //   blocksSecretPath — HOME 크리덴셜 디렉터리 + lain DATA_DIR 디렉터리 단위 차단.
-//   blocksSecretCommand — 셸 명령문 토큰화 후 절대경로 토큰만 blocksSecretPath로 판정.
+//   blocksSecretCommand — 셸 명령문 토큰화 후 절대경로 토큰만 blocksSecretPath+isSecretFile로 판정.
 // electron은 vitest.config alias로 스텁(DATA_DIR = os.tmpdir()/lain-vitest 또는 LAIN_TEST_DATA_DIR).
 import { describe, it, expect } from 'vitest'
 import os from 'node:os'
@@ -220,12 +220,25 @@ describe('blocksSecretCommand — 셸 명령문 안의 절대경로 판정', () 
     expect(blocksSecretCommand(mk())).toBe(true)
   })
 
+  // A1 — 절대경로 토큰의 basename도 isSecretFile로 판정(디렉터리 데노리스트 밖 프로젝트 .env 사각 봉쇄).
+  it.each([
+    ['프로젝트 .env(백슬래시)', 'type C:\\proj\\.env'],
+    ['프로젝트 .env(포워드슬래시)', 'cat C:/proj/.env'],
+    ['POSIX 절대경로 .env', 'cat /srv/app/.env'],
+    ['SSH 개인키 basename', 'cat C:\\work\\id_rsa'],
+  ])('차단(basename 시크릿): %s', (_name, cmd) => {
+    expect(blocksSecretCommand(cmd)).toBe(true)
+  })
+
   it.each([
     'npm test',
     'git -C C:\\lain status',
     'cmd /c dir',
     'node script.js 2>/dev/null',
     'echo hi > C:\\lain\\out.txt',
+    'cat C:\\proj\\.env.example', // EXAMPLE_RE 화이트리스트 유지
+    'type C:/proj/config.sample.json',
+    'cat .env', // 상대경로는 절대경로 토큰 아님 — 파일 도구 게이트(isSecretFile) 영역
     '',
   ])('통과: %s', (cmd) => {
     expect(blocksSecretCommand(cmd)).toBe(false)

@@ -214,10 +214,13 @@ function absPathIn(token: string): string | null {
 }
 
 /**
- * 셸 명령문에 시크릿 디렉터리를 가리키는 절대경로가 섞여 있으면 true
- * (`type C:\Users\me\.ssh\id_rsa`, `cat C:/lain/data/lain.db` 등).
+ * 셸 명령문에 시크릿을 가리키는 절대경로가 섞여 있으면 true
+ * (`type C:\Users\me\.ssh\id_rsa`, `cat C:/lain/data/lain.db`, `cat C:\proj\.env` 등).
+ * 판정 2겹: 디렉터리 데노리스트(blocksSecretPath) + basename 데노리스트(isSecretFile — A1,
+ * 데노리스트 디렉터리 밖 프로젝트 `.env`류 사각 봉쇄. EXAMPLE_RE 화이트리스트는 그대로 통과).
  * blocksSecretPath는 경로 하나가 계약이라 명령문을 통째로 넘기면 항상 false다 — 호출부가
  * 오용하지 않게 여기서 토큰화(따옴표 보존)한 뒤 절대경로 토큰만 개별로 넘긴다.
+ * 상대경로 토큰은 대상 아님(파일 도구 게이트 isSecretFile 영역 — cwd 오판 방지).
  * 결정론·순수(LLM 없음).
  */
 export function blocksSecretCommand(cmd: string): boolean {
@@ -227,7 +230,7 @@ export function blocksSecretCommand(cmd: string): boolean {
   while ((m = SHELL_TOKEN_RE.exec(cmd))) {
     const token = m[1] ?? m[2] ?? m[3] ?? ''
     const p = absPathIn(token)
-    if (p && blocksSecretPath(p)) {
+    if (p && (blocksSecretPath(p) || isSecretFile(p))) {
       SHELL_TOKEN_RE.lastIndex = 0
       return true
     }
