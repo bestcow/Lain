@@ -31,7 +31,7 @@ import { classifySystemDestructive } from './sysrisk'
 import { isTestFile } from './safety'
 import { shouldCompact, contextOccupancyTokens } from './compactgate'
 import { summarizeNaviHandoff, handoffBlock, taskEventsToDialogue } from './handoff'
-import type { ExitReason, Task, TaskEngine, TaskEvent } from '../shared/types'
+import type { ExitReason, NaviMode, Task, TaskEngine, TaskEvent } from '../shared/types'
 import { isTransientApiError, transientBackoffMs, MAX_TRANSIENT_RETRIES } from './retry'
 import { skillOptions } from './skills'
 import { capTaskImages, toImageBlocks } from './taskimages'
@@ -40,7 +40,7 @@ import { conventionsBlock } from './conventions'
 import { naviSkillsBlock, isValidSkillName, readSkillBody } from './agentskills'
 import { thinkingOption, tierQueryOptions, preToolUseGuard, secretDeny } from './agentopts'
 import type { PreToolDeny } from './agentopts'
-import { recordUsage } from './usage'
+import { budgetExceeded, recordUsage } from './usage'
 import { parseTodoWriteInput, encodeTodoLine } from '../shared/todoline'
 import { shouldCheckpoint, formatCheckpoint } from './checkpoint'
 import { diffStat, commitCount } from './worktree'
@@ -75,6 +75,15 @@ export function sessionBaselineFor(
 /** baseline + 이 세션 cumulative = 라이프타임 누적. 동일세션 재갱신은 baseline이 고정이라 '교체', 새 세션은 가산. */
 export function lifetimeTokensFor(sessionBaseline: number, sessionCumulative: number): number {
   return sessionBaseline + sessionCumulative
+}
+
+/** #14 — 세션 중 예산 판정의 베이스(순수): run 시작 시점의 라이프타임 누계를 고른다.
+ *  resume 세션은 sessionBaseline(이전 세션들 누계)만으론 이 세션의 이전 run 몫(세션 cumulative)이 빠져
+ *  과소계상되므로, 저장된 tokensTotal(=baseline+지금까지 cumulative)이 정확한 베이스다. 신규/핸드오프
+ *  스왑 세션은 tokensTotal==baseline이라 동일. max로 양쪽을 커버해 이 베이스 기준의 tokensTotal 갱신이
+ *  기존 값보다 작아지는 역행이 없게 한다(legacy tokensTotal=0 행은 baseline으로 폴백). */
+export function midSessionBudgetBase(sessionBaseline: number, tokensTotal: number): number {
+  return Math.max(sessionBaseline || 0, tokensTotal || 0)
 }
 
 /** #4 크래시 복원 갭 — 핸드오프 스왑은 (handoffMd 저장 · naviSessionId='') 를 원자적으로 쓰지만, 그 새 세션의
@@ -127,6 +136,38 @@ export function isOutsideWorkspace(cmd: string, root: string): boolean {
   if (!/[A-Za-z]:[\\/]/.test(cmd)) return false
   const norm = (s: string) => s.toUpperCase().replace(/\//g, '\\')
   return !norm(cmd).includes(norm(root))
+}
+
+// #11 spec-gaming 방어 확장 — '판사 매수' 차단(순수, autonomous 한정). 기존 §21.6 방어는 테스트 파일
+// 수정만 막아, Navi가 package.json의 "scripts"를 고쳐 verify_cmd가 실행하는 명령 자체를 무력화하는
+// 우회가 열려 있었다. verify_cmd는 worktree 루트에서 실행되는 루트 npm script가 현실 기준이지만, 루트
+// 스크립트가 워크스페이스 하위 패키지 스크립트로 위임(npm -w/--prefix)할 수 있어 하위 패키지
+// package.json도 판사 정의의 일부다 → 경로 깊이 무관 파일명 package.json 전부 대상(보수적).
+// Edit는 old/new_string이 "scripts" 키 관련 문자열에 닿을 때만 deny(버전 bump 등 무관 편집은 통과),
+// Write/NotebookEdit(전체 재작성)는 scripts 포함 여부를 알 수 없어 package.json 대상 자체를 deny.
+// Bash 경유 package.json 수정 추적은 하지 않는다(기존 결정 — 과설계).
+export function scriptsTamperDeny(
+  mode: NaviMode | undefined,
+  toolName: string,
+  input: unknown,
+): PreToolDeny | null {
+  if (mode !== 'autonomous') return null
+  if (toolName !== 'Edit' && toolName !== 'Write' && toolName !== 'NotebookEdit') return null
+  const fp = String((input as any)?.file_path ?? (input as any)?.path ?? '')
+  const base = fp.split(/[\\/]/).pop()?.toLowerCase() ?? ''
+  if (base !== 'package.json') return null
+  if (toolName === 'Edit') {
+    const oldS = String((input as any)?.old_string ?? '')
+    const newS = String((input as any)?.new_string ?? '')
+    // package.json 안 편집이라 'scripts' 언급 = 사실상 scripts 블록 접근 — 오탐 비용이 낮아 보수적 판정.
+    if (!/scripts/i.test(oldS) && !/scripts/i.test(newS)) return null
+  }
+  return {
+    kind: 'spec_gaming',
+    detail: `package.json "scripts"(검증 명령 정의) 수정 거부 (${fp})`,
+    message:
+      '검증 명령 정의(package.json "scripts")는 수정할 수 없다(§21.6 — 판사를 바꾸는 우회). 검증 명령이 잘못됐다고 판단되면 고치지 말고 blocked로 보고해라.',
+  }
 }
 
 // §21.5 divergence(escalation) 정책 — autonomous Navi가 계획대로 안 풀려 위험행위에
@@ -640,6 +681,9 @@ export async function runNavi(
         }
       }
     }
+    // #11 — package.json "scripts" 변조(판사 매수) 차단. 판정은 순수 scriptsTamperDeny(autonomous 한정).
+    const scripts = scriptsTamperDeny(task.mode, toolName, input)
+    if (scripts) return scripts
     return secretDeny(toolName, input)
   }
   // 차단 1건을 glass-box에 남긴다(종전 canUseTool 경로와 동일한 exitReason/denyDetail 계약).
@@ -776,6 +820,15 @@ export async function runNavi(
   if (!resume && sessionBaseline !== (task.sessionBaseTokens ?? 0)) {
     updateTask(task.id, { sessionBaseTokens: sessionBaseline })
   }
+
+  // #14 — 세션 중 예산 상태(이 run 동안만). 예산 판정이 세션 경계(finishWork)에만 있으면 '반복은 적은데
+  // 한 번이 비싼' 단일 세션이 뚫린다 — 스트림의 assistant 분기에서 usage를 누적해 초과 즉시 abort한다.
+  // base가 이미 예산 이상인 run은 게이트를 끈다: 예산 일시정지 후 사람이 명시적으로 재개한 run을 첫
+  // assistant 메시지에서 곧장 재중단하면 재개가 영원히 불가능한 루프가 된다(경계 게이트가 done 리포트를
+  // 안 막는 C1+I5와 같은 이유 — 이 경우 판정은 경계 게이트에 맡긴다). 새 설정·새 영속 상태 없음.
+  let sessionUsage = 0
+  let budgetAborted = false
+  const budgetBase = midSessionBudgetBase(sessionBaseline, task.tokensTotal ?? 0)
 
   // 프롬프트 3분기: ①진짜 resume(세션에 규칙·히스토리 있음) ②핸드오프 스왑(새 세션 — 규칙 재공급 + 핸드오프)
   // ③신규 작업. 스왑은 resume이 끊겼지만 opts.resumePrompt는 살아있어 '이어가기'로 이어붙인다.
@@ -1093,6 +1146,23 @@ export async function runNavi(
           lastCheckpointTurn = turnsSoFar
           lastCheckpointMs = Date.now()
         }
+        // #14 — 세션 중 예산 판정: assistant 메시지 usage(API 호출 1건분, manager.ts 점유 추적과 같은
+        // message.usage)를 result(세션 종료)를 기다리지 않고 누적, 라이프타임 누적(base+세션누적)이 작업
+        // 예산(taskTokenBudget, 0=off)을 넘는 즉시 abort. abort 후엔 아래 budgetAborted 분기가 blocked
+        // 보고로 반환 → finishWork의 기존 shouldPauseForBudget→pauseForBudget(일시정지) 경로에 합류한다.
+        sessionUsage += sumUsageTokens(msg.message)
+        const budget = getSettings().taskTokenBudget
+        const lifetime = lifetimeTokensFor(budgetBase, sessionUsage)
+        if (!budgetAborted && budgetBase < budget && budgetExceeded(lifetime, budget)) {
+          budgetAborted = true
+          // abort하면 result가 안 와 기존 tokensTotal 갱신이 누락된다 — 경계 게이트(shouldPauseForBudget)가
+          // 초과값을 보도록 여기서 갱신(base ≥ run 시작 tokensTotal이라 단조 — 역행 없음).
+          updateTask(task.id, { tokensTotal: lifetime })
+          exitReason = 'blocked'
+          denyDetail = `budget: 세션 중 예산 초과 ${lifetime.toLocaleString()}/${budget.toLocaleString()} tok`
+          log('status', `토큰 예산 초과(세션 중): ${lifetime.toLocaleString()}/${budget.toLocaleString()} tok — 중단(일시정지 경로)`)
+          ac.abort()
+        }
       } else if (msg.type === 'user') {
         // i1 no-progress 축의 결과 채널: tool_result를 직전 canUseTool(toolUseID→sig)와 상관시켜
         // 같은 sig의 결과 해시를 누적한다. 같은 결과면 repeats++, 달라지면 진전으로 보고 1로 리셋.
@@ -1164,8 +1234,9 @@ export async function runNavi(
     // 그 외 에러는 호출부(launch try/catch)가 error 상태로 처리하도록 재던짐.
     if (ac.signal.aborted) {
       aborted = true
-      exitReason = 'aborted'
-      log('status', '세션 중단됨(abort)')
+      // #14 — 예산 초과 abort는 임의 중단이 아니라 일시정지행 — 트리거에서 latch한 blocked 사유를 보존.
+      if (!budgetAborted) exitReason = 'aborted'
+      log('status', budgetAborted ? '세션 중단됨(토큰 예산 초과)' : '세션 중단됨(abort)')
     } else {
       // throw 전에 exit 사유를 확정·적재한다(에러도 glass-box).
       exitReason = 'error'
@@ -1183,6 +1254,20 @@ export async function runNavi(
   const report = parseReport(lastText)
   if (!exitReason) exitReason = report?.status === 'blocked' ? 'blocked' : 'done'
   logExit(task.id, emit, exitReason, denyDetail)
+
+  // #14 — 세션 중 예산 초과 abort는 blocked 보고로 반환: finishWork의 shouldPauseForBudget(status!=='done')
+  // 이 기존 pauseForBudget(일시정지) 경로를 태운다. done으로 반환하면 verify/review로 예산을 더 태우고
+  // (취지 역행), throw하면 handleRunError의 autoRetry가 재개→재초과를 반복한다 — 둘 다 금지(정상 반환).
+  // 질문은 verify-재시도 중 runNavi(경계 게이트 이후) 경로가 blocked로 정착할 때도 사유가 보이게 싣는다.
+  if (budgetAborted) {
+    return {
+      status: 'blocked',
+      summary: lastText.slice(0, 1500) || '(토큰 예산 초과 — 세션 중 일시정지)',
+      questions: [
+        '작업 토큰 예산을 세션 중 초과해 여기서 멈췄다. 계속하려면 재개하고(예산 상향/해제 고려), 아니면 취소/검토해라. (작업트리·세션은 보존됨)',
+      ],
+    }
+  }
 
   if (report && !aborted) return report
   return {

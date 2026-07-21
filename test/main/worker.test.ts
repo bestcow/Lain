@@ -16,6 +16,8 @@ import {
   sumUsageTokens,
   sessionBaselineFor,
   lifetimeTokensFor,
+  midSessionBudgetBase,
+  scriptsTamperDeny,
   classifyDivergence,
   RISKY,
   approvalTimeoutMs,
@@ -442,5 +444,104 @@ describe('isAwaitingApproval — C1 hold 대기 추적 set/clear', () => {
     void waitApproval(105, { taskId: 'c1-foreground' }) // hold 없음
     expect(isAwaitingApproval('c1-foreground')).toBe(false)
     resolveApproval(105, false)
+  })
+})
+
+// #11 spec-gaming 방어 확장 — package.json "scripts"(verify_cmd가 실행하는 판사 명령 정의) 변조 차단.
+describe('scriptsTamperDeny — #11 판사 매수(package.json scripts 변조) 차단(순수)', () => {
+  const pkg = 'C:\\wt\\package.json'
+
+  it('Edit: old/new_string이 scripts 키에 닿으면 deny (autonomous)', () => {
+    const d = scriptsTamperDeny('autonomous', 'Edit', {
+      file_path: pkg,
+      old_string: '"scripts": {\n  "test": "vitest run"',
+      new_string: '"scripts": {\n  "test": "exit 0"',
+    })
+    expect(d).not.toBeNull()
+    expect(d!.kind).toBe('spec_gaming')
+    // 거부 메시지는 기존 테스트파일 거부와 같은 패턴 — 고치지 말고 blocked로 보고.
+    expect(d!.message).toContain('blocked로 보고')
+  })
+
+  it('Edit: new_string에만 scripts가 있어도 deny(블록 신설 우회 차단)', () => {
+    const d = scriptsTamperDeny('autonomous', 'Edit', {
+      file_path: pkg,
+      old_string: '"license": "MIT"',
+      new_string: '"license": "MIT",\n"scripts": { "test": "exit 0" }',
+    })
+    expect(d).not.toBeNull()
+  })
+
+  it('Write: package.json 전체 재작성은 내용 무관 보수적 deny', () => {
+    const d = scriptsTamperDeny('autonomous', 'Write', {
+      file_path: pkg,
+      content: '{"name": "x"}', // scripts가 없어 보여도 전체 재작성은 판정 불가 → deny
+    })
+    expect(d).not.toBeNull()
+    expect(d!.kind).toBe('spec_gaming')
+  })
+
+  it('하위 패키지 package.json도 대상(루트 npm script가 -w/--prefix로 위임 가능)', () => {
+    const d = scriptsTamperDeny('autonomous', 'Write', {
+      file_path: 'C:\\wt\\packages\\sub\\package.json',
+      content: '{}',
+    })
+    expect(d).not.toBeNull()
+  })
+
+  it('non-autonomous(interactive)는 통과', () => {
+    expect(
+      scriptsTamperDeny('interactive', 'Write', { file_path: pkg, content: '{}' }),
+    ).toBeNull()
+    expect(scriptsTamperDeny(undefined, 'Write', { file_path: pkg, content: '{}' })).toBeNull()
+  })
+
+  it('scripts 무관 Edit(버전 bump 등)는 통과', () => {
+    expect(
+      scriptsTamperDeny('autonomous', 'Edit', {
+        file_path: pkg,
+        old_string: '"version": "1.0.0"',
+        new_string: '"version": "1.0.1"',
+      }),
+    ).toBeNull()
+  })
+
+  it('package.json이 아닌 파일은 scripts 문자열이 있어도 통과', () => {
+    expect(
+      scriptsTamperDeny('autonomous', 'Edit', {
+        file_path: 'C:\\wt\\src\\build.ts',
+        old_string: 'const scripts = 1',
+        new_string: 'const scripts = 2',
+      }),
+    ).toBeNull()
+  })
+
+  it('편집 도구가 아니면(Bash/Read) 통과 — 셸 경유 추적은 안 한다(기존 결정)', () => {
+    expect(
+      scriptsTamperDeny('autonomous', 'Bash', { command: 'echo x > package.json' }),
+    ).toBeNull()
+    expect(scriptsTamperDeny('autonomous', 'Read', { file_path: pkg })).toBeNull()
+  })
+
+  it('포워드슬래시 경로 표기도 잡는다', () => {
+    expect(
+      scriptsTamperDeny('autonomous', 'Write', { file_path: 'C:/wt/package.json', content: '{}' }),
+    ).not.toBeNull()
+  })
+})
+
+// #14 — 세션 중 예산 판정의 베이스(순수): run 시작 시점 라이프타임 누계.
+describe('midSessionBudgetBase — #14 세션 중 예산 베이스(순수)', () => {
+  it('신규 작업: baseline=tokensTotal=0 → 0', () => {
+    expect(midSessionBudgetBase(0, 0)).toBe(0)
+  })
+  it('핸드오프 스왑: baseline==tokensTotal → 동일값', () => {
+    expect(midSessionBudgetBase(700, 700)).toBe(700)
+  })
+  it('resume 세션: baseline만으론 이 세션 이전 run 몫이 빠짐 → tokensTotal(더 큰 쪽)이 베이스', () => {
+    expect(midSessionBudgetBase(300, 900)).toBe(900)
+  })
+  it('legacy(tokensTotal=0 미갱신)면 baseline으로 폴백', () => {
+    expect(midSessionBudgetBase(500, 0)).toBe(500)
   })
 })
