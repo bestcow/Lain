@@ -14,10 +14,10 @@
   <a href="https://github.com/bestcow/Lain/releases/latest"><b>⬇️ Download the installer</b></a>
 </p>
 
-**A personal AI manager that lives on your PC and adapts to you** — it chats, directs coding
-work across your projects, occasionally glances at your screen to offer help only when it's
-actually useful, and learns more about you the more you use it. It's a Windows desktop app
-(Electron + Claude Agent SDK).
+**A personal AI manager for developers that lives on your PC and adapts to you** — it chats,
+directs/verifies/merges coding work across your projects, offers help only when your dev
+screen shows you're stuck, and learns more about you the more you use it. It's a Windows
+desktop app (Electron + Claude Agent SDK).
 
 > A local orchestrator where a manager agent ("Lain") directs Claude Code workers
 > ("Navi") across many projects — each Navi runs in its own isolated git worktree,
@@ -42,8 +42,9 @@ today. See [로드맵](#roadmap) below for i18n plans. ([한국어로 보기](RE
   Anything else is never captured, and it stays quiet the rest of the time.
 - **Voice** — Supports 3 TTS engines (Edge/Supertonic/GPT-SoVITS) and Discord voice calls.
 - **Mobile** — Chat, dispatch tasks, approve, and check status from anywhere via Telegram.
-- **Safety** — Dangerous-command approval queue, secret-file access blocking, and
-  spec-gaming defenses for autonomous mode.
+- **Safety** — Dangerous-command approval queue, secret-file access blocking, spec-gaming
+  defenses for autonomous mode — plus every autonomous decision is recorded for post-hoc
+  review, and per-task token budgets stop runaways.
 
 ## Quick start
 
@@ -72,10 +73,11 @@ npm run dist       # build installer (dist\Lain Setup *.exe)
 
 **First 5 minutes**
 
-1. Launch it — Lain greets you. Just start talking.
-2. Register a project: add a folder to manage from the Projects panel. (You can also point an
-   environment variable at your workspace root for auto-scanning — see the Korean README's
-   [설정](README.md#설정) section for details.)
+1. Launch it — a one-time welcome guide appears and Lain greets you. Just start talking.
+2. If no projects are registered, **Lain asks where your project folders live** — reply with
+   a path in chat and it registers and scans them on the spot. You can also add folders
+   manually from the Projects panel, or point an environment variable at your workspace root
+   for auto-scanning — see the Korean README's [설정](README.md#설정) section.
 3. Ask it to do something in a registered project via chat — e.g. "add a login feature to
    project X".
 4. Open preferences (⚙) to customize how it addresses you, the model, Telegram, and more.
