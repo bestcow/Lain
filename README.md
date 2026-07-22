@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/bestcow/Lain/releases/latest"><b>⬇️ 설치 파일 다운로드 (Windows)</b></a> — <code>Lain Setup x.y.z.exe</code> 받아서 실행하면 끝. 자동 업데이트 지원.
+  <a href="https://github.com/bestcow/Lain/releases/latest"><b>⬇️ 설치 파일 다운로드</b></a>
 </p>
 
 **내 PC에 상주하며 나에게 길들여지는 개인 AI 매니저**입니다 — 대화하고, 여러 프로젝트의 코딩 작업을 지휘하고, 화면을 어깨너머로 지켜보다 필요할 때만 조언하며, 쓸수록 사용자를 학습합니다. Windows 데스크톱 앱(Electron + Claude Agent SDK)입니다.

@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/bestcow/Lain/releases/latest"><b>⬇️ Download the installer (Windows)</b></a> — grab <code>Lain Setup x.y.z.exe</code> and run it. Auto-update included.
+  <a href="https://github.com/bestcow/Lain/releases/latest"><b>⬇️ Download the installer</b></a>
 </p>
 
 **A personal AI manager that lives on your PC and adapts to you** — it chats, directs coding
