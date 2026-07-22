@@ -5,8 +5,13 @@
 <h1 align="center"><img src="assets/lain-face.png" width="34" alt="" align="top"> Lain</h1>
 
 <p align="center">
+  <a href="https://github.com/bestcow/Lain/releases/latest"><img src="https://img.shields.io/github/v/release/bestcow/Lain?label=latest%20release&color=00c853" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Windows only">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
+</p>
+
+<p align="center">
+  <a href="https://github.com/bestcow/Lain/releases/latest"><b>⬇️ Download the installer (Windows)</b></a> — grab <code>Lain Setup x.y.z.exe</code> and run it. Auto-update included.
 </p>
 
 **A personal AI manager that lives on your PC and adapts to you** — it chats, directs coding
@@ -51,9 +56,9 @@ today. See [로드맵](#roadmap) below for i18n plans. ([한국어로 보기](RE
 
 **Install**
 
-> Prebuilt installers (Releases) are on the way. For now, build from source below.
+**Option A — Installer (recommended)**: [**download `Lain Setup x.y.z.exe` from Releases**](https://github.com/bestcow/Lain/releases/latest) and run it. New versions are fetched automatically (electron-updater).
 
-**Build from source** — requires Node.js 20+ (LTS 20/22 recommended), Git 2.x+
+**Option B — Build from source**: requires Node.js 20+ (LTS 20/22 recommended), Git 2.x+
 
 ```sh
 git clone https://github.com/bestcow/Lain.git

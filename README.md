@@ -5,8 +5,13 @@
 <h1 align="center"><img src="assets/lain-face.png" width="34" alt="" align="top"> Lain</h1>
 
 <p align="center">
+  <a href="https://github.com/bestcow/Lain/releases/latest"><img src="https://img.shields.io/github/v/release/bestcow/Lain?label=%EC%B5%9C%EC%8B%A0%20%EB%A6%B4%EB%A6%AC%EC%8A%A4&color=00c853" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Windows only">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
+</p>
+
+<p align="center">
+  <a href="https://github.com/bestcow/Lain/releases/latest"><b>⬇️ 설치 파일 다운로드 (Windows)</b></a> — <code>Lain Setup x.y.z.exe</code> 받아서 실행하면 끝. 자동 업데이트 지원.
 </p>
 
 **내 PC에 상주하며 나에게 길들여지는 개인 AI 매니저**입니다 — 대화하고, 여러 프로젝트의 코딩 작업을 지휘하고, 화면을 어깨너머로 지켜보다 필요할 때만 조언하며, 쓸수록 사용자를 학습합니다. Windows 데스크톱 앱(Electron + Claude Agent SDK)입니다.
@@ -37,9 +42,9 @@
 
 **설치**
 
-> 설치본(Releases) 자동 배포는 준비 중입니다. 지금은 아래 **소스 빌드**로 실행하세요.
+**방법 A — 설치 파일(권장)**: [**Releases에서 `Lain Setup x.y.z.exe` 다운로드**](https://github.com/bestcow/Lain/releases/latest) 후 실행. 이후 새 버전은 앱이 알아서 받아 갱신을 제안합니다(electron-updater).
 
-**소스 빌드** — Node.js 20+ (LTS 20/22 권장), Git 2.x+ 필요
+**방법 B — 소스 빌드**: Node.js 20+ (LTS 20/22 권장), Git 2.x+ 필요
 
 ```sh
 git clone https://github.com/bestcow/Lain.git
