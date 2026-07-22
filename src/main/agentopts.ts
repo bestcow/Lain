@@ -65,6 +65,44 @@ export function tierQueryOptions(
   }
 }
 
+/**
+ * M3 — 작업 Navi 한 개에만 Anthropic 호환 프로바이더를 적용한다.
+ * manager·judge는 이 함수를 호출하지 않으므로 제3자 장애가 관제탑 판단 경로로 번지지 않는다.
+ * 플래그 OFF 또는 프로필 미선택이면 null을 돌려 기존 tierQueryOptions 경로를 그대로 쓴다.
+ */
+export function providerQueryOptions(
+  providerId: string | null | undefined,
+  s: Pick<LainSettings, 'providerSwapEnabled' | 'providerProfiles'>,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): { model: string; env: Record<string, string | undefined> } | null {
+  if (!s.providerSwapEnabled || !providerId) return null
+  const profile = s.providerProfiles.find((p) => p.id === providerId)
+  if (!profile) throw new Error(`프로바이더 프로필 없음: ${providerId}`)
+  const baseUrl = profile.baseUrl.trim().replace(/\/+$/, '')
+  const authToken = profile.authToken.trim()
+  const model = profile.modelId.trim()
+  if (!baseUrl || authToken.length < 4 || !model) {
+    throw new Error(`프로바이더 프로필 미완성: ${profile.label || providerId}`)
+  }
+  return {
+    model,
+    env: {
+      ...baseEnv,
+      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_AUTH_TOKEN: authToken,
+      ANTHROPIC_API_KEY: undefined,
+      ANTHROPIC_MODEL: model,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+      ANTHROPIC_DEFAULT_FABLE_MODEL: model,
+      CLAUDE_CODE_SUBAGENT_MODEL: model,
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+      ENABLE_TOOL_SEARCH: 'false',
+    },
+  }
+}
+
 // D7 (§9b) — judge류 짧은 판정 query의 티어/라우팅 옵션. 전역 사용량 가드가 발동(최근 창 누적이
 // usageWindowTokenLimit 이상)이면 judge 티어를 한 단계 강등(opus→sonnet→haiku, local 예외)해 크레딧을
 // 아낀다. 미발동·off(limit=0)면 설정 judgeModel 그대로 → 기존 동작 불변. elicit·ask_manager·reflect·

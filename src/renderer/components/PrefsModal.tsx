@@ -11,6 +11,7 @@ import type {
   DiscordStatus,
   UpdateStatus,
   ReviewDepth,
+  ProviderProfile,
 } from '../../shared/types'
 import { MODEL_IDS, MODEL_TIERS } from '../../shared/models'
 import { Icon } from './icons'
@@ -87,6 +88,8 @@ export const SEARCH_INDEX: PrefsSearchItem[] = [
   { label: '판정 모델', hint: 'elicit ask_manager judgeModel', cat: 'models' },
   { label: '로컬 모델 서버', hint: 'llama-server localBaseUrl Qwen', cat: 'models' },
   { label: 'Anthropic API 키', hint: '구독 대신 키 인증 anthropicApiKey 과금 console', cat: 'models' },
+  { label: '프로바이더 스왑(실험)', hint: 'Kimi DeepSeek Anthropic 호환 provider worker 전용', cat: 'models' },
+  { label: '프로바이더 프로필', hint: 'base URL auth token model ID 공급자 프리셋', cat: 'models' },
   // 자동화·고급
   { label: '동시 작업 cap', hint: '동시에 working 작업 수 concurrency', cat: 'automation' },
   { label: '프로젝트 병렬 cap', hint: '같은 프로젝트 동시 작업 병렬 projectParallelCap D14', cat: 'automation' },
@@ -102,6 +105,7 @@ export const SEARCH_INDEX: PrefsSearchItem[] = [
   { label: '기본 리뷰 강도', hint: '독립 심사 강도 light standard adversarial reviewDepthDefault L4', cat: 'automation' },
   { label: '빠른 대화', hint: '도구 없는 경량 응답 managerFastChat', cat: 'automation' },
   { label: '클로드코드 연동', hint: 'CC 훅 양방향 ccHooks', cat: 'automation' },
+  { label: 'Codex 외부 세션 연동', hint: 'Codex notify rollout 관찰 config.toml codexLink', cat: 'automation' },
   { label: 'idle 임계(분)', hint: '자동 끼어듦 게이트 idleMin', cat: 'automation' },
   { label: '컨텍스트 압축(토큰)', hint: '무한세션 요약 compact', cat: 'automation' },
   { label: 'Navi 핸드오프(토큰)', hint: '유한세션 교체 handoff', cat: 'automation' },
@@ -269,6 +273,156 @@ function ModelSelect({
       </select>
       <span className="dim settings-hint">{hint}</span>
     </label>
+  )
+}
+
+const PROVIDER_PRESETS: ProviderProfile[] = [
+  {
+    id: 'kimi',
+    label: 'Kimi K3',
+    baseUrl: 'https://api.moonshot.ai/anthropic',
+    authToken: '',
+    modelId: 'kimi-k3[1m]',
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek V4 Pro',
+    baseUrl: 'https://api.deepseek.com/anthropic',
+    authToken: '',
+    modelId: 'deepseek-v4-pro[1m]',
+  },
+]
+
+function ProviderProfileRow({
+  profile,
+  onSave,
+  onRemove,
+}: {
+  profile: ProviderProfile
+  onSave: (profile: ProviderProfile) => void
+  onRemove: () => void
+}) {
+  const [draft, setDraft] = useState(profile)
+  useEffect(() => setDraft(profile), [profile])
+  const dirty = JSON.stringify(draft) !== JSON.stringify(profile)
+  return (
+    <div className="provider-profile-row">
+      <input
+        value={draft.id}
+        placeholder="id"
+        title="영문/숫자/대시/밑줄"
+        onChange={(e) => setDraft({ ...draft, id: e.target.value })}
+      />
+      <input
+        value={draft.label}
+        placeholder="표시 이름"
+        onChange={(e) => setDraft({ ...draft, label: e.target.value })}
+      />
+      <input
+        value={draft.baseUrl}
+        placeholder="Anthropic 호환 base URL"
+        onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}
+      />
+      <input
+        value={draft.modelId}
+        placeholder="실제 model ID"
+        onChange={(e) => setDraft({ ...draft, modelId: e.target.value })}
+      />
+      <input
+        type="password"
+        value={draft.authToken}
+        placeholder="auth token"
+        onChange={(e) => setDraft({ ...draft, authToken: e.target.value })}
+      />
+      <button
+        type="button"
+        className="tg-save"
+        disabled={!dirty}
+        onClick={() => onSave({
+          ...draft,
+          id: draft.id.trim(),
+          label: draft.label.trim(),
+          baseUrl: draft.baseUrl.trim(),
+          modelId: draft.modelId.trim(),
+          authToken: draft.authToken.trim(),
+        })}
+      >
+        저장
+      </button>
+      <button type="button" className="tg-save" onClick={onRemove}>삭제</button>
+    </div>
+  )
+}
+
+function ProviderProfilesEditor({
+  profiles,
+  defaultProvider,
+  onPatch,
+}: {
+  profiles: ProviderProfile[]
+  defaultProvider: string
+  onPatch: (patch: Partial<LainSettings>) => void
+}) {
+  const upsertPreset = (preset: ProviderProfile) => {
+    const found = profiles.find((p) => p.id === preset.id)
+    const next = found
+      ? profiles.map((p) => p.id === preset.id ? { ...preset, authToken: p.authToken } : p)
+      : [...profiles, preset]
+    onPatch({ providerProfiles: next })
+  }
+  const save = (oldId: string, profile: ProviderProfile) => {
+    const next = profiles.map((p) => p.id === oldId ? profile : p)
+    onPatch({
+      providerProfiles: next,
+      ...(defaultProvider === oldId && oldId !== profile.id ? { defaultProvider: profile.id } : {}),
+    })
+  }
+  const remove = (id: string) => onPatch({
+    providerProfiles: profiles.filter((p) => p.id !== id),
+    ...(defaultProvider === id ? { defaultProvider: '' } : {}),
+  })
+  return (
+    <div className="settings-row provider-profiles">
+      <span className="settings-key">프로바이더 프로필</span>
+      <div className="provider-profile-main">
+        <div className="provider-preset-actions">
+          {PROVIDER_PRESETS.map((preset) => (
+            <button key={preset.id} type="button" className="upd-btn" onClick={() => upsertPreset(preset)}>
+              + {preset.label} 프리셋
+            </button>
+          ))}
+          <button
+            type="button"
+            className="upd-btn"
+            onClick={() => {
+              let n = profiles.length + 1
+              while (profiles.some((p) => p.id === `provider${n}`)) n++
+              onPatch({ providerProfiles: [...profiles, { id: `provider${n}`, label: `Provider ${n}`, baseUrl: 'https://api.example.com/anthropic', authToken: '', modelId: 'model-id' }] })
+            }}
+          >
+            + 직접 추가
+          </button>
+        </div>
+        {profiles.map((profile) => (
+          <ProviderProfileRow
+            key={profile.id}
+            profile={profile}
+            onSave={(next) => save(profile.id, next)}
+            onRemove={() => remove(profile.id)}
+          />
+        ))}
+        <label className="provider-default">
+          새 Claude 작업 기본
+          <select value={defaultProvider} onChange={(e) => onPatch({ defaultProvider: e.target.value })}>
+            <option value="">Anthropic</option>
+            {profiles.map((p) => <option key={p.id} value={p.id} disabled={p.authToken.length < 4}>{p.label} · {p.modelId || '모델 미설정'}{p.authToken.length >= 4 ? '' : ' (토큰 없음)'}</option>)}
+          </select>
+        </label>
+        <span className="dim settings-hint">
+          worker 작업에만 적용된다. Lain·판정 모델은 항상 기존 Anthropic 경로를 유지한다. 토큰은 평문으로 표시하지 않으며 로그·다이제스트에서 마스킹한다.
+        </span>
+      </div>
+    </div>
   )
 }
 
@@ -923,6 +1077,24 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 }
                 onSave={(v) => patch({ anthropicApiKey: v })}
               />
+              <label className="settings-row">
+                <span className="settings-key">프로바이더 스왑(실험)</span>
+                <input
+                  type="checkbox"
+                  checked={settings.providerSwapEnabled}
+                  onChange={(e) => patch({ providerSwapEnabled: e.target.checked })}
+                />
+                <span className="dim settings-hint">
+                  Anthropic 호환 API를 선택한 Claude 작업 worker에만 적용. 기본 꺼짐 — 끄면 관련 선택 UI와 라우팅이 모두 사라진다.
+                </span>
+              </label>
+              {settings.providerSwapEnabled && (
+                <ProviderProfilesEditor
+                  profiles={settings.providerProfiles}
+                  defaultProvider={settings.defaultProvider}
+                  onPatch={patch}
+                />
+              )}
                   </>
                 )}
                 {cat === 'general' && (
@@ -1406,6 +1578,17 @@ export function PrefsModal({ onClose }: { onClose: () => void }) {
                 <span className="dim settings-hint">
                   레인↔클로드코드 양방향 인지(등록 프로젝트 한정) — 밖에서 직접 실행한 CC 세션을 레인이 알고,
                   레인 작업 현황도 그 CC 세션에 주입. 켜면 ~/.claude 훅 자동 설치(끄면 제거)
+                </span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-key">Codex 외부 세션 연동</span>
+                <input
+                  type="checkbox"
+                  checked={settings.codexLinkEnabled}
+                  onChange={(e) => patch({ codexLinkEnabled: e.target.checked })}
+                />
+                <span className="dim settings-hint">
+                  등록 프로젝트에서 직접 연 Codex 세션을 관찰한다. 켜면 ~/.codex/config.toml에 표시된 마커 블록과 notify를 설치하고, 끄면 그 블록만 제거한다. 기존 notify가 있으면 안전하게 거부한다.
                 </span>
               </label>
               <div className="settings-section-label">세션 · 타이밍</div>

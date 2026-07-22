@@ -71,6 +71,11 @@ import { collectStatus, runVerify } from './collectors'
 import { walkProjectFiles, MAX_FILES } from './filewalk'
 import { listCcSessions, ccSessionDigest } from './ccsessions'
 import {
+  codexSessionDigest,
+  codexSessionStatus,
+  listCodexSessions,
+} from './codexsessions'
+import {
   sendToManager,
   stopManager,
   resetManager,
@@ -86,6 +91,15 @@ import {
 import { encodeEditDiffLine } from '../shared/editdiff'
 import { buildLearnPrompt } from './learnprompt'
 import { applyCcHooks, refreshCcLinkIfEnabled } from './cchooks'
+import {
+  applyCodexLink,
+  refreshCodexLinkIfEnabled,
+} from './codexlink'
+import { engineCapabilityInfo } from './engines'
+import {
+  buildObservedAdoptContent,
+  summarizeObservedHandoff,
+} from './observedadopt'
 import { applyAutoStart } from './autostart'
 import { syncOverlayMode, openMainWindow, resizeOverlay, setOverlayVisible } from './overlay-window'
 import { bindTitleRefresh } from './title'
@@ -107,7 +121,7 @@ import { discordStatus, restartDiscord, bindDiscordState } from './discord'
 import { refreshTray } from './tray'
 import { capTaskImages } from './taskimages'
 import { app } from 'electron'
-import type { LainSettings } from '../shared/types'
+import type { LainSettings, ObservedSessionInfo, TaskEngine } from '../shared/types'
 
 // 앱(main 프로세스) 기동 시각 — 모듈 로드(=프로세스 시작) 시 1회 고정. 렌더러가 크래시 후 자동
 // reload(index.ts render-process-gone)돼도 불변이라 '이번 실행' 경계의 단일 출처가 된다. 렌더러가
@@ -134,6 +148,7 @@ function broadcast(channel: string, payload: unknown): void {
 function pushProjects(): void {
   broadcast('projects:updated', listProjects())
   refreshCcLinkIfEnabled() // 클로드코드 연동 — 등록 프로젝트 목록·다이제스트를 훅이 읽는 파일에 반영
+  refreshCodexLinkIfEnabled() // 외부 Codex notify가 읽는 등록 프로젝트 목록 갱신
 }
 
 // 승인 큐 방송 — 직전 스냅샷과 내용이 같으면 내보내지 않는다. 작업 이벤트가 흐를 때마다 무조건 밀면
@@ -262,6 +277,59 @@ export function registerIpc(): void {
     const p = getProject(projectId)
     return p ? ccSessionDigest(p.path, sessionId) : null
   })
+  ipcMain.handle('observed:sessions', (_e, projectId: string): ObservedSessionInfo[] => {
+    const p = getProject(projectId)
+    if (!p) return []
+    const claude: ObservedSessionInfo[] = listCcSessions(p.path).map((s) => ({
+      ...s,
+      engine: 'claude',
+      origin: 'observed',
+      status: codexSessionStatus(s.lastAt),
+    }))
+    const codex = getSettings().codexLinkEnabled ? listCodexSessions(p.path) : []
+    return [...claude, ...codex]
+      .sort((a, b) => b.lastAt - a.lastAt)
+      .slice(0, 40)
+  })
+  ipcMain.handle(
+    'observed:sessionDigest',
+    (_e, projectId: string, engine: TaskEngine, sessionId: string) => {
+      const p = getProject(projectId)
+      if (!p) return null
+      return engine === 'codex'
+        ? getSettings().codexLinkEnabled
+          ? codexSessionDigest(p.path, sessionId)
+          : null
+        : ccSessionDigest(p.path, sessionId)
+    },
+  )
+  ipcMain.handle('engines:capabilities', () => engineCapabilityInfo())
+  ipcMain.handle(
+    'observed:adopt',
+    async (
+      _e,
+      projectId: string,
+      sourceEngine: TaskEngine,
+      sessionId: string,
+      taskEngine: TaskEngine = 'claude',
+      goal?: string,
+    ) => {
+      const p = getProject(projectId)
+      if (!p) return { error: '프로젝트 없음' }
+      if (sourceEngine === 'codex' && !getSettings().codexLinkEnabled)
+        return { error: 'Codex 외부 세션 연동이 꺼져 있음' }
+      const digest = sourceEngine === 'codex'
+        ? codexSessionDigest(p.path, sessionId, 6000)
+        : ccSessionDigest(p.path, sessionId, 6000)
+      if (!digest) return { error: '관찰 세션을 읽을 수 없음' }
+      const handoff = await summarizeObservedHandoff(digest, sourceEngine)
+      return startTask(projectId, {
+        content: buildObservedAdoptContent(handoff, sourceEngine, sessionId, goal),
+        engine: taskEngine,
+        ...(taskEngine === 'codex' ? { mode: 'interactive' as const } : {}),
+      })
+    },
+  )
 
   ipcMain.handle('chat:send', async (_e, text: string, attachments?: import('../shared/types').FileAttachment[], conversationId?: string) => {
     // 렌더러 반영은 rendererMirror(bindManagerRenderer)가 conversationId 태깅해 단일 처리.
@@ -449,6 +517,21 @@ export function registerIpc(): void {
       broadcast('tasks:updated', listTasks())
     },
   )
+  ipcMain.handle('tasks:setProvider', (_e, taskId: string, provider: string) => {
+    const task = getTask(taskId)
+    if (!task) throw new Error('작업 없음')
+    const settings = getSettings()
+    const id = String(provider ?? '').trim()
+    if (id) {
+      if (!settings.providerSwapEnabled) throw new Error('프로바이더 스왑 기능이 꺼져 있다')
+      if (task.engine !== 'claude') throw new Error('프로바이더 스왑은 Claude 작업에서만 사용할 수 있다')
+      const profile = settings.providerProfiles.find((p) => p.id === id)
+      if (!profile) throw new Error(`프로바이더 프로필 없음: ${id}`)
+      if (profile.authToken.trim().length < 4) throw new Error(`프로바이더 토큰 없음/너무 짧음: ${profile.label}`)
+    }
+    updateTask(taskId, { provider: id || null })
+    broadcast('tasks:updated', listTasks())
+  })
   // D11 — done/cancelled 작업을 같은 명세로 재실행(원본 보존, 새 task 생성).
   ipcMain.handle('tasks:rerun', async (_e, taskId: string) => {
     const r = await rerunTask(taskId)
@@ -724,7 +807,7 @@ export function registerIpc(): void {
   ipcMain.handle('settings:get', () => getSettings())
   ipcMain.handle('settings:set', (_e, patch: Partial<LainSettings>) => {
     const prev = getSettings() // quips — '실제로 값이 바뀐' 변경만 반응하기 위한 이전 값 캡처
-    const s = saveSettings(patch)
+    let s = saveSettings(patch)
     // Phase 3 부수효과: 스캔 타이머 재장전 + 로그인 자동 시작(트레이로) 반영
     if (patch.scanIntervalMin !== undefined) rearmScheduler()
     if (patch.autoStart !== undefined) applyAutoStart(s.autoStart)
@@ -746,6 +829,19 @@ export function registerIpc(): void {
       restartDiscord()
     // 클로드코드 연동 토글 변경 시 훅 설치/제거 + 감시 적용
     if (patch.ccHooksEnabled !== undefined) applyCcHooks()
+    // 외부 Codex 연동 — 부팅 OFF 경로는 홈 무접근, 토글 OFF 전이에만 마커 제거.
+    if (patch.codexLinkEnabled !== undefined) {
+      const result = applyCodexLink(patch.codexLinkEnabled === false)
+      if (!result.ok) {
+        // 설치/제거 실패 시 체크 상태를 실제 config 상태로 되돌린다.
+        s = saveSettings({ codexLinkEnabled: !patch.codexLinkEnabled })
+        void dialog.showMessageBox({
+          type: 'warning',
+          title: patch.codexLinkEnabled ? 'Codex 연동을 켜지 못함' : 'Codex 연동을 끄지 못함',
+          message: result.error ?? 'Codex 연동 설치 실패',
+        })
+      }
+    }
     // 어깨너머 토글 변경 시 오버레이/감시 즉시 재평가
     if (patch.overlayMonitoringEnabled !== undefined) syncOverlayMode()
     // 자동 다운로드 토글 변경을 업데이트 엔진에 반영

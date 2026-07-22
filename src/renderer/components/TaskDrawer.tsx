@@ -7,6 +7,8 @@ import type {
   TaskEvent,
   TaskPermissionMode,
   ThinkingLevel,
+  EngineCapabilityInfo,
+  LainSettings,
 } from '../../shared/types'
 import { MODEL_TIERS, MODEL_NAME } from '../../shared/models'
 import { TODO_STATUS_ICON, todoProgress, decodeTodoLine } from '../../shared/todoline'
@@ -17,6 +19,7 @@ import { useStickyScroll } from '../lib/useStickyScroll'
 import { parseDiffFiles, fileStatLabel, totalDiffStat, type DiffFile } from '../lib/diffParse'
 import { ConfirmWindow } from './ConfirmWindow'
 import { Icon } from './icons'
+import { EngineBadge } from './EngineBadge'
 
 // B17 이미지 입력 — 파일 → 이미지 FileAttachment. Anthropic 4종 media_type만(isImageMime) 이미지로 취급.
 function fileToImageAttachment(file: File): Promise<FileAttachment | null> {
@@ -114,6 +117,7 @@ interface Props {
   events: TaskEvent[] | null
   // UI③ — '지금 뭐 하는 중' 사람말 한 줄(App이 taskActivity에서 변환해 전달). working일 때만 표시.
   activity?: string | null
+  engineInfo?: EngineCapabilityInfo
   onClose: () => void
 }
 
@@ -472,7 +476,7 @@ function QuestionCard({ approval }: { approval: Approval }) {
   )
 }
 
-function TaskDrawerInner({ task, approvals, events, activity, onClose }: Props) {
+function TaskDrawerInner({ task, approvals, events, activity, engineInfo, onClose }: Props) {
   const [answer, setAnswer] = useState('')
   const [answers, setAnswers] = useState<string[]>([])
   const [verifyOpen, setVerifyOpen] = useState(false)
@@ -484,7 +488,7 @@ function TaskDrawerInner({ task, approvals, events, activity, onClose }: Props) 
   const [reviewMsg, setReviewMsg] = useState<string | null>(null)
   const [reviewBusy, setReviewBusy] = useState(false)
   // 스킬 킬스위치(기본 off) — off면 task.skills가 있어도 SDK에 안 붙는다(skills.ts). 배지가 거짓말하지 않게 읽는다.
-  const [skillsEnabled, setSkillsEnabled] = useState(true)
+  const [runtimeSettings, setRuntimeSettings] = useState<LainSettings | null>(null)
   const [, setNow] = useState(Date.now())
   // B2 — ChatPanel의 near-bottom 스티키 스크롤 이식: 바닥 근처일 때만 추종, 벗어나면 '↓ 최신' 점프 버튼.
   const { bottomRef, showJump, jumpToBottom } = useStickyScroll([events?.length ?? 0])
@@ -500,9 +504,14 @@ function TaskDrawerInner({ task, approvals, events, activity, onClose }: Props) 
 
   // 스킬 킬스위치 — 마운트 시 1회 조회 + 설정 변경 라이브 반영(환경설정에서 켜면 배지도 바로 정확해진다).
   useEffect(() => {
-    void window.lain.getSettings().then((s) => setSkillsEnabled(s.skillsEnabled))
-    return window.lain.onSettingsUpdated((s) => setSkillsEnabled(s.skillsEnabled))
+    void window.lain.getSettings().then(setRuntimeSettings)
+    return window.lain.onSettingsUpdated(setRuntimeSettings)
   }, [])
+
+  const skillsEnabled = runtimeSettings?.skillsEnabled ?? true
+  const selectedProvider = runtimeSettings?.providerSwapEnabled
+    ? runtimeSettings.providerProfiles.find((p) => p.id === task.provider)
+    : undefined
 
   // 결재 결과 줄은 다른 작업으로 넘어가면 남기지 않는다(이전 작업의 사유가 새 작업 화면에 붙는 오해 방지).
   useEffect(() => {
@@ -552,16 +561,44 @@ function TaskDrawerInner({ task, approvals, events, activity, onClose }: Props) 
             ⚡auto
           </span>
         )}
-        {task.engine === 'codex' && (
-          <span className="task-mode-badge" title="OpenAI Codex CLI 엔진 — 승인 큐 대신 codex 샌드박스가 방어선">
-            ◆codex
+        <EngineBadge engine={task.engine} info={engineInfo} />
+        {runtimeSettings?.providerSwapEnabled && (
+          <select
+            className="task-provider"
+            value={task.provider ?? ''}
+            disabled={task.engine !== 'claude'}
+            title={
+              task.engine !== 'claude'
+                ? '프로바이더 스왑은 Claude 작업에서만 사용할 수 있다'
+                : selectedProvider
+                  ? `${selectedProvider.label} — 실제 모델 ${selectedProvider.modelId}`
+                  : '프로바이더 — 기본 Anthropic 또는 저장한 Anthropic 호환 프로필'
+            }
+            onChange={(e) => void window.lain.setTaskProvider(task.id, e.target.value)}
+          >
+            <option value="">프로바이더:Anthropic</option>
+            {runtimeSettings.providerProfiles.map((p) => (
+              <option key={p.id} value={p.id} disabled={p.authToken.length < 4}>
+                프로바이더:{p.label}{p.authToken.length >= 4 ? '' : ' (토큰 없음)'}
+              </option>
+            ))}
+          </select>
+        )}
+        {selectedProvider && (
+          <span className="provider-model-badge" title={`${selectedProvider.label}의 실제 모델 ID`}>
+            {selectedProvider.label} · {selectedProvider.modelId}
           </span>
         )}
         {/* P2 권한모드 — bypass=승인 자동통과(시크릿·테스트보호는 유지). 진행 중 변경은 다음 재개부터 적용. */}
         <select
           className="task-permmode"
           value={task.permissionMode}
-          title="권한모드 — plan은 계획 전문을 승인 카드로 띄우고 승인해야 실행. bypass는 위험명령 승인을 자동통과(끼어듦 0). 시크릿 차단·테스트 보호는 유지"
+          disabled={engineInfo ? !engineInfo.capabilities.approvals : false}
+          title={
+            engineInfo && !engineInfo.capabilities.approvals
+              ? engineInfo.capabilityNotes.approvals
+              : '권한모드 — plan은 계획 전문을 승인 카드로 띄우고 승인해야 실행. bypass는 위험명령 승인을 자동통과(끼어듦 0). 시크릿 차단·테스트 보호는 유지'
+          }
           onChange={(e) =>
             window.lain.setTaskPermissionMode(task.id, e.target.value as TaskPermissionMode)
           }
@@ -589,7 +626,12 @@ function TaskDrawerInner({ task, approvals, events, activity, onClose }: Props) 
         <select
           className="task-model"
           value={task.modelOverride}
-          title="모델 — 이 작업만 고정할 모델(전역=설정의 Navi 모델을 따름). 다음 실행/재개부터 적용"
+          disabled={!!selectedProvider}
+          title={
+            selectedProvider
+              ? `프로바이더가 실제 모델 ${selectedProvider.modelId}를 고정한다`
+              : '모델 — 이 작업만 고정할 모델(전역=설정의 Navi 모델을 따름). 다음 실행/재개부터 적용'
+          }
           onChange={(e) => window.lain.setTaskModel(task.id, e.target.value as ModelTier | '')}
         >
           <option value="">모델:전역</option>
@@ -618,16 +660,22 @@ function TaskDrawerInner({ task, approvals, events, activity, onClose }: Props) 
         </span>
         {task.skills && task.skills.length > 0 && (
           <span
-            className={`task-skills dim${skillsEnabled ? '' : ' task-skills-off'}`}
-            style={skillsEnabled ? undefined : { textDecoration: 'line-through', opacity: 0.55 }}
+            className={`task-skills dim${skillsEnabled && (engineInfo?.capabilities.lessons ?? true) ? '' : ' task-skills-off'}`}
+            style={
+              skillsEnabled && (engineInfo?.capabilities.lessons ?? true)
+                ? undefined
+                : { textDecoration: 'line-through', opacity: 0.55 }
+            }
             title={
-              skillsEnabled
+              skillsEnabled && (engineInfo?.capabilities.lessons ?? true)
                 ? '이 작업에 할당된 스킬'
-                : '스킬 사용이 꺼져 있어 이 작업엔 적용되지 않았다 (환경설정 → 스킬 사용)'
+                : engineInfo && !engineInfo.capabilities.lessons
+                  ? engineInfo.capabilityNotes.lessons
+                  : '스킬 사용이 꺼져 있어 이 작업엔 적용되지 않았다 (환경설정 → 스킬 사용)'
             }
           >
             🧩 {task.skills.join(' · ')}
-            {!skillsEnabled && ' (미적용)'}
+            {(!skillsEnabled || (engineInfo && !engineInfo.capabilities.lessons)) && ' (미적용)'}
           </span>
         )}
         {task.dependsOn.length > 0 && (
@@ -655,6 +703,28 @@ function TaskDrawerInner({ task, approvals, events, activity, onClose }: Props) 
           <Icon name="x-circle" size={14} />
         </button>
       </div>
+
+      {engineInfo && Object.entries(engineInfo.capabilities).some(([, on]) => !on) && (
+        <div className="engine-capability-strip" aria-label="엔진 기능 제한">
+          {Object.entries(engineInfo.capabilities)
+            .filter(([, on]) => !on)
+            .map(([key]) => (
+              <span
+                key={key}
+                className="engine-capability-off"
+                title={engineInfo.capabilityNotes[key as keyof typeof engineInfo.capabilityNotes]}
+              >
+                {key === 'approvals'
+                  ? '승인 큐 없음'
+                  : key === 'askManager'
+                    ? '작업 중 질문 없음'
+                    : key === 'autonomous'
+                      ? '자율 모드 없음'
+                      : '학습 주입 없음'}
+              </span>
+            ))}
+        </div>
+      )}
 
       {/* A4 — TodoWrite 진행 체크리스트(있을 때만) */}
       <TodoChecklist task={task} />

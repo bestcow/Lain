@@ -1357,6 +1357,107 @@ body {
   padding: 4px 8px;
   border-bottom: 1px solid var(--border);
 }
+
+.cc-adopt-engine {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.cc-adopt-engine select {
+  max-width: 110px;
+}
+
+.cc-adopt-error {
+  color: var(--glitch);
+  padding: 6px 10px 0;
+  font-size: 11px;
+}
+
+.engine-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid color-mix(in srgb, var(--signal) 42%, transparent);
+  border-radius: 999px;
+  padding: 0 5px;
+  color: var(--signal);
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.engine-badge-observed {
+  border-style: dashed;
+  color: var(--text-3);
+}
+
+.engine-capability-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.engine-capability-off {
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  color: var(--text-3);
+  font-size: 10px;
+  padding: 2px 5px;
+  opacity: 0.7;
+}
+
+.provider-model-badge {
+  display: inline-flex;
+  align-items: center;
+  max-width: 240px;
+  border: 1px solid color-mix(in srgb, var(--hum) 45%, transparent);
+  border-radius: 3px;
+  color: var(--hum);
+  font-size: 10px;
+  line-height: 16px;
+  padding: 0 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-profiles {
+  align-items: flex-start;
+}
+
+.provider-profile-main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.provider-preset-actions,
+.provider-profile-row,
+.provider-default {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+.provider-profile-row {
+  border: 1px solid var(--border-strong);
+  padding: 7px;
+}
+
+.provider-profile-row input {
+  min-width: 110px;
+  flex: 1 1 140px;
+}
+
+.provider-profile-row input:nth-of-type(3) {
+  flex-basis: 260px;
+}
 .cc-digest-body {
   margin: 0;
   padding: 8px;
@@ -1958,6 +2059,14 @@ body {
   justify-content: space-between;
   gap: 8px;
   margin: 4px 2px 0;
+}
+
+.imb-engine-note {
+  max-width: 260px;
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: normal;
 }
 .imb-left,
 .imb-right {

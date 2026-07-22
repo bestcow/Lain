@@ -47,7 +47,7 @@ describe('buildLiveCard', () => {
       '파일 고치는 중 — store.ts',
       NOW,
     )
-    expect(card).toContain('⚙ blog — 다크모드 구현')
+    expect(card).toContain('⚙ [Claude] blog — 다크모드 구현')
     expect(card).toContain('12분 경과')
     expect(card).toContain('5턴')
     expect(card).toContain('할일 1/2')
@@ -61,6 +61,10 @@ describe('buildLiveCard', () => {
     )
     expect(card).not.toContain('지금:')
     expect(card).toContain('1시간 35분 경과')
+  })
+
+  it('실행 엔진을 카드 첫 줄에 표시한다', () => {
+    expect(buildLiveCard({ ...baseTask, engine: 'codex' }, null, NOW)).toContain('[Codex]')
   })
 })
 

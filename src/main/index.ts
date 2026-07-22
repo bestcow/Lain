@@ -41,6 +41,7 @@ import {
 import { rearmScheduler, runScanOnce, briefNow, stopScheduler } from './scheduler'
 import { runAutoBackupIfDue } from './autobackup'
 import { applyCcHooks, stopCcHooks } from './cchooks'
+import { applyCodexLink, stopCodexLink } from './codexlink'
 import { cleanupCheckpoints } from './rewind'
 import { startTelegram, stopTelegram } from './telegram'
 import { startDiscord, stopDiscord } from './discord'
@@ -107,6 +108,7 @@ const shutdown = createShutdown({
   stops: {
     scheduler: stopScheduler,
     ccHooks: stopCcHooks,
+    codexLink: stopCodexLink,
     telegram: stopTelegram,
     discord: stopDiscord,
     watcher: stopWatcher,
@@ -446,6 +448,8 @@ app.whenReady().then(async () => {
   bootStep('updater', () => initUpdater())
   // 클로드코드 연동(개선 #2) — 켜져 있으면 훅 설치 + inbox 감시 시작(꺼졌으면 잔여 훅 제거). 격리.
   bootStep('ccHooks', () => applyCcHooks())
+  // 외부 Codex 관찰 — OFF면 ~/.codex를 읽지 않는 no-op, ON일 때만 notify 설치+inbox 감시.
+  bootStep('codexLink', () => applyCodexLink())
   // D15 되감기 — 편집 체크포인트 보존 정리(14일/200MB 초과·고아 디렉터리). 격리.
   bootStep('rewindCleanup', () => cleanupCheckpoints())
   // 시작 시 레인 브리핑 1회 생성(프로덕션엔 startup 스캔이 없어 주기 스캔 전까지 브리핑이 비던 것 교정).

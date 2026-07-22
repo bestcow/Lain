@@ -44,11 +44,12 @@ import type {
   ThinkingLevel,
   ChatHistoryHit,
   ReviewDepth,
+  ProviderProfile,
 } from '../shared/types'
 import { MODEL_TIERS } from '../shared/models' // m6 — 티어 목록 단일출처(로컬 중복 제거)
 import type { LoopStats, PromotionStats } from '../shared/loopstats' // L6·A3 — 루프 성적표/승격·강등 실적 집계 결과 타입(main/renderer 공용 아님)
 // 출력측 비밀 redaction + 학습 인젝션 스캔 — 구현은 safety 소유자, store는 chokepoint에서 import-only.
-import { redactSecrets, scanLessonInjection } from './safety'
+import { redactSecrets, registerSecretValues, scanLessonInjection } from './safety'
 // curatedPlugins 기본값(CC-FEATURES P1) — skills는 store를 import하지 않아 단방향(순환 없음).
 import { CURATED_PLUGIN_NAMES } from './skills'
 
@@ -325,6 +326,8 @@ export function initStore(): void {
   safeAlter('ALTER TABLE tasks ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0')
   // 작업 실행 엔진 — claude(기본) | codex(OpenAI Codex CLI). worker만 해당.
   safeAlter("ALTER TABLE tasks ADD COLUMN engine TEXT NOT NULL DEFAULT 'claude'")
+  // M3 — 작업 Navi의 Anthropic 호환 프로바이더 프로필 id(NULL=기본 Anthropic).
+  safeAlter('ALTER TABLE tasks ADD COLUMN provider TEXT')
   // D3 — runNavi throw로 error 확정 전 자동 재시도한 횟수(영속·무한루프 방지). 재부팅 후에도 유지.
   safeAlter('ALTER TABLE tasks ADD COLUMN auto_retry_count INTEGER NOT NULL DEFAULT 0')
   // D10 — 작업별 모델 고정(빈 문자열=전역 naviModel 따름). 다음 실행/재개부터 적용.
@@ -367,6 +370,8 @@ export function initStore(): void {
   safeAlter('ALTER TABLE projects ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
   // C3 — CC 세션 종료 judge 요약(cchooks summarizeCcEnd)을 SessionEnd 행에 붙여 다이제스트로 노출.
   safeAlter('ALTER TABLE cc_events ADD COLUMN summary TEXT')
+  // 멀티 엔진 M1 — 기존 NULL 행은 Claude로 해석. 테이블은 외부 세션 이벤트 공용으로 유지한다.
+  safeAlter('ALTER TABLE cc_events ADD COLUMN engine TEXT')
   try {
     // '숨김'(muted) — 레인이 계속 관리(수집·작업·질의응답)하되, 유저가 먼저 언급하기 전엔 레인이
     // 먼저 화제로 꺼내지 않는 내비. 구 '대기실'(enabled=0, 관리 완전 제외)을 대체 — 기존 비활성
@@ -1582,12 +1587,19 @@ export interface CcEvent {
   event: string // SessionStart | SessionEnd
   createdAt: string
   summary?: string | null // CC 세션 요약(SessionEnd만 유의미)
+  engine: TaskEngine
 }
-export function addCcEvent(projectId: string, sessionId: string, event: string): void {
-  db.prepare('INSERT INTO cc_events (project_id, session_id, event) VALUES (?, ?, ?)').run(
+export function addCcEvent(
+  projectId: string,
+  sessionId: string,
+  event: string,
+  engine: TaskEngine = 'claude',
+): void {
+  db.prepare('INSERT INTO cc_events (project_id, session_id, event, engine) VALUES (?, ?, ?, ?)').run(
     projectId,
     sessionId,
     event,
+    engine,
   )
 }
 // C3 — CC 세션 종료 judge 요약(cchooks summarizeCcEnd)을 해당 SessionEnd 행에 붙인다. 500자 컷(다이제스트 비대화 방지).
@@ -1628,6 +1640,7 @@ export function listRecentCcEvents(limit = 20): CcEvent[] {
     event: r.event,
     createdAt: r.created_at,
     summary: r.summary ?? null,
+    engine: r.engine === 'codex' ? 'codex' : 'claude',
   }))
 }
 
@@ -1640,15 +1653,15 @@ export function listRecentActivity(limit = 20): ActivityRaw[] {
   // 병합 후 상위 limit만 표시하므로 각 소스는 limit개씩만 당겨오면 충분(전량 스캔 방지).
   const taskRows = db
     .prepare(
-      `SELECT task_id, kind, content, created_at
-       FROM task_events
-       WHERE kind IN ('error','exit')
-          OR (kind = 'status' AND (content LIKE '작업 생성%' OR content LIKE '검토 대기%'))
-       ORDER BY id DESC LIMIT ?`,
+      `SELECT e.task_id, e.kind, e.content, e.created_at, t.engine
+       FROM task_events e LEFT JOIN tasks t ON t.id=e.task_id
+       WHERE e.kind IN ('error','exit')
+          OR (e.kind = 'status' AND (e.content LIKE '작업 생성%' OR e.content LIKE '검토 대기%'))
+       ORDER BY e.id DESC LIMIT ?`,
     )
     .all(cap) as any[]
   const ccRows = db
-    .prepare('SELECT project_id, event, summary, created_at FROM cc_events ORDER BY id DESC LIMIT ?')
+    .prepare('SELECT project_id, event, summary, engine, created_at FROM cc_events ORDER BY id DESC LIMIT ?')
     .all(cap) as any[]
   const out: ActivityRaw[] = []
   for (const r of taskRows)
@@ -1658,6 +1671,7 @@ export function listRecentActivity(limit = 20): ActivityRaw[] {
       detail: r.kind,
       text: r.content ?? null,
       taskId: r.task_id ?? null,
+      engine: r.engine === 'codex' ? 'codex' : 'claude',
     })
   for (const r of ccRows)
     out.push({
@@ -1666,6 +1680,7 @@ export function listRecentActivity(limit = 20): ActivityRaw[] {
       detail: r.event,
       projectId: r.project_id ?? null,
       summary: r.summary ?? null,
+      engine: r.engine === 'codex' ? 'codex' : 'claude',
     })
   return out
 }
@@ -1740,6 +1755,7 @@ function rowToTask(r: any): Task {
       : '',
     todos: safeTaskJson(r.todos, null, r.id, 'todos'),
     engine: r.engine === 'codex' ? 'codex' : 'claude',
+    provider: r.provider ?? null,
     priority: r.priority ?? 0,
     dependsOn: safeTaskJson(r.depends_on, [], r.id, 'depends_on'), // D2 — 선행 task id 배열
     groupId: r.group_id ?? null, // D13 — 크로스레포 그룹 소속(NULL=단독)
@@ -1772,13 +1788,14 @@ export function insertTask(t: {
   fastMode?: boolean
   modelOverride?: ModelTier | ''
   engine?: TaskEngine
+  provider?: string | null
   priority?: number // D1 — queued 드레인 순서(낮을수록 먼저, 기본 0)
   dependsOn?: string[] // D2 — 선행 task id(전부 done 돼야 착수)
   groupId?: string // D13 — 크로스레포 그룹 소속
   reviewDepth?: ReviewDepth // L4(P6) — 미지정이면 NULL(설정 reviewDepthDefault를 finishWork가 대신 적용)
 }): void {
   db.prepare(
-    'INSERT INTO tasks (id, project_id, title, state, content, mode, permission_mode, thinking_level, disallowed_tools, skills, fast_mode, model_override, engine, priority, depends_on, group_id, review_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO tasks (id, project_id, title, state, content, mode, permission_mode, thinking_level, disallowed_tools, skills, fast_mode, model_override, engine, provider, priority, depends_on, group_id, review_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   ).run(t.id, t.projectId, t.title, t.state, t.content, t.mode ?? 'interactive',
         t.permissionMode ?? 'acceptEdits',
         t.thinkingLevel ?? 'default',
@@ -1787,6 +1804,7 @@ export function insertTask(t: {
         t.fastMode ? 1 : 0,
         t.modelOverride ?? '',
         t.engine === 'codex' ? 'codex' : 'claude',
+        t.provider || null,
         t.priority ?? 0,
         JSON.stringify(t.dependsOn ?? []),
         t.groupId ?? null,
@@ -1816,6 +1834,7 @@ export function updateTask(id: string, patch: Partial<Task>): void {
     error: 'error',
     autoRetryCount: 'auto_retry_count',
     modelOverride: 'model_override',
+    provider: 'provider',
     priority: 'priority',
     mergeBaseSha: 'merge_base_sha', // D8 — 병합 범위 하한(포착 시 저장, revert에 사용)
     mergeHeadSha: 'merge_head_sha', // D8 — 병합 범위 상한
@@ -3125,6 +3144,38 @@ function asTier(v: string | null, fallback: ModelTier): ModelTier {
   return (MODEL_TIERS as readonly string[]).includes(v ?? '') ? (v as ModelTier) : fallback
 }
 
+function readProviderProfiles(): ProviderProfile[] {
+  const raw = getSetting('provider_profiles')
+  if (!raw) {
+    registerSecretValues([])
+    return []
+  }
+  try {
+    const value = JSON.parse(raw)
+    if (!Array.isArray(value)) {
+      registerSecretValues([])
+      return []
+    }
+    const profiles = value
+      .filter((p) => p && typeof p === 'object')
+      .map((p) => ({
+        id: String(p.id ?? '').trim(),
+        label: String(p.label ?? '').trim(),
+        baseUrl: String(p.baseUrl ?? '').trim(),
+        authToken: String(p.authToken ?? '').trim(),
+        modelId: String(p.modelId ?? '').trim(),
+      }))
+      .filter((p) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(p.id) && p.label && p.baseUrl && p.modelId)
+      .filter((p, i, all) => all.findIndex((q) => q.id === p.id) === i)
+      .slice(0, 20)
+    registerSecretValues(profiles.map((p) => p.authToken))
+    return profiles
+  } catch {
+    registerSecretValues([])
+    return []
+  }
+}
+
 // 어깨너머 — 기본 민감앱 블랙리스트(앱명/창 제목 소문자 부분일치). 사용자가 설정에서 덮어씀.
 const DEFAULT_SENSITIVE_APPS = [
   '1password',
@@ -3177,6 +3228,7 @@ export function getSettings(): LainSettings {
     )
       ? (getSetting('default_task_mode') as 'auto' | 'autonomous' | 'interactive')
       : 'auto',
+    defaultTaskEngine: getSetting('default_task_engine') === 'codex' ? 'codex' : 'claude',
     // L4(P6) — 작업별 reviewDepth 미지정 시 기본 강도. 3값 화이트리스트 외면 'standard'로 안전 폴백.
     reviewDepthDefault: (['light', 'standard', 'adversarial'] as readonly string[]).includes(
       getSetting('review_depth_default') ?? '',
@@ -3225,6 +3277,10 @@ export function getSettings(): LainSettings {
     idleMin: Math.max(1, Number(getSetting('idle_min') ?? '3') || 3),
     routinesEnabled: (getSetting('routines_enabled') ?? '0') === '1',
     ccHooksEnabled: (getSetting('cc_hooks_enabled') ?? '0') === '1',
+    codexLinkEnabled: (getSetting('codex_link_enabled') ?? '0') === '1',
+    providerSwapEnabled: (getSetting('provider_swap_enabled') ?? '0') === '1',
+    providerProfiles: readProviderProfiles(),
+    defaultProvider: getSetting('default_provider') ?? '',
     onboardingDone: (getSetting('onboarding_done') ?? '0') === '1',
     telegramEnabled: (getSetting('telegram_enabled') ?? '0') === '1',
     telegramBotToken: getSetting('telegram_bot_token') ?? '',
@@ -3318,6 +3374,8 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
   if (patch.userAliases !== undefined)
     setSetting('user_aliases', JSON.stringify(patch.userAliases.map((a) => String(a).trim()).filter(Boolean)))
   if (patch.defaultTaskMode !== undefined) setSetting('default_task_mode', patch.defaultTaskMode)
+  if (patch.defaultTaskEngine !== undefined)
+    setSetting('default_task_engine', patch.defaultTaskEngine === 'codex' ? 'codex' : 'claude')
   if (patch.reviewDepthDefault !== undefined)
     setSetting(
       'review_depth_default',
@@ -3374,6 +3432,26 @@ export function saveSettings(patch: Partial<LainSettings>): LainSettings {
     setSetting('routines_enabled', patch.routinesEnabled ? '1' : '0')
   if (patch.ccHooksEnabled !== undefined)
     setSetting('cc_hooks_enabled', patch.ccHooksEnabled ? '1' : '0')
+  if (patch.codexLinkEnabled !== undefined)
+    setSetting('codex_link_enabled', patch.codexLinkEnabled ? '1' : '0')
+  if (patch.providerSwapEnabled !== undefined)
+    setSetting('provider_swap_enabled', patch.providerSwapEnabled ? '1' : '0')
+  if (patch.providerProfiles !== undefined) {
+    const profiles = patch.providerProfiles
+      .map((p) => ({
+        id: String(p.id ?? '').trim(),
+        label: String(p.label ?? '').trim(),
+        baseUrl: String(p.baseUrl ?? '').trim(),
+        authToken: String(p.authToken ?? '').trim(),
+        modelId: String(p.modelId ?? '').trim(),
+      }))
+      .filter((p) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(p.id) && p.label && p.baseUrl && p.modelId)
+      .filter((p, i, all) => all.findIndex((q) => q.id === p.id) === i)
+      .slice(0, 20)
+    setSetting('provider_profiles', JSON.stringify(profiles))
+  }
+  if (patch.defaultProvider !== undefined)
+    setSetting('default_provider', patch.defaultProvider.trim())
   if (patch.onboardingDone !== undefined)
     setSetting('onboarding_done', patch.onboardingDone ? '1' : '0')
   if (patch.curatedPlugins !== undefined)

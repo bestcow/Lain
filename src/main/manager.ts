@@ -808,8 +808,12 @@ const lainServer = createSdkMcpServer({
           .enum(['claude', 'codex'])
           .optional()
           .describe(
-            '실행 엔진. codex=OpenAI Codex CLI(별도 설치·로그인 필요, Claude 크레딧 절약). 사용자가 명시로 원할 때만 codex — 단 codex는 승인 큐·ask_manager 질문·학습/스킬 주입이 없고(샌드박스가 방어선) autonomous 미지원. 생략=claude',
+            '실행 엔진. codex=OpenAI Codex CLI(별도 설치·로그인 필요, Claude 크레딧 절약). 사용자가 명시로 원할 때만 codex — 단 codex는 승인 큐·ask_manager 질문·학습/스킬 주입이 없고(샌드박스가 방어선) autonomous 미지원. 생략=설정 기본 엔진',
           ),
+        provider: z
+          .string()
+          .optional()
+          .describe('Claude 작업에 적용할 Anthropic 호환 프로바이더 프로필 id. 설정의 실험 플래그가 켜진 경우만. 생략=설정 기본'),
         depends_on: z
           .array(z.string())
           .optional()
@@ -821,7 +825,7 @@ const lainServer = createSdkMcpServer({
           .optional()
           .describe('리뷰 강도 — adversarial은 3렌즈 심사(비용↑). 생략 시 설정 기본값'),
       },
-      async ({ project_id, content, mode, permission_mode, thinking, disallowed_tools, skills, fast, engine, depends_on, review_depth }) => {
+      async ({ project_id, content, mode, permission_mode, thinking, disallowed_tools, skills, fast, engine, provider, depends_on, review_depth }) => {
         const r = await startTask(project_id, {
           content,
           mode,
@@ -831,6 +835,7 @@ const lainServer = createSdkMcpServer({
           skills,
           fastMode: fast,
           engine,
+          provider,
           dependsOn: depends_on,
           reviewDepth: review_depth,
         })

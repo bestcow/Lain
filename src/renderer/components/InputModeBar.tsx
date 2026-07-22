@@ -1,9 +1,15 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react'
-import type { LainSettings, TaskPermissionMode, ManagerEffort } from '../../shared/types'
+import type {
+  EngineCapabilityInfo,
+  LainSettings,
+  TaskEngine,
+  TaskPermissionMode,
+  ManagerEffort,
+} from '../../shared/types'
 import { MODEL_TIERS, MODEL_NAME } from '../../shared/models'
 import { Icon } from './icons'
 
-type Opt = { value: string; label: string }
+type Opt = { value: string; label: string; disabled?: boolean; reason?: string }
 
 // 커스텀 드롭다운 — 버튼 위로 뜨는 팝업(둥근 사각형·연한 테두리·헤더·옵션 하단 footer 슬롯).
 function ModeDropdown({
@@ -15,6 +21,7 @@ function ModeDropdown({
   footer,
   align = 'left',
   cat,
+  disabled = false,
 }: {
   value: string
   options: Opt[]
@@ -24,6 +31,7 @@ function ModeDropdown({
   footer?: ReactNode
   align?: 'left' | 'right'
   cat?: string // 값 앞에 병기할 카테고리 이름표 — 닫힌 상태에서도 무슨 설정인지 보이게
+  disabled?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -38,7 +46,7 @@ function ModeDropdown({
   const current = options.find((o) => o.value === value)
   return (
     <div className="imb-dd" ref={ref}>
-      <button className="imb-sel" title={title} onClick={() => setOpen((v) => !v)}>
+      <button className="imb-sel" title={title} disabled={disabled} onClick={() => setOpen((v) => !v)}>
         {cat && <span className="imb-cat">{cat}</span>}
         {current?.label ?? value}
       </button>
@@ -49,6 +57,8 @@ function ModeDropdown({
             <button
               key={o.value}
               className={`imb-item${o.value === value ? ' imb-item-on' : ''}`}
+              disabled={o.disabled}
+              title={o.disabled ? (o.reason ?? '이 옵션은 현재 사용할 수 없다') : undefined}
               onClick={() => {
                 onChange(o.value)
                 setOpen(false)
@@ -102,15 +112,36 @@ export function InputModeBar({
   onPatch,
   onPlus,
   contextPercent,
+  engineInfos,
 }: {
   settings: LainSettings
   onPatch: (p: Partial<LainSettings>) => void
   onPlus: (anchor: { x: number; y: number }) => void
   contextPercent?: number | null // A5 — 무한세션 컨텍스트 게이지(%). null/undefined = 압축 비활성·데이터 없음(빈 orb)
+  engineInfos: EngineCapabilityInfo[]
 }) {
   // A5 — 게이지 % 클램프(0~100, 표시용) + 임계 접근(80%+) 경고색 판정. null=압축 비활성·데이터 없음(빈 orb).
   const gaugePct = contextPercent == null ? null : Math.min(100, Math.max(0, contextPercent))
   const gaugeWarn = gaugePct != null && gaugePct >= 80
+  const engineOpts = engineInfos.map((i) => ({ value: i.engine, label: i.label }))
+  const selectedEngine = engineInfos.find((i) => i.engine === settings.defaultTaskEngine)
+  const downgradeNotes = selectedEngine
+    ? Object.values(selectedEngine.capabilityNotes).filter(Boolean)
+    : []
+  const providerOpts = [
+    { value: '', label: 'Anthropic' },
+    ...settings.providerProfiles.map((p) => ({
+      value: p.id,
+      label: `${p.label} · ${p.modelId}${p.authToken.length >= 4 ? '' : ' (토큰 없음)'}`,
+      disabled: p.authToken.length < 4,
+      reason: '토큰을 저장해야 선택할 수 있다',
+    })),
+  ]
+  const taskModeOpts = TASKMODE_OPTS.map((o) =>
+    o.value === 'autonomous' && selectedEngine && !selectedEngine.capabilities.autonomous
+      ? { ...o, disabled: true, reason: selectedEngine.capabilityNotes.autonomous }
+      : o,
+  )
   return (
     <div className="input-modebar">
       <div className="imb-left">
@@ -171,8 +202,38 @@ export function InputModeBar({
         {/* 그룹 경계 — 여기부터는 레인 자신이 아니라 '작업을 어떻게 굴리나' */}
         <span className="imb-sep" aria-hidden="true" />
         <ModeDropdown
+          value={settings.defaultTaskEngine}
+          options={engineOpts.length ? engineOpts : [{ value: 'claude', label: 'Claude' }]}
+          onChange={(v) => onPatch({ defaultTaskEngine: v as TaskEngine })}
+          title="새 작업의 기본 실행 엔진"
+          header="작업 엔진"
+          cat="엔진"
+          align="right"
+          footer={
+            downgradeNotes.length ? (
+              <div className="imb-engine-note">{downgradeNotes.join(' · ')}</div>
+            ) : undefined
+          }
+        />
+        {settings.providerSwapEnabled && (
+          <ModeDropdown
+            value={settings.defaultProvider}
+            options={providerOpts}
+            onChange={(v) => onPatch({ defaultProvider: v })}
+            disabled={settings.defaultTaskEngine !== 'claude'}
+            title={
+              settings.defaultTaskEngine !== 'claude'
+                ? '프로바이더 스왑은 Claude 작업에서만 사용할 수 있다'
+                : '새 Claude 작업의 기본 프로바이더'
+            }
+            header="프로바이더"
+            cat="공급자"
+            align="right"
+          />
+        )}
+        <ModeDropdown
           value={settings.defaultTaskMode}
-          options={TASKMODE_OPTS}
+          options={taskModeOpts}
           onChange={(v) => onPatch({ defaultTaskMode: v as LainSettings['defaultTaskMode'] })}
           title="작업 방식 — 자동판정 / 자율(무개입) / 대화형"
           header="작업 방식"

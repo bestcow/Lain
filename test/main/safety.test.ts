@@ -5,6 +5,8 @@ import {
   blocksSecretFile,
   toolFilePath,
   FILE_PATH_TOOLS,
+  redactSecrets,
+  registerSecretValues,
 } from '../../src/main/safety'
 
 describe('isSecretFile — 비밀 파일 데노리스트(§24)', () => {
@@ -66,6 +68,22 @@ describe('isSecretFile — 비밀 파일 데노리스트(§24)', () => {
     // .env.example: SECRET_RE(.env) 매칭 가능하지만 EXAMPLE_RE가 먼저 false로 끊는다.
     expect(isSecretFile('.env.example')).toBe(false)
     expect(isSecretFile('.env.sample')).toBe(false)
+  })
+})
+
+describe('동적 프로바이더 토큰 redaction', () => {
+  it('형상이 알려지지 않은 실제 설정 토큰도 원문에서 제거한다', () => {
+    registerSecretValues(['moonshot-token-1234', 'deepseek.custom.secret'])
+    expect(redactSecrets('a moonshot-token-1234 b deepseek.custom.secret')).toBe(
+      'a [REDACTED] b [REDACTED]',
+    )
+    registerSecretValues([])
+  })
+
+  it('너무 짧은 값은 오탐 방지를 위해 등록하지 않는다', () => {
+    registerSecretValues(['abc'])
+    expect(redactSecrets('abc')).toBe('abc')
+    registerSecretValues([])
   })
 })
 

@@ -5,6 +5,7 @@ import {
   thinkingOption,
   managerAgentOptions,
   tierQueryOptions,
+  providerQueryOptions,
   adaptiveEffort,
   secretDeny,
   preToolUseGuard,
@@ -56,6 +57,60 @@ describe('tierQueryOptions — 티어 → 모델/로컬 라우팅 옵션', () =>
   it('localBaseUrl 설정이 그대로 반영된다', () => {
     const o = tierQueryOptions('local', { localBaseUrl: 'http://127.0.0.1:9999' }, {})
     expect(o.env!.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:9999')
+  })
+})
+
+describe('providerQueryOptions — worker 전용 프로바이더 라우팅', () => {
+  const profiles = [
+    {
+      id: 'kimi',
+      label: 'Kimi K3',
+      baseUrl: 'https://api.moonshot.ai/anthropic/',
+      authToken: 'kimi-secret',
+      modelId: 'kimi-k3[1m]',
+    },
+  ]
+
+  it('플래그 OFF 또는 미선택이면 null — 기존 Anthropic 경로 불변', () => {
+    expect(providerQueryOptions('kimi', { providerSwapEnabled: false, providerProfiles: profiles })).toBeNull()
+    expect(providerQueryOptions('', { providerSwapEnabled: true, providerProfiles: profiles })).toBeNull()
+  })
+
+  it('선택 프로필의 실제 model/env를 주입하고 기존 API key는 제거한다', () => {
+    const out = providerQueryOptions(
+      'kimi',
+      { providerSwapEnabled: true, providerProfiles: profiles },
+      { PATH: 'C:\\bin', ANTHROPIC_API_KEY: 'do-not-leak' },
+    )!
+    expect(out.model).toBe('kimi-k3[1m]')
+    expect(out.env.PATH).toBe('C:\\bin')
+    expect(out.env.ANTHROPIC_BASE_URL).toBe('https://api.moonshot.ai/anthropic')
+    expect(out.env.ANTHROPIC_AUTH_TOKEN).toBe('kimi-secret')
+    expect(out.env.ANTHROPIC_API_KEY).toBeUndefined()
+    expect(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('kimi-k3[1m]')
+    expect(out.env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('kimi-k3[1m]')
+  })
+
+  it('없는 프로필·토큰 없는 프로필은 조용히 Anthropic으로 새지 않고 실패한다', () => {
+    expect(() => providerQueryOptions('missing', { providerSwapEnabled: true, providerProfiles: profiles })).toThrow(
+      '프로바이더 프로필 없음',
+    )
+    expect(() =>
+      providerQueryOptions('kimi', {
+        providerSwapEnabled: true,
+        providerProfiles: [{ ...profiles[0], authToken: '' }],
+      }),
+    ).toThrow('프로바이더 프로필 미완성')
+  })
+
+  it('기존 tier 경로(manager·judge 공용)는 프로바이더 설정이 있어도 바뀌지 않는다', () => {
+    const settings = {
+      localBaseUrl: 'http://127.0.0.1:8080',
+      anthropicApiKey: '',
+      providerSwapEnabled: true,
+      providerProfiles: profiles,
+    }
+    expect(tierQueryOptions('sonnet', settings)).toEqual({ model: 'claude-sonnet-4-6' })
   })
 })
 

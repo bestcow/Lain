@@ -28,7 +28,7 @@ import {
 import { notifyUser } from './notify'
 import { runCodexNavi } from './codex'
 import { classifySystemDestructive } from './sysrisk'
-import { isTestFile } from './safety'
+import { isTestFile, redactSecrets } from './safety'
 import { shouldCompact, contextOccupancyTokens } from './compactgate'
 import { summarizeNaviHandoff, handoffBlock, taskEventsToDialogue } from './handoff'
 import type { ExitReason, NaviMode, Task, TaskEngine, TaskEvent } from '../shared/types'
@@ -38,7 +38,7 @@ import { capTaskImages, toImageBlocks } from './taskimages'
 import { NAVI_SENDER_LEGEND } from './navisender'
 import { conventionsBlock } from './conventions'
 import { naviSkillsBlock, isValidSkillName, readSkillBody } from './agentskills'
-import { thinkingOption, tierQueryOptions, preToolUseGuard, secretDeny } from './agentopts'
+import { thinkingOption, tierQueryOptions, providerQueryOptions, preToolUseGuard, secretDeny } from './agentopts'
 import type { PreToolDeny } from './agentopts'
 import { budgetExceeded, recordUsage } from './usage'
 import { parseTodoWriteInput, encodeTodoLine } from '../shared/todoline'
@@ -863,6 +863,8 @@ export async function runNavi(
     let transientAttempt = 0
     while (true) {
      try {
+    const runSettings = getSettings()
+    const providerOptions = providerQueryOptions(task.provider, runSettings)
     const stream = query({
       prompt: makePrompt(),
       options: {
@@ -876,10 +878,10 @@ export async function runNavi(
         // P2 allow/deny — 금지 도구(블랙리스트). canUseTool 가드와 별개의 SDK 레벨 필터.
         ...(task.disallowedTools.length ? { disallowedTools: task.disallowedTools } : {}),
         maxTurns: 60,
-        ...tierQueryOptions(opts.modelOverride ?? getSettings().naviModel, getSettings()), // §9b 티어링(local 라우팅 포함)
+        ...(providerOptions ?? tierQueryOptions(opts.modelOverride ?? runSettings.naviModel, runSettings)), // M3 provider 선택 시 실제 modelId/env, 아니면 종전 티어링
         // B4 fast-mode — 작업별 Opus 빠른 출력 모드. SDK는 settings(inline Settings)로 받는다(settingSources와 별개라 정체성 오염 0).
         ...(task.fastMode ? { settings: { fastMode: true } } : {}),
-        ...skillOptions(task.skills, getSettings().skillsEnabled, getSettings().curatedPlugins),
+        ...skillOptions(task.skills, runSettings.skillsEnabled, runSettings.curatedPlugins),
         // 결정론 차단(시크릿·spec-gaming)의 실발동 지점 — auto-allow된 호출도 PreToolUse는 반드시 거친다.
         ...preToolUseGuard(denyCheck, recordDeny),
 
@@ -889,7 +891,7 @@ export async function runNavi(
         // 내부 lain 서버 + 사용자 등록 외부 MCP(navi 타깃, enabled만) — CC-FEATURES P1
         mcpServers: { lain: lainServer, ...mcpServersFor('navi') },
         stderr: (d: string) =>
-          appendCapped(path.join(DATA_DIR, `worker-${task.id}-stderr.log`), d),
+          appendCapped(path.join(DATA_DIR, `worker-${task.id}-stderr.log`), redactSecrets(d)),
         canUseTool: async (toolName, input, { toolUseID }) => {
           const cmd = String((input as any)?.command ?? '')
           const desc = String((input as any)?.description ?? '')

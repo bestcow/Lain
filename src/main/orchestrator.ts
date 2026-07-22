@@ -203,7 +203,11 @@ function decideMode(taskId: string, autoGradable: boolean): void {
   const pref = getSettings().defaultTaskMode
   // A3 — 자동판정의 autonomous에는 프로젝트 완료 실적(loopStats)을 요구(첫 작업 프로젝트 hands-off 방지).
   const done = loopStats(AUTONOMOUS_DONE_WINDOW_DAYS, task.projectId).done
-  const mode = pickTaskMode(task.content, pref, autoGradable, !!project?.verifyCmd, done)
+  const picked = pickTaskMode(task.content, pref, autoGradable, !!project?.verifyCmd, done)
+  // capability 없는 엔진이 auto 판정 뒤 autonomous로 승격되는 숨은 경로를 차단한다.
+  const mode = picked === 'autonomous' && !engineCapabilities(task.engine).autonomous
+    ? 'interactive'
+    : picked
   if (mode !== task.mode) updateTask(taskId, { mode })
   // glass-box — 실적 게이트가 결정적이었으면(실적만 찼다면 autonomous였을 판정) 사유를 로그에 남긴다.
   const gated =
@@ -368,6 +372,7 @@ export async function startTask(
     fastMode?: boolean
     modelOverride?: ModelTier | '' // D10 — 이 작업만 고정할 모델('' 또는 생략=전역 naviModel)
     engine?: TaskEngine // codex = OpenAI Codex CLI로 실행(설치·로그인 필요). 기본 claude
+    provider?: string // M3 — Claude worker 전용 프로바이더 프로필 id
     dependsOn?: string[] // D2 — 선행 task id. 전부 done 될 때까지 queued 대기 후 자동 착수
     groupId?: string // D13 — 크로스레포 그룹 소속(startTaskGroup 내부 전용)
     reviewDepth?: ReviewDepth // L4(P6) — 이 작업의 독립 심사 강도(생략 시 설정 reviewDepthDefault)
@@ -376,6 +381,23 @@ export async function startTask(
   const project = getProject(projectId)
   if (!project) return { error: '프로젝트 없음' }
   if (!project.isGit) return { error: '비-git 프로젝트는 Phase 1에서 미지원 (§15b)' }
+  const settings = getSettings()
+  const engine = opts.engine ?? settings.defaultTaskEngine
+  if (opts.provider && engine !== 'claude') {
+    return { error: '프로바이더 스왑은 Claude 작업에서만 사용할 수 있다' }
+  }
+  if (opts.provider && !settings.providerSwapEnabled) {
+    return { error: '프로바이더 스왑 기능이 꺼져 있다' }
+  }
+  const provider =
+    engine === 'claude' && settings.providerSwapEnabled
+      ? (opts.provider ?? settings.defaultProvider).trim()
+      : ''
+  if (provider) {
+    const profile = settings.providerProfiles.find((p) => p.id === provider)
+    if (!profile) return { error: `프로바이더 프로필 없음: ${provider}` }
+    if (profile.authToken.trim().length < 4) return { error: `프로바이더 토큰 없음/너무 짧음: ${profile.label}` }
+  }
 
   // D1 — 즉시 착수 가능 여부. 프로젝트 상한·전역 cap 초과면 거절이 아니라 큐에 적재한다.
   // D14 — 프로젝트당 동시 활성은 projectParallelCap(기본 1=종전 '진행 중이면 대기')까지 허용. 병합 충돌은
@@ -384,11 +406,11 @@ export async function startTask(
   // D7 — 전역 사용량 가드: 최근 창 누적 토큰이 한도 근접이면 신규 스폰을 큐로 우회(거절 아님). 큐에 쌓아
   // 두고 사용량이 창 밖으로 빠져 여유가 생기면 drainQueue가 착수한다(병렬 작업이 한도를 다 태워 급한 작업을
   // 막는 것 방지). off(limit=0)면 항상 false → 기존 동작 불변.
-  const cap = getSettings().concurrencyCap
+  const cap = settings.concurrencyCap
   const projectBusy =
-    activeTaskCountForProject(projectId) >= Math.max(1, getSettings().projectParallelCap)
+    activeTaskCountForProject(projectId) >= Math.max(1, settings.projectParallelCap)
   const capFull = capRoom(listTasks(), cap, isAwaitingApproval) <= 0
-  const usageTripped = usageGuardTripped(recentUsageTokens(), getSettings().usageWindowTokenLimit)
+  const usageTripped = usageGuardTripped(recentUsageTokens(), settings.usageWindowTokenLimit)
   // D2 — 선행 의존 검증(존재하는 id만 — depsMet는 미지 id를 충족으로 보므로 오타를 여기서 끊는다).
   // 신규 task id는 아직 없으니 사이클은 불가능(사후 조정 set_task_deps 쪽에서 검사).
   const dependsOn = [...new Set(opts.dependsOn ?? [])]
@@ -430,14 +452,14 @@ export async function startTask(
   }
   // D12 — autonomous 미지원 엔진 거절을 capability 기반으로 일반화(하드코딩 엔진 문자열 대신).
   // autonomous는 spec-gaming 방어(테스트 파일 수정 차단)가 canUseTool 기반이라 그 게이트가 없는 엔진(codex 등)에선 불가.
-  if (mode === 'autonomous' && !engineCapabilities(opts.engine).autonomous) {
+  if (mode === 'autonomous' && !engineCapabilities(engine).autonomous) {
     return {
-      error: `${opts.engine ?? 'claude'} 엔진은 autonomous(무개입) 모드를 지원하지 않는다(테스트 보호 게이트 미지원) — interactive로 시작해라.`,
+      error: `${engine} 엔진은 autonomous(무개입) 모드를 지원하지 않는다(테스트 보호 게이트 미지원) — interactive로 시작해라.`,
     }
   }
   // Codex 고유 — 시작 전 설치·로그인 검사(런타임 blocked보다 명확한 즉시 에러). capability와 별개:
   // 이건 '엔진 능력'이 아니라 외부 CLI의 설치/로그인 가용성이라 codex 전용 게이트로 유지한다.
-  if (opts.engine === 'codex') {
+  if (engine === 'codex') {
     const st = codexStatus()
     if (!st.ok) return { error: `codex 엔진 사용 불가 — ${st.reason}` }
   }
@@ -459,7 +481,8 @@ export async function startTask(
     skills: opts.skills,
     fastMode: opts.fastMode,
     modelOverride: opts.modelOverride,
-    engine: opts.engine,
+    engine,
+    provider: provider || null,
     dependsOn,
     groupId: opts.groupId,
     reviewDepth: opts.reviewDepth,
@@ -480,7 +503,7 @@ export async function startTask(
     return { taskId, mode, queued: true, queuePos: pos }
   }
 
-  log(taskId, 'status', `작업 생성[${mode}${opts.engine === 'codex' ? '·codex' : ''}]: ${title}`)
+  log(taskId, 'status', `작업 생성[${mode}·${engine}${provider ? `·${provider}` : ''}]: ${title}`)
   // §23 벤치는 clarify를 건너뛴다(측정 일관성 — 명세 명확한 fixture 전제)
   beginTask(taskId, !!opts.skipClarify)
 
@@ -1251,6 +1274,8 @@ export async function rerunTask(
     fastMode: task.fastMode,
     modelOverride: task.modelOverride,
     engine: task.engine,
+    // 킬스위치 OFF면 과거 provider id를 되살리지 않고 기존 Anthropic 경로로 재실행한다.
+    provider: getSettings().providerSwapEnabled ? (task.provider ?? undefined) : undefined,
   })
 }
 

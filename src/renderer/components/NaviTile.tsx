@@ -1,9 +1,10 @@
 import { memo, type MouseEvent as ReactMouseEvent } from 'react'
-import type { ProjectView, Task } from '../../shared/types'
+import type { EngineCapabilityInfo, ProjectView, Task } from '../../shared/types'
 import { todoProgress } from '../../shared/todoline'
 import { fmtRelTime, tileMeta } from '../lib/chat'
 import { ProjectSprite } from './projectSprite'
 import { naviStatus } from './StageView'
+import { EngineBadge } from './EngineBadge'
 
 interface Props {
   project: ProjectView
@@ -15,6 +16,8 @@ interface Props {
   onStartTask: (id: string) => void
   onContextMenu?: (e: ReactMouseEvent, p: ProjectView) => void
   onRequestRemove?: (p: ProjectView) => void
+  engineInfo?: EngineCapabilityInfo
+  providerModel?: { label: string; modelId: string }
 }
 
 function NaviTileInner({
@@ -27,6 +30,8 @@ function NaviTileInner({
   onStartTask,
   onContextMenu,
   onRequestRemove,
+  engineInfo,
+  providerModel,
 }: Props) {
   const st = naviStatus(p, task)
   const s = p.status
@@ -93,6 +98,12 @@ function NaviTileInner({
             <span className="status-dot" />
             {st.label}
           </span>
+          {task && <EngineBadge engine={task.engine} info={engineInfo} />}
+          {providerModel && (
+            <span className="provider-model-badge" title={`실제 모델 ${providerModel.modelId}`}>
+              {providerModel.label} · {providerModel.modelId}
+            </span>
+          )}
         </div>
         {tm.active ? (
           <>

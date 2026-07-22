@@ -471,6 +471,39 @@ describe('startTask — skills 저장', () => {
   })
 })
 
+describe('startTask — M3 프로바이더 선택', () => {
+  const profile = {
+    id: 'kimi',
+    label: 'Kimi K3',
+    baseUrl: 'https://api.moonshot.ai/anthropic',
+    authToken: 'test-token',
+    modelId: 'kimi-k3[1m]',
+  }
+
+  afterEach(() => saveSettings({ providerSwapEnabled: false, providerProfiles: [], defaultProvider: '' }))
+
+  it('플래그 ON의 기본 프로필을 새 Claude 작업에 고정한다', async () => {
+    saveSettings({ providerSwapEnabled: true, providerProfiles: [profile], defaultProvider: 'kimi' })
+    const r = await startTask(TEST_PROJECT_ID, { content: 'provider 기본값 테스트' })
+    expect(r.error).toBeUndefined()
+    expect(getTask(r.taskId!)!.provider).toBe('kimi')
+    updateTask(r.taskId!, { state: 'done' })
+    saveSettings({ providerSwapEnabled: false })
+    const rerun = await rerunTask(r.taskId!)
+    expect(getTask(rerun.taskId!)!.provider).toBeNull()
+    updateTask(rerun.taskId!, { state: 'done' })
+  })
+
+  it('Codex 작업과 플래그 OFF에서는 명시 프로필을 거절한다', async () => {
+    saveSettings({ providerSwapEnabled: true, providerProfiles: [profile] })
+    expect((await startTask(TEST_PROJECT_ID, { content: 'x', engine: 'codex', provider: 'kimi' })).error)
+      .toContain('Claude 작업')
+    saveSettings({ providerSwapEnabled: false })
+    expect((await startTask(TEST_PROJECT_ID, { content: 'x', provider: 'kimi' })).error)
+      .toContain('꺼져')
+  })
+})
+
 // D12 — autonomous 거절이 하드코딩 엔진 문자열이 아니라 engineCapabilities(engine).autonomous로 일반화됐는지.
 // codex는 autonomous:false라 verify_cmd가 있어도 autonomous 마커면 거절, claude는 착수한다.
 describe('startTask — autonomous 미지원 엔진 거절(capability 일반화)', () => {

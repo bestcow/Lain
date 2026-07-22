@@ -2,20 +2,23 @@
 // '오늘 이 머신에서 무슨 일이 있었나'를 한눈에 본다. 신규 백엔드 조회(activity:recent) 1개를 쓰되 병합·
 // 라벨링·정렬은 렌더러 순수 함수(mergeActivity)로 검증한다. 구조·스타일은 HistoryPanel/LessonsPanel을 따른다.
 import { useEffect, useState } from 'react'
-import type { ActivityRaw, Project } from '../../shared/types'
+import type { ActivityRaw, EngineCapabilityInfo, Project } from '../../shared/types'
 import { mergeActivity } from '../lib/activityFeed'
 import { fmtRelTime } from '../lib/chat'
 import { Icon } from './icons'
+import { EngineBadge, engineInfoFor } from './EngineBadge'
 
 const LIMIT = 20
 
 export function ActivityPanel({ onClose }: { onClose: () => void }) {
   const [raws, setRaws] = useState<ActivityRaw[] | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
+  const [engineInfos, setEngineInfos] = useState<EngineCapabilityInfo[]>([])
 
   useEffect(() => {
     window.lain.recentActivity(LIMIT).then(setRaws)
     window.lain.listProjects().then(setProjects)
+    window.lain.engineCapabilities().then(setEngineInfos)
     // 라이브 갱신 — 작업 상태 변화·새 CC 세션이 곧 피드에 잡히게, tasks:updated 신호에 편승해 재조회.
     return window.lain.onTasksUpdated(() => window.lain.recentActivity(LIMIT).then(setRaws))
   }, [])
@@ -45,7 +48,12 @@ export function ActivityPanel({ onClose }: { onClose: () => void }) {
             return (
               <div key={`${it.source}-${it.at}-${i}`} className="activity-row">
                 <span className={`activity-src activity-src-${it.source}`}>
-                  {it.source === 'cc' ? 'CC' : 'TASK'}
+                  {it.source === 'task' && 'TASK '}
+                  <EngineBadge
+                    engine={it.engine}
+                    info={engineInfoFor(engineInfos, it.engine)}
+                    observed={it.source === 'cc'}
+                  />
                 </span>
                 <div className="activity-body">
                   <div className="activity-label">

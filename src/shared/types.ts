@@ -79,6 +79,22 @@ export type ManagerEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra
 // codex는 OpenAI Codex CLI(전역 설치+로그인) 필요. 승인 큐 대신 codex 샌드박스가 방어선.
 export type TaskEngine = 'claude' | 'codex'
 
+export type EngineCapability = 'approvals' | 'askManager' | 'autonomous' | 'lessons'
+
+export interface NaviEngineCapabilities {
+  approvals: boolean
+  askManager: boolean
+  autonomous: boolean
+  lessons: boolean
+}
+
+export interface EngineCapabilityInfo {
+  engine: TaskEngine
+  label: string
+  capabilities: NaviEngineCapabilities
+  capabilityNotes: Partial<Record<EngineCapability, string>>
+}
+
 // L4(P6) — 리뷰 강도 다이얼: light=독립 심사 생략(verify만 신뢰) · standard=judge 1콜 심사(기본) ·
 // adversarial=3렌즈(요구사항/완료조건/회귀) 병렬 심사 후 과반 합의(비용↑, opt-in). audit.ts runAudit이 분기.
 export type ReviewDepth = 'light' | 'standard' | 'adversarial'
@@ -99,6 +115,7 @@ export interface Task {
   state: TaskState
   mode: NaviMode // §21 — 기본 interactive
   engine: TaskEngine // 실행 엔진(기본 claude)
+  provider?: string | null // M3 — 프로바이더 프로필 id(NULL=기본 Anthropic). Claude worker에만 적용
   permissionMode: TaskPermissionMode // P2 — 기본 acceptEdits. bypass=승인 자동통과(시크릿·테스트보호는 유지)
   thinkingLevel: ThinkingLevel // P2 — 확장사고 수준(기본 default=미설정)
   disallowedTools: string[] // P2 — 이 작업 Navi에 금지할 도구 이름(빈 배열=제한 없음). canUseTool 가드와 별개 SDK 필터
@@ -322,6 +339,7 @@ export interface LainSettings {
   userTitle: string // 레인이 사용자를 부르는 호칭(기본 '유저'). 채팅 라벨·레인 말투에 반영. set_user_title 도구/환경설정으로 변경
   userAliases: string[] // 외부 앱(디스코드·카톡 등) 채팅에서 사용자 본인의 표시명/닉네임 — 감시(오버레이)가 화면 속 본인/타인을 구별하는 데 사용
   defaultTaskMode: 'auto' | 'autonomous' | 'interactive' // 작업 위임 기본(auto=현 자동판정)
+  defaultTaskEngine: TaskEngine // 멀티 엔진 — 새 작업의 기본 실행 엔진(기본 claude)
   reviewDepthDefault: ReviewDepth // L4(P6) — 작업별 reviewDepth 미지정 시 기본 강도(기본 standard). start_task로 작업별 override 가능
   // 어깨너머 모드 (실시간 감시 + 우하단 오버레이) — 메인창 안 볼 때 화면 작업을 관찰해 먼저 조언
   overlayMonitoringEnabled: boolean // 어깨너머 on/off (기본 off, opt-in)
@@ -347,6 +365,10 @@ export interface LainSettings {
   idleMin: number // idle 판정 임계(분) — 마지막 채팅 활동 후 이 시간 경과해야 끼어듦 허용 (기본 3)
   routinesEnabled: boolean // 선언적 routines 스케줄 디스패치 on/off (기본 off — off면 등록만 되고 실행 안 됨)
   ccHooksEnabled: boolean // 클로드코드 연동 — 레인 밖에서 직접 실행한 CC 세션을 레인이 인지(훅 자동 설치). 기본 off
+  codexLinkEnabled: boolean // 외부 Codex 관찰 — ~/.codex notify 연동(기본 off, opt-in)
+  providerSwapEnabled: boolean // M3 — 작업 Navi 프로바이더 스왑 UI/배관 킬스위치(기본 off)
+  providerProfiles: ProviderProfile[] // Anthropic 호환 프로바이더 프로필(토큰은 시크릿)
+  defaultProvider: string // 새 Claude 작업에 적용할 프로필 id(''=기본 Anthropic)
   onboardingDone: boolean // 첫 실행 위저드 완료 플래그(기존 설치는 마이그레이션에서 자동 true)
   // §20.3 텔레그램 채널 — 자리 비웠을 때 폰으로 와이어드 지휘·결재
   telegramEnabled: boolean // 텔레그램 어댑터 on/off
@@ -503,6 +525,7 @@ export interface ActivityRaw {
   taskId?: string | null // task 출처
   projectId?: string | null // cc 출처
   summary?: string | null // cc 출처: cc_events.summary (SessionEnd 요약)
+  engine?: TaskEngine // task/외부 세션 실행 엔진. 구행 NULL은 claude
 }
 
 // C6 — 병합·라벨링된 활동 요소(표시용). mergeActivity 산출물.
@@ -513,6 +536,15 @@ export interface ActivityItem {
   taskId: string | null
   label: string // 사람이 읽을 한 줄
   kind: string // 원본 kind/event (렌더러 아이콘 분기용)
+  engine: TaskEngine
+}
+
+export interface ProviderProfile {
+  id: string
+  label: string
+  baseUrl: string
+  authToken: string
+  modelId: string
 }
 
 // 파일 첨부 (채팅 입력 - 이미지·텍스트)
@@ -534,6 +566,16 @@ export interface CcSessionInfo {
   entrypoint: string // 'claude-desktop' 등 — 데스크톱/CLI 출처 구분
 }
 
+export type ObservedSessionStatus = 'active' | 'recent' | 'ended'
+
+// 레인 밖에서 직접 연 Claude Code/Codex 세션을 한 목록으로 표시하는 공용 메타.
+export interface ObservedSessionInfo extends CcSessionInfo {
+  engine: TaskEngine
+  origin: 'observed'
+  status: ObservedSessionStatus
+  provider?: string
+}
+
 // preload가 contextBridge로 노출하는 API 표면
 export interface LainApi {
   listProjects(): Promise<ProjectView[]>
@@ -549,6 +591,20 @@ export interface LainApi {
   // CC 세션 열람 — 프로젝트의 클로드코드(데스크톱/터미널) 세션 목록·내용 발췌(읽기 전용)
   listCcSessions(projectId: string): Promise<CcSessionInfo[]>
   ccSessionDigest(projectId: string, sessionId: string): Promise<string | null>
+  listObservedSessions(projectId: string): Promise<ObservedSessionInfo[]>
+  observedSessionDigest(
+    projectId: string,
+    engine: TaskEngine,
+    sessionId: string,
+  ): Promise<string | null>
+  engineCapabilities(): Promise<EngineCapabilityInfo[]>
+  adoptObservedSession(
+    projectId: string,
+    sourceEngine: TaskEngine,
+    sessionId: string,
+    taskEngine?: TaskEngine,
+    goal?: string,
+  ): Promise<{ taskId?: string; mode?: NaviMode; error?: string; queued?: boolean; queuePos?: number }>
   sendChat(text: string, attachments?: FileAttachment[], conversationId?: string): Promise<void>
   stopChat(): Promise<void>
   resetManager(): Promise<void> // Lain 무한세션 새로고침 — 진행 중 응답 멈추고 SDK 세션·월드스테이트 비움(로그는 보존)
@@ -584,6 +640,7 @@ export interface LainApi {
   ): Promise<{ accepted: number; dropped: number }>
   setTaskFastMode(taskId: string, on: boolean): Promise<void> // B4 — Opus 빠른 출력 모드 토글(다음 실행/재개부터 적용)
   setTaskModel(taskId: string, model: ModelTier | ''): Promise<void> // D10 — 작업별 모델 고정('' = 전역, 다음 실행/재개부터 적용)
+  setTaskProvider(taskId: string, provider: string): Promise<void> // M3 — 작업별 프로바이더 프로필(''=기본 Anthropic)
   rerunTask(taskId: string): Promise<{ taskId?: string; mode?: NaviMode; error?: string }> // D11 — done/cancelled 작업을 같은 content로 새 task 생성해 착수(원본 보존). mode=재판정된 실행 모드(orchestrator.rerunTask→startTask 반환)
   taskEvents(taskId: string): Promise<TaskEvent[]>
   taskDiff(taskId: string): Promise<string>

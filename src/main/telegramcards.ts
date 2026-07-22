@@ -3,6 +3,7 @@
 import type { Task, TaskEvent } from '../shared/types'
 import { humanizeActivity } from '../shared/activity'
 import { todoProgress } from '../shared/todoline'
+import { ENGINE_LABELS } from './engines'
 
 /** 라이브 카드 갱신 최소 간격 — 텔레그램 editMessageText rate limit(채팅당 ~1/s) 안전 마진. */
 export const LIVE_EDIT_MIN_MS = 4000
@@ -34,11 +35,12 @@ function fmtElapsed(createdAt: string, now: number): string {
 
 /** 라이브 카드 본문 — 한 메시지를 editMessageText로 계속 갱신하는 텍스트(플레인, HTML 아님). */
 export function buildLiveCard(
-  t: Pick<Task, 'projectId' | 'title' | 'createdAt' | 'todos' | 'turns'>,
+  t: Pick<Task, 'projectId' | 'title' | 'createdAt' | 'todos' | 'turns'> & Pick<Partial<Task>, 'engine'>,
   activity: string | null,
   now: number,
 ): string {
-  const lines = [`⚙ ${t.projectId} — ${t.title.slice(0, 70)}`]
+  const engine = t.engine ?? 'claude'
+  const lines = [`⚙ [${ENGINE_LABELS[engine]}] ${t.projectId} — ${t.title.slice(0, 70)}`]
   let meta = `실행 중 · ${fmtElapsed(t.createdAt, now)} 경과`
   if (t.turns > 0) meta += ` · ${t.turns}턴`
   if (t.todos && t.todos.length > 0) {

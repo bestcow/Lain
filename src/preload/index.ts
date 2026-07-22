@@ -34,6 +34,19 @@ const api: LainApi = {
   listFiles: (projectId) => ipcRenderer.invoke('files:list', projectId),
   listCcSessions: (projectId) => ipcRenderer.invoke('cc:sessions', projectId),
   ccSessionDigest: (projectId, sessionId) => ipcRenderer.invoke('cc:sessionDigest', projectId, sessionId),
+  listObservedSessions: (projectId) => ipcRenderer.invoke('observed:sessions', projectId),
+  observedSessionDigest: (projectId, engine, sessionId) =>
+    ipcRenderer.invoke('observed:sessionDigest', projectId, engine, sessionId),
+  engineCapabilities: () => ipcRenderer.invoke('engines:capabilities'),
+  adoptObservedSession: (projectId, sourceEngine, sessionId, taskEngine, goal) =>
+    ipcRenderer.invoke(
+      'observed:adopt',
+      projectId,
+      sourceEngine,
+      sessionId,
+      taskEngine,
+      goal,
+    ),
   sendChat: (text, attachments, conversationId) =>
     ipcRenderer.invoke('chat:send', text, attachments, conversationId),
   stopChat: () => ipcRenderer.invoke('chat:stop'),
@@ -63,6 +76,8 @@ const api: LainApi = {
   setTaskImages: (taskId, images) => ipcRenderer.invoke('tasks:setImages', taskId, images),
   setTaskFastMode: (taskId, on) => ipcRenderer.invoke('tasks:setFastMode', taskId, on),
   setTaskModel: (taskId, model) => ipcRenderer.invoke('tasks:setModel', taskId, model),
+  setTaskProvider: (taskId, provider) =>
+    ipcRenderer.invoke('tasks:setProvider', taskId, provider),
   rerunTask: (taskId) => ipcRenderer.invoke('tasks:rerun', taskId),
   taskEvents: (taskId) => ipcRenderer.invoke('tasks:events', taskId),
   taskDiff: (taskId) => ipcRenderer.invoke('tasks:diff', taskId),

@@ -21,7 +21,9 @@ import type {
   DiscordCallState,
   LainSettings,
   UpdateStatus,
-  CcSessionInfo,
+  ObservedSessionInfo,
+  EngineCapabilityInfo,
+  TaskEngine,
 } from '../shared/types'
 import { spokenText } from '../shared/speech'
 import { messagesToMarkdown } from '../shared/exportMarkdown'
@@ -37,6 +39,7 @@ import { ManagerSprite } from './components/Sprites'
 import { LainBubble } from './components/LainBubble'
 import { ProjectSprite } from './components/projectSprite'
 import { TaskDrawer } from './components/TaskDrawer'
+import { EngineBadge, engineInfoFor } from './components/EngineBadge'
 import { NaviChatPanel } from './components/NaviChatPanel'
 import { LessonsPanel } from './components/LessonsPanel'
 import { HistoryPanel } from './components/HistoryPanel'
@@ -280,9 +283,13 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [prefsOpen, setPrefsOpen] = useState(false)
   const [settings, setSettings] = useState<LainSettings | null>(null)
+  const [engineInfos, setEngineInfos] = useState<EngineCapabilityInfo[]>([])
   useEffect(() => {
     void window.lain.getSettings().then(setSettings)
     return window.lain.onSettingsUpdated(setSettings) // 레인 도구·다른 창의 설정 변경을 라이브 반영(Prefs '내 호칭' 등)
+  }, [])
+  useEffect(() => {
+    void window.lain.engineCapabilities().then(setEngineInfos)
   }, [])
   // E6 — 유효 워크스페이스 루트(env 오버라이드 반영). SCAN 제목·빈상태 문구를 실제 경로로 표시(하드코딩 제거).
   const [wsRoot, setWsRoot] = useState<string>('C:\\workspace')
@@ -384,13 +391,23 @@ export default function App() {
   const [taskEvents, setTaskEvents] = useState<TaskEvent[] | null>(null)
   // C1 — 타일용 라이브 활동: taskId별 '마지막 활동 한 줄'(decode된 display만). 드로어와 무관하게 항상 갱신.
   const [taskActivity, setTaskActivity] = useState<Map<string, string>>(new Map())
-  // CC 세션 열람 — 드릴 헤더 'CC 세션' 버튼. null=닫힘, []=열었지만 세션 없음. 뷰어는 발췌 텍스트.
-  const [ccSessions, setCcSessions] = useState<CcSessionInfo[] | null>(null)
-  const [ccDigest, setCcDigest] = useState<{ title: string; text: string } | null>(null)
+  // 외부 세션 열람 — Claude Code/Codex 단일 목록. null=닫힘, []=열었지만 세션 없음.
+  const [ccSessions, setCcSessions] = useState<ObservedSessionInfo[] | null>(null)
+  const [ccDigest, setCcDigest] = useState<{
+    title: string
+    text: string
+    engine: ObservedSessionInfo['engine']
+    sessionId: string
+  } | null>(null)
+  const [adoptEngine, setAdoptEngine] = useState<TaskEngine>('claude')
+  const [adoptBusy, setAdoptBusy] = useState(false)
+  const [adoptMessage, setAdoptMessage] = useState<string | null>(null)
   // 드릴 대상이 바뀌면 CC 세션 패널을 닫는다 — 다른 프로젝트의 세션 목록이 남아 보이는 것 방지.
   useEffect(() => {
     setCcSessions(null)
     setCcDigest(null)
+    setAdoptEngine('claude')
+    setAdoptMessage(null)
   }, [drillTarget])
   const openTaskIdRef = useRef<string | null>(null)
   openTaskIdRef.current = openTaskId
@@ -2690,6 +2707,18 @@ export default function App() {
                     onStartTask={startTask}
                     onContextMenu={openNaviMenu}
                     onRequestRemove={requestRemove}
+                    engineInfo={
+                      activeTaskOf(p.id)
+                        ? engineInfoFor(engineInfos, activeTaskOf(p.id)!.engine)
+                        : undefined
+                    }
+                    providerModel={(() => {
+                      const task = activeTaskOf(p.id)
+                      const profile = settings?.providerSwapEnabled
+                        ? settings.providerProfiles.find((x) => x.id === task?.provider)
+                        : undefined
+                      return profile ? { label: profile.label, modelId: profile.modelId } : undefined
+                    })()}
                   />
                 ))}
               {/* 내비 추가 — 그리드 끝의 점선 타일(폴더 피커). */}
@@ -2730,6 +2759,18 @@ export default function App() {
                             onStartTask={startTask}
                             onContextMenu={openNaviMenu}
                             onRequestRemove={requestRemove}
+                            engineInfo={
+                              activeTaskOf(p.id)
+                                ? engineInfoFor(engineInfos, activeTaskOf(p.id)!.engine)
+                                : undefined
+                            }
+                            providerModel={(() => {
+                              const task = activeTaskOf(p.id)
+                              const profile = settings?.providerSwapEnabled
+                                ? settings.providerProfiles.find((x) => x.id === task?.provider)
+                                : undefined
+                              return profile ? { label: profile.label, modelId: profile.modelId } : undefined
+                            })()}
                           />
                         ))}
                     </div>
@@ -2847,6 +2888,7 @@ export default function App() {
               approvals={approvals}
               events={taskEvents}
               activity={openedTaskActivity}
+              engineInfo={engineInfoFor(engineInfos, openedTask.engine)}
               onClose={closeTask}
             />
           )}
@@ -2883,38 +2925,60 @@ export default function App() {
                   </button>
                   <button
                     className={ccSessions ? 'active' : ''}
-                    title="이 프로젝트에서 클로드코드(데스크톱 앱·터미널)로 직접 연 세션들을 본다"
+                    title="이 프로젝트에서 레인 밖으로 직접 연 Claude Code·Codex 세션을 본다"
                     onClick={async () => {
                       if (ccSessions) {
                         setCcSessions(null)
                         setCcDigest(null)
                         return
                       }
-                      setCcSessions(await window.lain.listCcSessions(drillTarget))
+                      setCcSessions(await window.lain.listObservedSessions(drillTarget))
                     }}
                   >
-                    <Icon name="window" size={14} /> CC 세션
+                    <Icon name="window" size={14} /> 외부 세션
                   </button>
                 </div>
-                {/* CC 세션 목록 — 데스크톱/CLI에서 이 프로젝트(+워크트리)로 직접 연 클로드코드 세션(읽기 전용) */}
+                {/* 관찰 세션 목록 — origin=관찰, engine은 배지로 분리. */}
                 {ccSessions && !ccDigest && (
                   <div className="cc-sessions">
                     {ccSessions.length === 0 && (
-                      <div className="cc-empty">이 프로젝트에서 연 클로드코드 세션이 없다.</div>
+                      <div className="cc-empty">이 프로젝트에서 관찰된 외부 세션이 없다.</div>
                     )}
                     {ccSessions.map((s) => (
                       <button
-                        key={s.id}
+                        key={`${s.engine}:${s.id}`}
                         className="cc-session-row"
                         title={s.firstUserText || s.title}
                         onClick={async () => {
-                          const d = await window.lain.ccSessionDigest(drillTarget, s.id)
-                          setCcDigest({ title: s.title, text: d ?? '(세션을 읽지 못함)' })
+                          const d = await window.lain.observedSessionDigest(
+                            drillTarget,
+                            s.engine,
+                            s.id,
+                          )
+                          setCcDigest({
+                            title: s.title,
+                            text: d ?? '(세션을 읽지 못함)',
+                            engine: s.engine,
+                            sessionId: s.id,
+                          })
+                          setAdoptEngine('claude')
+                          setAdoptMessage(null)
                         }}
                       >
                         <span className="cc-title">{s.title}</span>
                         <span className="cc-meta">
-                          {s.entrypoint === 'claude-desktop' ? '데스크톱' : 'CLI'} ·{' '}
+                          <EngineBadge
+                            engine={s.engine}
+                            info={engineInfoFor(engineInfos, s.engine)}
+                            observed
+                          />{' '}
+                          ·{' '}
+                          {s.status === 'active'
+                            ? '진행 중 추정'
+                            : s.status === 'recent'
+                              ? '최근'
+                              : '종료 추정'}{' '}
+                          ·{' '}
                           {new Date(s.lastAt).toLocaleString('sv-SE').slice(0, 16)}
                           {s.gitBranch ? ` · ${s.gitBranch}` : ''}
                         </span>
@@ -2926,6 +2990,54 @@ export default function App() {
                   <div className="cc-digest">
                     <div className="cc-digest-head">
                       <span className="cc-title">{ccDigest.title}</span>
+                      <label className="cc-adopt-engine">
+                        이어받을 엔진
+                        <select
+                          value={adoptEngine}
+                          disabled={adoptBusy}
+                          onChange={(e) => setAdoptEngine(e.target.value as TaskEngine)}
+                        >
+                          {(engineInfos.length
+                            ? engineInfos
+                            : [{ engine: 'claude' as const, label: 'Claude' }]
+                          ).map((info) => (
+                            <option key={info.engine} value={info.engine}>
+                              {info.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        disabled={adoptBusy}
+                        title="외부 세션을 요약해 새 격리 worktree 작업으로 이어받는다"
+                        onClick={async () => {
+                          setAdoptBusy(true)
+                          setAdoptMessage(null)
+                          try {
+                            const result = await window.lain.adoptObservedSession(
+                              drillTarget,
+                              ccDigest.engine,
+                              ccDigest.sessionId,
+                              adoptEngine,
+                            )
+                            if (result.error) {
+                              setAdoptMessage(result.error)
+                              return
+                            }
+                            if (result.taskId) {
+                              setCcSessions(null)
+                              setCcDigest(null)
+                              openTask(result.taskId)
+                            }
+                          } catch (e) {
+                            setAdoptMessage(e instanceof Error ? e.message : String(e))
+                          } finally {
+                            setAdoptBusy(false)
+                          }
+                        }}
+                      >
+                        {adoptBusy ? '정리 중…' : '새 작업으로 이어받기'}
+                      </button>
                       <button onClick={() => setCcDigest(null)}>← 목록</button>
                       <button
                         onClick={() => {
@@ -2936,6 +3048,7 @@ export default function App() {
                         닫기
                       </button>
                     </div>
+                    {adoptMessage && <div className="cc-adopt-error">{adoptMessage}</div>}
                     <pre className="cc-digest-body">{ccDigest.text}</pre>
                   </div>
                 )}
@@ -3357,6 +3470,7 @@ export default function App() {
           {settings && (
             <InputModeBar
               settings={settings}
+              engineInfos={engineInfos}
               onPatch={(p) => void window.lain.setSettings(p).then(setSettings)}
               onPlus={(a) => setPlusMenu(a)}
               contextPercent={

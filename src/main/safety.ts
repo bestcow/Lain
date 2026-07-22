@@ -91,6 +91,14 @@ const ENV_ASSIGN_RE =
 const CONNSTR_RE = /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)([^\s:/@]{2,})(@)/gi
 
 const MASK = '[REDACTED]'
+let dynamicSecretValues: string[] = []
+
+/** 런타임 설정에만 존재하는 토큰을 로그/다이제스트 redaction에 등록한다. */
+export function registerSecretValues(values: string[]): void {
+  dynamicSecretValues = [...new Set(values.map((v) => v.trim()).filter((v) => v.length >= 4))]
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 100)
+}
 
 /**
  * 텍스트에서 고신뢰 credential 형상을 [REDACTED]로 치환(원문 비파괴 — 새 문자열 반환).
@@ -108,6 +116,8 @@ export function redactSecrets(text: string): string {
   out = out.replace(BEARER_RE, (_m, prefix: string) => `${prefix}${MASK}`)
   out = out.replace(ENV_ASSIGN_RE, (_m, name: string, sep: string, q: string) => `${name}${sep}${q}${MASK}${q}`)
   out = out.replace(CONNSTR_RE, (_m, head: string, _pw: string, at: string) => `${head}${MASK}${at}`)
+  // 프로바이더 토큰은 접두 형상이 제각각이라 설정의 실제 값으로 결정론 치환한다.
+  for (const secret of dynamicSecretValues) out = out.split(secret).join(MASK)
   return out
 }
 
